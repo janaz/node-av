@@ -1,0 +1,181 @@
+diff --git a/builder/build.sh b/builder/build.sh
+index 28b5081622..855843f8a6 100755
+--- a/builder/build.sh
++++ b/builder/build.sh
+@@ -24,7 +24,15 @@ done
+ 
+ export FFBUILD_PREFIX="$(docker run --rm "$IMAGE" bash -c 'echo $FFBUILD_PREFIX')"
+ 
+-for script in scripts.d/**/*.sh; do
++ENABLED_SCRIPTS=(
++    scripts.d/20-zlib.sh
++    scripts.d/20-libiconv.sh
++    scripts.d/50-dav1d.sh
++    scripts.d/50-libwebp.sh
++    scripts.d/99-rpath.sh
++)
++
++for script in "${ENABLED_SCRIPTS[@]}"; do
+     FF_CONFIGURE+=" $(get_output $script configure)"
+     FF_CFLAGS+=" $(get_output $script cflags)"
+     FF_CXXFLAGS+=" $(get_output $script cxxflags)"
+diff --git a/builder/buildmac.sh b/builder/buildmac.sh
+index ad81a6a2b3..ef15cf27db 100755
+--- a/builder/buildmac.sh
++++ b/builder/buildmac.sh
+@@ -58,7 +58,14 @@ for addin in ${ADDINS[*]}; do
+     source "addins/${addin}.sh"
+ done
+ 
+-for script in scripts.d/*.sh; do
++ENABLED_SCRIPTS=(
++    scripts.d/20-zlib.sh
++    scripts.d/20-libiconv.sh
++    scripts.d/50-dav1d.sh
++    scripts.d/50-libwebp.sh
++)
++
++for script in "${ENABLED_SCRIPTS[@]}"; do
+     FF_CONFIGURE+=" $(get_output $script configure)"
+     FF_CFLAGS+=" $(get_output $script cflags)"
+     FF_CXXFLAGS+=" $(get_output $script cxxflags)"
+@@ -86,7 +93,7 @@ if [ "$SKIP_BUILD" = false ]; then
+     done
+ 
+     cd "$BUILDER_ROOT"
+-    for lib in scripts.d/*.sh; do
++    for lib in "${ENABLED_SCRIPTS[@]}"; do
+         cd "$BUILDER_ROOT"/build
+         source "$BUILDER_ROOT"/"$lib"
+         ffbuild_enabled || continue
+diff --git a/builder/variants/defaults-gpl.sh b/builder/variants/defaults-gpl.sh
+index cb5760aa4a..369cd5a531 100755
+--- a/builder/variants/defaults-gpl.sh
++++ b/builder/variants/defaults-gpl.sh
+@@ -7,9 +7,4 @@ LICENSE_FILE="COPYING.GPLv3"
+ 
+ [[ $TARGET == linux* ]] && FF_CONFIGURE+=" --enable-lto=auto" || true
+ # [[ $TARGET == win* ]] && FF_CONFIGURE+=" --enable-lto=auto" || true
+-[[ $TARGET == mac* ]] && FF_CONFIGURE+=" --enable-lto=thin" || true
+-
+-# Enable input devices for device capture (webcam, microphone, screen)
+-[[ $TARGET == linux* ]] && FF_CONFIGURE+=" --enable-indev=v4l2" || true
+-[[ $TARGET == win* ]] && FF_CONFIGURE+=" --enable-indev=dshow --enable-indev=gdigrab" || true
+-[[ $TARGET == mac* ]] && FF_CONFIGURE+=" --enable-indev=avfoundation" || true
+\ No newline at end of file
++[[ $TARGET == mac* ]] && FF_CONFIGURE+=" --enable-lto=thin" || true
+\ No newline at end of file
+diff --git a/builder/variants/defaults-mac.sh b/builder/variants/defaults-mac.sh
+index 9d73ff32ad..78dfe5689f 100755
+--- a/builder/variants/defaults-mac.sh
++++ b/builder/variants/defaults-mac.sh
+@@ -4,7 +4,7 @@ MACOS_BUILDER_CPU_ARCH="$(uname -m)"
+ 
+ FF_CFLAGS+="-I"$FFBUILD_PREFIX"/include"
+ FF_LDFLAGS+="-L"$FFBUILD_PREFIX"/lib"
+-FF_CONFIGURE+=" --disable-libjack --disable-indev=jack --disable-libxcb --disable-xlib --enable-neon --enable-runtime-cpudetect --enable-audiotoolbox --enable-videotoolbox"
++FF_CONFIGURE+=" --disable-libjack --disable-indev=jack --disable-libxcb --disable-xlib --enable-neon --enable-runtime-cpudetect"
+ FFBUILD_TARGET_FLAGS="--disable-shared --enable-static --pkg-config-flags=\"--static\" --enable-pthreads --cc=clang"
+ FF_HOST_CFLAGS="-I/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include -I"$FFBUILD_PREFIX"/include"
+ FF_HOST_LDFLAGS=""
+diff --git a/msys2/build.sh b/msys2/build.sh
+index ad7109d9a2..0eb813b9ab 100755
+--- a/msys2/build.sh
++++ b/msys2/build.sh
+@@ -45,48 +45,9 @@ PKG_CONFIG_PATH=/clang64/ffbuild/lib/pkgconfig ./configure --cc=clang --cxx=clan
+     --enable-lto=thin \
+     --enable-gpl \
+     --enable-version3 \
+-    --enable-schannel \
+-    --enable-iconv \
+-    --enable-libxml2 \
+     --enable-zlib \
+-    --enable-lzma \
+-    --enable-gmp \
+-    --enable-chromaprint \
+-    --enable-libfreetype \
+-    --enable-libfribidi \
+-    --enable-libfontconfig \
+-    --enable-libharfbuzz \
+-    --enable-libass \
+-    --enable-libbluray \
+-    --enable-libmp3lame \
+-    --enable-libopus \
+-    --enable-libtheora \
+-    --enable-libvorbis \
+-    --enable-libopenmpt \
+-    --enable-libjxl \
+     --enable-libwebp \
+-    --enable-libvpx \
+-    --enable-libzimg \
+-    --enable-libx264 \
+-    --enable-libx265 \
+-    --enable-libsvtav1 \
+-    --enable-libdav1d \
+-    --enable-libfdk-aac \
+-    --enable-whisper \
+-    --enable-opencl \
+-    --enable-vulkan \
+-    --enable-libshaderc \
+-    --enable-dxva2 \
+-    --enable-d3d11va \
+-    --enable-d3d12va \
+-    --enable-amf \
+-    --enable-libvpl \
+-    --enable-ffnvcodec \
+-    --enable-cuda \
+-    --enable-cuda-llvm \
+-    --enable-cuvid \
+-    --enable-nvdec \
+-    --enable-nvenc
++    --enable-libdav1d
+ 
+ make -j$(nproc) V=1
+ 
+diff --git a/msys2/buildarm64.sh b/msys2/buildarm64.sh
+index 30dc09b64f..2bb47c3739 100755
+--- a/msys2/buildarm64.sh
++++ b/msys2/buildarm64.sh
+@@ -46,41 +46,9 @@ PKG_CONFIG_PATH=/clangarm64/ffbuild/lib/pkgconfig ./configure --cc=clang --cxx=c
+     --enable-lto=thin \
+     --enable-gpl \
+     --enable-version3 \
+-    --enable-schannel \
+-    --enable-iconv \
+-    --enable-libxml2 \
+     --enable-zlib \
+-    --enable-lzma \
+-    --enable-gmp \
+-    --enable-chromaprint \
+-    --enable-libfreetype \
+-    --enable-libfribidi \
+-    --enable-libfontconfig \
+-    --enable-libharfbuzz \
+-    --enable-libass \
+-    --enable-libbluray \
+-    --enable-libmp3lame \
+-    --enable-libopus \
+-    --enable-libtheora \
+-    --enable-libvorbis \
+-    --enable-libopenmpt \
+-    --enable-libjxl \
+     --enable-libwebp \
+-    --enable-libvpx \
+-    --enable-libzimg \
+-    --enable-libx264 \
+-    --enable-libx265 \
+-    --enable-libsvtav1 \
+-    --enable-libdav1d \
+-    --enable-libfdk-aac \
+-    --enable-whisper \
+-    --enable-opencl \
+-    --enable-vulkan \
+-    --enable-libshaderc \
+-    --enable-dxva2 \
+-    --enable-d3d11va \
+-    --enable-d3d12va \
+-    --enable-mediafoundation
++    --enable-libdav1d
+ 
+ make -j$(nproc) V=1
+ 
