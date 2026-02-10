@@ -148,6 +148,23 @@ jobs:
 
           make -j$(nproc) V=1
           make install
+
+          # Copy dependency static libs to output prefix for native addon linking
+          echo "=== FFBUILD_PREFIX: $FFBUILD_PREFIX ==="
+          echo "=== Contents of $FFBUILD_PREFIX/lib/ (dependency libs): ==="
+          ls -la $FFBUILD_PREFIX/lib/lib{webp,webpmux,sharpyuv,dav1d,z,iconv}* 2>/dev/null || echo "Some libs not found"
+
+          for lib in libwebp.a libwebpmux.a libsharpyuv.a libdav1d.a libz.a libiconv.a; do
+              if [ -f "$FFBUILD_PREFIX/lib/$lib" ]; then
+                  cp "$FFBUILD_PREFIX/lib/$lib" /ffbuild/prefix/lib/
+                  echo "Copied $lib to output prefix"
+              else
+                  echo "WARNING: $FFBUILD_PREFIX/lib/$lib not found"
+              fi
+          done
+
+          # Also copy headers needed for native addon
+          cp -rn $FFBUILD_PREFIX/include/* /ffbuild/prefix/include/ 2>/dev/null || true
           BUILDSCRIPT
 
           docker run --rm -i \
@@ -173,16 +190,8 @@ jobs:
               exit 1
             fi
 
-            CONTAINER_ID=$(docker create "${IMAGE}")
-            docker cp "${CONTAINER_ID}:/opt/ffbuild/lib" /tmp/codec-libs 2>/dev/null && {
-              sudo cp -n /tmp/codec-libs/*.a /opt/ffbuild/prefix/lib/ 2>/dev/null || true
-              rm -rf /tmp/codec-libs
-            }
-            docker cp "${CONTAINER_ID}:/opt/ffbuild/include" /tmp/codec-includes 2>/dev/null && {
-              sudo cp -rn /tmp/codec-includes/* /opt/ffbuild/prefix/include/ 2>/dev/null || true
-              rm -rf /tmp/codec-includes
-            }
-            docker rm "${CONTAINER_ID}"
+            echo "=== Verifying dependency libs in output: ==="
+            ls -la /opt/ffbuild/prefix/lib/lib{webp,webpmux,sharpyuv,dav1d,z,iconv}* 2>/dev/null || echo "WARNING: Some dependency libs missing!"
 
             sudo rm -rf ffbuild
             sudo chown -R $USER:$USER /opt/ffbuild
