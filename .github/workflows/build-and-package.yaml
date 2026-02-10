@@ -184,7 +184,7 @@ jobs:
             }
             docker rm "${CONTAINER_ID}"
 
-            rm -rf ffbuild
+            sudo rm -rf ffbuild
             sudo chown -R $USER:$USER /opt/ffbuild
           else
             echo "Error: ffbuild/prefix not found!"
