@@ -183,7 +183,6 @@
                             "-Wl,-rpath,'$$ORIGIN'",
                             "-Wl,--allow-multiple-definition",
                             "-Wl,--exclude-libs,ALL",
-                            "-Wl,--no-undefined",
                         ],
                     },
                 ],
