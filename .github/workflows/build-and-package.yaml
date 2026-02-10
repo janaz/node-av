@@ -5,7 +5,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CACHE_VERSION_LINUX: "v34"
+  CACHE_VERSION_LINUX: "v35"
 
 on:
   workflow_dispatch:
@@ -70,70 +70,6 @@ jobs:
             ffmpeg-linux-${{ matrix.arch }}-${{ env.CACHE_VERSION_LINUX }}-${{ steps.ffmpeg-hash.outputs.hash }}
             ffmpeg-linux-${{ matrix.arch }}-${{ env.CACHE_VERSION_LINUX }}-
 
-      - name: Patch FFmpeg configure for minimal video-only build
-        run: |
-          cat > externals/jellyfin-ffmpeg/builder/variants/defaults-gpl.sh << 'DEFAULTS'
-          FF_CONFIGURE="--enable-gpl --enable-version3 --disable-ffplay --disable-debug --disable-doc --disable-sdl2"
-          FF_CFLAGS=""
-          FF_CXXFLAGS=""
-          FF_LDFLAGS=""
-          GIT_BRANCH="jellyfin"
-          LICENSE_FILE="COPYING.GPLv3"
-
-          # LTO disabled: Docker GCC version may differ from host GCC
-          # [[ $TARGET == linux* ]] && FF_CONFIGURE+=" --enable-lto=auto" || true
-          # [[ $TARGET == win* ]] && FF_CONFIGURE+=" --enable-lto=auto" || true
-          [[ $TARGET == mac* ]] && FF_CONFIGURE+=" --enable-lto=thin" || true
-
-          # Disable auto-detected features on Linux that we don't link against
-          [[ $TARGET == linux* ]] && FF_CONFIGURE+=" --disable-alsa --disable-xlib --disable-libxcb --disable-libdrm --disable-vaapi --disable-vdpau --disable-vulkan --disable-opencl" || true
-
-          # ── Minimal video-only build ──────────────────────────────────────────
-          # Disable all components then selectively re-enable only what we need.
-          # No audio support, no hardware acceleration, no network protocols.
-
-          # Encoders: GIF, APNG, WebP (animated), PNG, raw passthrough
-          FF_CONFIGURE+=" --disable-encoders"
-          FF_CONFIGURE+=" --enable-encoder=gif,apng,libwebp,libwebp_anim,png,rawvideo,wrapped_avframe"
-
-          # Decoders: H.264, HEVC, VP9, AV1 (libdav1d), image formats, raw
-          FF_CONFIGURE+=" --disable-decoders"
-          FF_CONFIGURE+=" --enable-decoder=h264,hevc,vp9,av1,libdav1d,png,apng,gif,webp,rawvideo,wrapped_avframe"
-
-          # Muxers: output containers for GIF/APNG/WebP/MOV/MP4/MKV
-          FF_CONFIGURE+=" --disable-muxers"
-          FF_CONFIGURE+=" --enable-muxer=gif,apng,webp,image2,mov,mp4,matroska,webm,rawvideo,null"
-
-          # Demuxers: input containers
-          FF_CONFIGURE+=" --disable-demuxers"
-          FF_CONFIGURE+=" --enable-demuxer=mov,matroska,image2,gif,apng,concat,rawvideo"
-
-          # Parsers: codec bitstream parsers
-          FF_CONFIGURE+=" --disable-parsers"
-          FF_CONFIGURE+=" --enable-parser=h264,hevc,vp9,av1,png,webp"
-
-          # Bitstream filters
-          FF_CONFIGURE+=" --disable-bsfs"
-          FF_CONFIGURE+=" --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,vp9_superframe,av1_frame_merge,null,extract_extradata"
-
-          # Protocols: local file I/O only
-          FF_CONFIGURE+=" --disable-protocols"
-          FF_CONFIGURE+=" --enable-protocol=file,pipe,data,concat,unix"
-
-          # Devices: none needed
-          FF_CONFIGURE+=" --disable-devices --disable-indevs --disable-outdevs"
-
-          # Filters: video processing filters only (no audio filters)
-          FF_CONFIGURE+=" --disable-filters"
-          FF_CONFIGURE+=" --enable-filter=buffer,buffersink,null,copy,format,fps,scale,crop,overlay"
-          FF_CONFIGURE+=" --enable-filter=hflip,vflip,transpose,rotate,split,pad,fade,trim,select"
-          FF_CONFIGURE+=" --enable-filter=setpts,setsar,setdar,framerate,framestep,concat,fifo"
-          FF_CONFIGURE+=" --enable-filter=drawbox,color,negate,edgedetect,hstack,vstack,yadif,bwdif"
-          DEFAULTS
-
-          echo "Patched defaults-gpl.sh:"
-          cat externals/jellyfin-ffmpeg/builder/variants/defaults-gpl.sh
-
       - name: Build FFmpeg
         id: build-ffmpeg
         if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
@@ -160,8 +96,64 @@ jobs:
             GITHUB_REPOSITORY="seydx/jellyfin-ffmpeg" ./makeimage.sh "${TARGET}" gpl
           fi
 
-          export GITHUB_REPOSITORY="seydx/jellyfin-ffmpeg"
-          ./build.sh "${TARGET}" gpl
+          # Prepare FFmpeg source (same as build.sh)
+          rm -rf ffbuild
+          mkdir -p ffbuild/ffmpeg
+          rsync -a .. ffbuild/ffmpeg --exclude=builder
+
+          # Create build script with explicit configure flags
+          # Quoted heredoc: $FFBUILD_TARGET_FLAGS and $(nproc) expand inside Docker
+          cat > /tmp/build-ffmpeg.sh << 'BUILDSCRIPT'
+          set -xe
+          cd /ffbuild/ffmpeg
+
+          if [[ -f "debian/patches/series" ]]; then
+              ln -sf /ffbuild/ffmpeg/debian/patches patches
+              quilt push -a || true
+          fi
+
+          echo "=== FFBUILD_TARGET_FLAGS: $FFBUILD_TARGET_FLAGS ==="
+
+          ./configure --prefix=/ffbuild/prefix \
+              $FFBUILD_TARGET_FLAGS \
+              --extra-version="Jellyfin" \
+              --enable-gpl --enable-version3 \
+              --disable-ffplay --disable-debug --disable-doc --disable-sdl2 \
+              --disable-alsa --disable-xlib --disable-libxcb --disable-libdrm \
+              --disable-vaapi --disable-vdpau --disable-vulkan --disable-opencl \
+              --disable-libvpl --disable-ffnvcodec --disable-cuda-llvm \
+              --disable-hwaccels \
+              --enable-zlib --enable-iconv \
+              --enable-libdav1d --enable-libwebp \
+              --disable-encoders \
+              --enable-encoder=gif,apng,libwebp,libwebp_anim,png,rawvideo,wrapped_avframe \
+              --disable-decoders \
+              --enable-decoder=h264,hevc,vp9,av1,libdav1d,png,apng,gif,webp,rawvideo,wrapped_avframe \
+              --disable-muxers \
+              --enable-muxer=gif,apng,webp,image2,mov,mp4,matroska,webm,rawvideo,null \
+              --disable-demuxers \
+              --enable-demuxer=mov,matroska,image2,gif,apng,concat,rawvideo \
+              --disable-parsers \
+              --enable-parser=h264,hevc,vp9,av1,png,webp \
+              --disable-bsfs \
+              --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,vp9_superframe,av1_frame_merge,null,extract_extradata \
+              --disable-protocols \
+              --enable-protocol=file,pipe,data,concat,unix \
+              --disable-devices --disable-indevs --disable-outdevs \
+              --disable-filters \
+              --enable-filter=buffer,buffersink,null,copy,format,fps,scale,crop,overlay \
+              --enable-filter=hflip,vflip,transpose,rotate,split,pad,fade,trim,select \
+              --enable-filter=setpts,setsar,setdar,framerate,framestep,concat,fifo \
+              --enable-filter=drawbox,color,negate,edgedetect,hstack,vstack,yadif,bwdif
+
+          make -j$(nproc) V=1
+          make install
+          BUILDSCRIPT
+
+          docker run --rm -i \
+            -v $PWD/ffbuild:/ffbuild \
+            -v /tmp/build-ffmpeg.sh:/build.sh \
+            "$IMAGE" bash /build.sh
 
           if [ -d ffbuild/prefix ]; then
             sudo mkdir -p /opt/ffbuild/prefix
