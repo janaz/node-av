@@ -159,6 +159,7 @@
                             "/opt/ffbuild/prefix/lib/libwebpmux.a",
                             "/opt/ffbuild/prefix/lib/libsharpyuv.a",
                             "/opt/ffbuild/prefix/lib/libz.a",
+                            "/opt/ffbuild/prefix/lib/libiconv.a",
                             "-Wl,--end-group",
                             "-Wl,--no-whole-archive",
                             "-lpthread",
