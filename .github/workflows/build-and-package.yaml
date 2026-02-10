@@ -17,6 +17,7 @@ on:
   push:
     branches:
       - main
+      - stripped-ffmpeg
     paths:
       - "src/**"
       - "externals/jellyfin-ffmpeg/**"
