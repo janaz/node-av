@@ -4,13 +4,10 @@ import { after, afterEach, beforeEach, describe, it } from 'node:test';
 
 import {
   AV_CODEC_ID_H264,
-  AV_CODEC_ID_PCM_S16LE,
-  AV_SAMPLE_FMT_S16,
   AVFLAG_NONE,
   AVFMT_FLAG_GENPTS,
   AVFMT_FLAG_IGNIDX,
   AVIO_FLAG_WRITE,
-  AVMEDIA_TYPE_AUDIO,
   AVMEDIA_TYPE_VIDEO,
   Codec,
   Dictionary,
@@ -18,7 +15,6 @@ import {
   IOContext,
   OutputFormat,
   Packet,
-  Rational,
 } from '../src/index.js';
 
 import type { AVFormatFlag } from '../src/index.js';
@@ -27,7 +23,6 @@ import { getInputFile, getOutputFile, prepareTestEnvironment } from './index.js'
 prepareTestEnvironment();
 
 const testFile = getOutputFile('test.mp4');
-const testAudioFile = getOutputFile('test-audio.wav');
 const inputVideoFile = getInputFile('video.mp4');
 
 describe('FormatContext', () => {
@@ -37,7 +32,6 @@ describe('FormatContext', () => {
     // Clean up test files
     try {
       if (existsSync(testFile)) unlinkSync(testFile);
-      if (existsSync(testAudioFile)) unlinkSync(testAudioFile);
     } catch {
       // Ignore cleanup errors
     }
@@ -727,39 +721,6 @@ describe('FormatContext', () => {
 
       // Don't free IOContext here - it's now owned by FormatContext
       // It will be freed when FormatContext is freed
-    });
-  });
-
-  describe('Audio-specific Operations', () => {
-    it('should create audio stream', () => {
-      ctx.allocOutputContext2(null, null, testAudioFile);
-
-      const stream = ctx.newStream(null);
-      assert.ok(stream);
-      stream.codecpar.codecType = AVMEDIA_TYPE_AUDIO;
-      stream.codecpar.codecId = AV_CODEC_ID_PCM_S16LE;
-      stream.codecpar.sampleRate = 44100;
-      stream.codecpar.channels = 2;
-      stream.codecpar.format = AV_SAMPLE_FMT_S16;
-
-      assert.equal(stream.codecpar.codecType, AVMEDIA_TYPE_AUDIO);
-      assert.equal(stream.codecpar.sampleRate, 44100);
-    });
-
-    it('should set audio time base', () => {
-      ctx.allocOutputContext2(null, null, testAudioFile);
-
-      const stream = ctx.newStream(null);
-      assert.ok(stream);
-      stream.codecpar.codecType = AVMEDIA_TYPE_AUDIO;
-      stream.codecpar.sampleRate = 48000;
-
-      const timeBase = new Rational(1, 48000);
-      stream.timeBase = timeBase;
-
-      const retrieved = stream.timeBase;
-      assert.equal(retrieved.num, 1);
-      assert.equal(retrieved.den, 48000);
     });
   });
 

@@ -4,7 +4,7 @@ import { describe, it } from 'node:test';
 import { Decoder } from '../src/api/decoder.js';
 import { Demuxer } from '../src/api/demuxer.js';
 import { AV_CODEC_ID_H264, AV_PIX_FMT_YUV420P } from '../src/constants/constants.js';
-import { FF_DECODER_AAC, FF_DECODER_H264 } from '../src/constants/decoders.js';
+import { FF_DECODER_H264 } from '../src/constants/decoders.js';
 import { Codec, Packet } from '../src/lib/index.js';
 import { decodePacket, decodePacketSync, getInputFile, prepareTestEnvironment } from './index.js';
 
@@ -48,37 +48,6 @@ describe('Decoder', () => {
       media.closeSync();
     });
 
-    it('should create decoder for audio stream (sync)', () => {
-      const media = Demuxer.openSync(inputFile);
-
-      // Find audio stream
-      const audioStream = media.audio();
-      assert.ok(audioStream, 'Should find audio stream');
-
-      // Create decoder
-      const decoder = Decoder.createSync(audioStream);
-      assert.ok(decoder);
-      assert.equal(decoder.isDecoderOpen, true);
-
-      decoder.close();
-      media.closeSync();
-    });
-  });
-
-  it('should create decoder for audio stream (async)', async () => {
-    const media = await Demuxer.open(inputFile);
-
-    // Find audio stream
-    const audioStream = media.audio();
-    assert.ok(audioStream, 'Should find audio stream');
-
-    // Create decoder
-    const decoder = await Decoder.create(audioStream);
-    assert.ok(decoder);
-    assert.equal(decoder.isDecoderOpen, true);
-
-    decoder.close();
-    await media.close();
   });
 
   it('should create decoder for video stream (sync)', () => {
@@ -93,55 +62,6 @@ describe('Decoder', () => {
     assert.ok(decoder);
     assert.equal(decoder.isDecoderOpen, true);
     assert.equal(decoder.getStream().index, videoStream.index);
-
-    decoder.close();
-    media.closeSync();
-  });
-
-  it('should create decoder for audio stream (sync)', () => {
-    const media = Demuxer.openSync(inputFile);
-
-    // Find audio stream
-    const audioStream = media.audio();
-    assert.ok(audioStream, 'Should find audio stream');
-
-    // Create decoder
-    const decoder = Decoder.createSync(audioStream);
-    assert.ok(decoder);
-    assert.equal(decoder.isDecoderOpen, true);
-
-    decoder.close();
-    media.closeSync();
-  });
-
-  it('should create decoder for video stream (sync)', () => {
-    const media = Demuxer.openSync(inputFile);
-
-    // Find video stream
-    const videoStream = media.video();
-    assert.ok(videoStream, 'Should find video stream');
-
-    // Create decoder
-    const decoder = Decoder.createSync(videoStream);
-    assert.ok(decoder);
-    assert.equal(decoder.isDecoderOpen, true);
-    assert.equal(decoder.getStream().index, videoStream.index);
-
-    decoder.close();
-    media.closeSync();
-  });
-
-  it('should create decoder for audio stream (sync)', () => {
-    const media = Demuxer.openSync(inputFile);
-
-    // Find audio stream
-    const audioStream = media.audio();
-    assert.ok(audioStream, 'Should find audio stream');
-
-    // Create decoder
-    const decoder = Decoder.createSync(audioStream);
-    assert.ok(decoder);
-    assert.equal(decoder.isDecoderOpen, true);
 
     decoder.close();
     media.closeSync();
@@ -237,34 +157,6 @@ describe('Decoder', () => {
       assert.ok(decoder);
       assert.equal(decoder.isDecoderOpen, true);
       assert.equal(decoder.getCodec().id, codec.id);
-
-      decoder.close();
-      media.closeSync();
-    });
-
-    it('should create audio decoder with explicit codec name (async)', async () => {
-      const media = await Demuxer.open(inputFile);
-      const audioStream = media.audio();
-      assert.ok(audioStream);
-
-      // Use explicit audio decoder
-      const decoder = await Decoder.create(audioStream, FF_DECODER_AAC);
-      assert.ok(decoder);
-      assert.equal(decoder.isDecoderOpen, true);
-
-      decoder.close();
-      await media.close();
-    });
-
-    it('should create audio decoder with explicit codec name (sync)', () => {
-      const media = Demuxer.openSync(inputFile);
-      const audioStream = media.audio();
-      assert.ok(audioStream);
-
-      // Use explicit audio decoder
-      const decoder = Decoder.createSync(audioStream, FF_DECODER_AAC);
-      assert.ok(decoder);
-      assert.equal(decoder.isDecoderOpen, true);
 
       decoder.close();
       media.closeSync();
@@ -570,84 +462,6 @@ describe('Decoder', () => {
       }
 
       assert.ok(frameCount > 0, 'Should decode at least one frame');
-
-      decoder.close();
-      media.closeSync();
-    });
-
-    it('should decode audio packets (async)', async () => {
-      const media = await Demuxer.open(inputFile);
-      const audioStream = media.audio();
-      assert.ok(audioStream);
-
-      const decoder = await Decoder.create(audioStream);
-
-      let frameCount = 0;
-      let packetCount = 0;
-      const maxPackets = 10;
-
-      for await (using packet of media.packets()) {
-        if (!packet) break;
-
-        if (packet.streamIndex === audioStream.index) {
-          for await (using frame of decodePacket(decoder, packet)) {
-            assert.ok(frame.nbSamples > 0);
-            assert.ok(frame.sampleRate > 0);
-            frameCount++;
-          }
-
-          packetCount++;
-          if (packetCount >= maxPackets) {
-            break;
-          }
-        }
-      }
-
-      // Flush remaining frames
-      for await (using frame of decoder.flushFrames()) {
-        assert.ok(frame.nbSamples > 0);
-        frameCount++;
-      }
-
-      assert.ok(frameCount > 0, 'Should decode at least one audio frame');
-
-      decoder.close();
-      await media.close();
-    });
-
-    it('should decode audio packets (sync)', () => {
-      const media = Demuxer.openSync(inputFile);
-      const audioStream = media.audio();
-      assert.ok(audioStream);
-
-      const decoder = Decoder.createSync(audioStream);
-
-      let frameCount = 0;
-      let packetCount = 0;
-      const maxPackets = 10;
-
-      for (using packet of media.packetsSync()) {
-        if (!packet) break;
-
-        if (packet.streamIndex === audioStream.index) {
-          for (using frame of decodePacketSync(decoder, packet)) {
-            assert.ok(frame.nbSamples > 0);
-            assert.ok(frame.sampleRate > 0);
-            frameCount++;
-          }
-
-          packetCount++;
-          if (packetCount >= maxPackets) break;
-        }
-      }
-
-      // Flush remaining frames
-      for (using frame of decoder.flushFramesSync()) {
-        assert.ok(frame.nbSamples > 0);
-        frameCount++;
-      }
-
-      assert.ok(frameCount > 0, 'Should decode at least one audio frame');
 
       decoder.close();
       media.closeSync();
@@ -1051,46 +865,6 @@ describe('Decoder', () => {
       assert.equal(frameCount, 0, 'Should not produce frames from empty stream');
 
       decoder.close();
-      media.closeSync();
-    });
-  });
-
-  describe('stream identification', () => {
-    it('should track stream index (async)', async () => {
-      const media = await Demuxer.open(inputFile);
-      const videoStream = media.video();
-      const audioStream = media.audio();
-      assert.ok(videoStream);
-      assert.ok(audioStream);
-
-      const videoDecoder = await Decoder.create(videoStream);
-      const audioDecoder = await Decoder.create(audioStream);
-
-      assert.equal(videoDecoder.getStream().index, videoStream.index);
-      assert.equal(audioDecoder.getStream().index, audioStream.index);
-      assert.notEqual(videoDecoder.getStream().index, audioDecoder.getStream().index);
-
-      videoDecoder.close();
-      audioDecoder.close();
-      await media.close();
-    });
-
-    it('should track stream index (sync)', () => {
-      const media = Demuxer.openSync(inputFile);
-      const videoStream = media.video();
-      const audioStream = media.audio();
-      assert.ok(videoStream);
-      assert.ok(audioStream);
-
-      const videoDecoder = Decoder.createSync(videoStream);
-      const audioDecoder = Decoder.createSync(audioStream);
-
-      assert.equal(videoDecoder.getStream().index, videoStream.index);
-      assert.equal(audioDecoder.getStream().index, audioStream.index);
-      assert.notEqual(videoDecoder.getStream().index, audioDecoder.getStream().index);
-
-      videoDecoder.close();
-      audioDecoder.close();
       media.closeSync();
     });
   });

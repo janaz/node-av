@@ -7,12 +7,6 @@ import {
   AVMEDIA_TYPE_DATA,
   AVMEDIA_TYPE_SUBTITLE,
   AVMEDIA_TYPE_VIDEO,
-  AV_CHANNEL_LAYOUT_5POINT1_BACK,
-  AV_CHANNEL_LAYOUT_7POINT1,
-  AV_CHANNEL_LAYOUT_MONO,
-  AV_CHANNEL_LAYOUT_STEREO,
-  AV_CHANNEL_LAYOUT_SURROUND,
-  AV_CHANNEL_ORDER_UNSPEC,
   AV_PIX_FMT_BGR24,
   AV_PIX_FMT_CUDA,
   AV_PIX_FMT_NONE,
@@ -27,34 +21,16 @@ import {
   AV_ROUND_NEAR_INF,
   AV_ROUND_UP,
   AV_ROUND_ZERO,
-  AV_SAMPLE_FMT_DBL,
-  AV_SAMPLE_FMT_DBLP,
-  AV_SAMPLE_FMT_FLT,
-  AV_SAMPLE_FMT_FLTP,
-  AV_SAMPLE_FMT_NONE,
-  AV_SAMPLE_FMT_S16,
-  AV_SAMPLE_FMT_S16P,
-  AV_SAMPLE_FMT_S32,
-  AV_SAMPLE_FMT_S32P,
-  AV_SAMPLE_FMT_U8,
-  AV_SAMPLE_FMT_U8P,
   FormatContext,
   OutputFormat,
   Rational,
-  avChannelLayoutDescribe,
   avCompareTs,
   avGcd,
-  avGetAudioFrameDuration2,
-  avGetBytesPerSample,
   avGetCodecString,
   avGetMediaTypeString,
   avGetMimeTypeDash,
-  avGetPackedSampleFmt,
   avGetPixFmtFromName,
   avGetPixFmtName,
-  avGetPlanarSampleFmt,
-  avGetSampleFmtFromName,
-  avGetSampleFmtName,
   avImageAlloc,
   avImageAllocArrays,
   avImageCopy2,
@@ -66,9 +42,6 @@ import {
   avRescaleQ,
   avRescaleQRnd,
   avRescaleRnd,
-  avSampleFmtIsPlanar,
-  avSamplesAlloc,
-  avSamplesGetBufferSize,
   avSdpCreate,
   avTs2Str,
   avTs2TimeStr,
@@ -126,163 +99,6 @@ describe('Utilities', () => {
 
       console.log('FFmpeg version:', info.version);
       console.log('libavfilter:', info.libraries.avfilter);
-    });
-  });
-
-  describe('Channel Layout Functions', () => {
-    it('should describe channel layouts', () => {
-      // Test mono layout
-      const mono = avChannelLayoutDescribe(AV_CHANNEL_LAYOUT_MONO);
-      assert.ok(mono, 'Should describe mono layout');
-      assert.ok(mono.toLowerCase().includes('mono'), 'Should contain "mono"');
-
-      // Test stereo layout
-      const stereo = avChannelLayoutDescribe(AV_CHANNEL_LAYOUT_STEREO);
-      assert.ok(stereo, 'Should describe stereo layout');
-      assert.ok(stereo.toLowerCase().includes('stereo'), 'Should contain "stereo"');
-
-      // Test 5.1 layout
-      const fivePointOne = avChannelLayoutDescribe(AV_CHANNEL_LAYOUT_5POINT1_BACK);
-      assert.ok(fivePointOne, 'Should describe 5.1 layout');
-      assert.ok(fivePointOne.includes('5.1'), 'Should contain "5.1"');
-
-      // Test 7.1 layout
-      const sevenPointOne = avChannelLayoutDescribe(AV_CHANNEL_LAYOUT_7POINT1);
-      assert.ok(sevenPointOne, 'Should describe 7.1 layout');
-      assert.ok(sevenPointOne.includes('7.1'), 'Should contain "7.1"');
-    });
-
-    it('should handle custom channel layouts', () => {
-      // Test with a surround layout (3 channels: FL + FR + FC)
-      const description = avChannelLayoutDescribe(AV_CHANNEL_LAYOUT_SURROUND);
-      assert.ok(description, 'Should describe custom layout');
-      assert.ok(description.includes('3'), 'Should indicate 3 channels');
-    });
-
-    it('should handle empty channel layout', () => {
-      const emptyLayout = {
-        order: AV_CHANNEL_ORDER_UNSPEC,
-        nbChannels: 0,
-        mask: 0n,
-      };
-      const description = avChannelLayoutDescribe(emptyLayout);
-      // Empty layout might return empty string or specific description
-      assert.ok(description !== undefined, 'Should handle empty layout');
-    });
-  });
-
-  describe('Sample Format Functions', () => {
-    it('should get bytes per sample', () => {
-      assert.equal(avGetBytesPerSample(AV_SAMPLE_FMT_U8), 1);
-      assert.equal(avGetBytesPerSample(AV_SAMPLE_FMT_S16), 2);
-      assert.equal(avGetBytesPerSample(AV_SAMPLE_FMT_S32), 4);
-      assert.equal(avGetBytesPerSample(AV_SAMPLE_FMT_FLT), 4);
-      assert.equal(avGetBytesPerSample(AV_SAMPLE_FMT_DBL), 8);
-
-      // Planar formats have same bytes per sample
-      assert.equal(avGetBytesPerSample(AV_SAMPLE_FMT_U8P), 1);
-      assert.equal(avGetBytesPerSample(AV_SAMPLE_FMT_S16P), 2);
-      assert.equal(avGetBytesPerSample(AV_SAMPLE_FMT_S32P), 4);
-      assert.equal(avGetBytesPerSample(AV_SAMPLE_FMT_FLTP), 4);
-      assert.equal(avGetBytesPerSample(AV_SAMPLE_FMT_DBLP), 8);
-    });
-
-    it('should get sample format name', () => {
-      assert.equal(avGetSampleFmtName(AV_SAMPLE_FMT_U8), 'u8');
-      assert.equal(avGetSampleFmtName(AV_SAMPLE_FMT_S16), 's16');
-      assert.equal(avGetSampleFmtName(AV_SAMPLE_FMT_S32), 's32');
-      assert.equal(avGetSampleFmtName(AV_SAMPLE_FMT_FLT), 'flt');
-      assert.equal(avGetSampleFmtName(AV_SAMPLE_FMT_DBL), 'dbl');
-
-      // Planar formats
-      assert.equal(avGetSampleFmtName(AV_SAMPLE_FMT_U8P), 'u8p');
-      assert.equal(avGetSampleFmtName(AV_SAMPLE_FMT_S16P), 's16p');
-      assert.equal(avGetSampleFmtName(AV_SAMPLE_FMT_S32P), 's32p');
-      assert.equal(avGetSampleFmtName(AV_SAMPLE_FMT_FLTP), 'fltp');
-      assert.equal(avGetSampleFmtName(AV_SAMPLE_FMT_DBLP), 'dblp');
-    });
-
-    it('should get sample format from name', () => {
-      assert.equal(avGetSampleFmtFromName('u8'), AV_SAMPLE_FMT_U8);
-      assert.equal(avGetSampleFmtFromName('s16'), AV_SAMPLE_FMT_S16);
-      assert.equal(avGetSampleFmtFromName('s32'), AV_SAMPLE_FMT_S32);
-      assert.equal(avGetSampleFmtFromName('flt'), AV_SAMPLE_FMT_FLT);
-      assert.equal(avGetSampleFmtFromName('dbl'), AV_SAMPLE_FMT_DBL);
-
-      // Planar formats
-      assert.equal(avGetSampleFmtFromName('u8p'), AV_SAMPLE_FMT_U8P);
-      assert.equal(avGetSampleFmtFromName('s16p'), AV_SAMPLE_FMT_S16P);
-      assert.equal(avGetSampleFmtFromName('s32p'), AV_SAMPLE_FMT_S32P);
-      assert.equal(avGetSampleFmtFromName('fltp'), AV_SAMPLE_FMT_FLTP);
-      assert.equal(avGetSampleFmtFromName('dblp'), AV_SAMPLE_FMT_DBLP);
-    });
-
-    it('should handle invalid sample format name', () => {
-      const invalidFormat = avGetSampleFmtFromName('invalid_format_name');
-      assert.equal(invalidFormat, AV_SAMPLE_FMT_NONE, 'Should return AV_SAMPLE_FMT_NONE for invalid format name');
-
-      // Test empty string
-      assert.equal(avGetSampleFmtFromName(''), AV_SAMPLE_FMT_NONE, 'Should return AV_SAMPLE_FMT_NONE for empty string');
-
-      // Test case sensitivity
-      assert.equal(avGetSampleFmtFromName('S16'), AV_SAMPLE_FMT_NONE, 'Should return AV_SAMPLE_FMT_NONE for uppercase (case sensitive)');
-    });
-
-    it('should check if sample format is planar', () => {
-      // Non-planar formats
-      assert.equal(avSampleFmtIsPlanar(AV_SAMPLE_FMT_U8), false);
-      assert.equal(avSampleFmtIsPlanar(AV_SAMPLE_FMT_S16), false);
-      assert.equal(avSampleFmtIsPlanar(AV_SAMPLE_FMT_S32), false);
-      assert.equal(avSampleFmtIsPlanar(AV_SAMPLE_FMT_FLT), false);
-      assert.equal(avSampleFmtIsPlanar(AV_SAMPLE_FMT_DBL), false);
-
-      // Planar formats
-      assert.equal(avSampleFmtIsPlanar(AV_SAMPLE_FMT_U8P), true);
-      assert.equal(avSampleFmtIsPlanar(AV_SAMPLE_FMT_S16P), true);
-      assert.equal(avSampleFmtIsPlanar(AV_SAMPLE_FMT_S32P), true);
-      assert.equal(avSampleFmtIsPlanar(AV_SAMPLE_FMT_FLTP), true);
-      assert.equal(avSampleFmtIsPlanar(AV_SAMPLE_FMT_DBLP), true);
-    });
-
-    it('should get packed sample format', () => {
-      // Planar formats should return their packed equivalents
-      assert.equal(avGetPackedSampleFmt(AV_SAMPLE_FMT_U8P), AV_SAMPLE_FMT_U8);
-      assert.equal(avGetPackedSampleFmt(AV_SAMPLE_FMT_S16P), AV_SAMPLE_FMT_S16);
-      assert.equal(avGetPackedSampleFmt(AV_SAMPLE_FMT_S32P), AV_SAMPLE_FMT_S32);
-      assert.equal(avGetPackedSampleFmt(AV_SAMPLE_FMT_FLTP), AV_SAMPLE_FMT_FLT);
-      assert.equal(avGetPackedSampleFmt(AV_SAMPLE_FMT_DBLP), AV_SAMPLE_FMT_DBL);
-
-      // Packed formats should return themselves
-      assert.equal(avGetPackedSampleFmt(AV_SAMPLE_FMT_U8), AV_SAMPLE_FMT_U8);
-      assert.equal(avGetPackedSampleFmt(AV_SAMPLE_FMT_S16), AV_SAMPLE_FMT_S16);
-      assert.equal(avGetPackedSampleFmt(AV_SAMPLE_FMT_S32), AV_SAMPLE_FMT_S32);
-      assert.equal(avGetPackedSampleFmt(AV_SAMPLE_FMT_FLT), AV_SAMPLE_FMT_FLT);
-      assert.equal(avGetPackedSampleFmt(AV_SAMPLE_FMT_DBL), AV_SAMPLE_FMT_DBL);
-    });
-
-    it('should get planar sample format', () => {
-      // Packed formats should return their planar equivalents
-      assert.equal(avGetPlanarSampleFmt(AV_SAMPLE_FMT_U8), AV_SAMPLE_FMT_U8P);
-      assert.equal(avGetPlanarSampleFmt(AV_SAMPLE_FMT_S16), AV_SAMPLE_FMT_S16P);
-      assert.equal(avGetPlanarSampleFmt(AV_SAMPLE_FMT_S32), AV_SAMPLE_FMT_S32P);
-      assert.equal(avGetPlanarSampleFmt(AV_SAMPLE_FMT_FLT), AV_SAMPLE_FMT_FLTP);
-      assert.equal(avGetPlanarSampleFmt(AV_SAMPLE_FMT_DBL), AV_SAMPLE_FMT_DBLP);
-
-      // Planar formats should return themselves
-      assert.equal(avGetPlanarSampleFmt(AV_SAMPLE_FMT_U8P), AV_SAMPLE_FMT_U8P);
-      assert.equal(avGetPlanarSampleFmt(AV_SAMPLE_FMT_S16P), AV_SAMPLE_FMT_S16P);
-      assert.equal(avGetPlanarSampleFmt(AV_SAMPLE_FMT_S32P), AV_SAMPLE_FMT_S32P);
-      assert.equal(avGetPlanarSampleFmt(AV_SAMPLE_FMT_FLTP), AV_SAMPLE_FMT_FLTP);
-      assert.equal(avGetPlanarSampleFmt(AV_SAMPLE_FMT_DBLP), AV_SAMPLE_FMT_DBLP);
-    });
-
-    it('should handle invalid sample format', () => {
-      const invalidFormat = 999999 as any;
-      const name = avGetSampleFmtName(invalidFormat);
-      assert.equal(name, null, 'Should return null for invalid format');
-
-      const bytes = avGetBytesPerSample(invalidFormat);
-      assert.equal(bytes, 0, 'Should return 0 for invalid format');
     });
   });
 
@@ -600,108 +416,6 @@ describe('Utilities', () => {
     });
   });
 
-  describe('Audio Sample Allocation Functions', () => {
-    it('should allocate audio samples for packed format', () => {
-      const nbChannels = 2;
-      const nbSamples = 1024;
-      const sampleFmt = AV_SAMPLE_FMT_S16; // Packed format
-      const align = 0;
-
-      const result = avSamplesAlloc(nbChannels, nbSamples, sampleFmt, align);
-
-      assert.ok(result.data instanceof Array, 'Should return data array');
-      assert.equal(result.data.length, 1, 'Packed format should have single buffer');
-      assert.ok(result.data[0] instanceof Buffer, 'Should contain Buffer');
-      assert.ok(result.linesize > 0, 'Should have positive linesize');
-      assert.ok(result.size > 0, 'Should have positive size');
-
-      // For S16 stereo: 2 bytes per sample * 2 channels * 1024 samples = 4096 bytes
-      const expectedSize = 2 * nbChannels * nbSamples;
-      assert.equal(result.size, expectedSize, 'Should allocate correct size');
-    });
-
-    it('should allocate audio samples for planar format', () => {
-      const nbChannels = 2;
-      const nbSamples = 1024;
-      const sampleFmt = AV_SAMPLE_FMT_FLTP; // Planar format
-      const align = 0;
-
-      const result = avSamplesAlloc(nbChannels, nbSamples, sampleFmt, align);
-
-      assert.ok(result.data instanceof Array, 'Should return data array');
-      assert.equal(result.data.length, nbChannels, 'Planar format should have buffer per channel');
-
-      for (let i = 0; i < nbChannels; i++) {
-        assert.ok(result.data[i] instanceof Buffer, `Channel ${i} should contain Buffer`);
-      }
-
-      assert.ok(result.linesize > 0, 'Should have positive linesize');
-      assert.ok(result.size > 0, 'Should have positive size');
-
-      // For FLTP: 4 bytes per sample * 1024 samples per channel * 2 channels = 8192 bytes
-      const expectedSize = 4 * nbSamples * nbChannels;
-      assert.equal(result.size, expectedSize, 'Should allocate correct size');
-    });
-
-    it('should get buffer size for audio samples', () => {
-      const nbChannels = 2;
-      const nbSamples = 1024;
-      const sampleFmt = AV_SAMPLE_FMT_S16;
-      const align = 0;
-
-      const result = avSamplesGetBufferSize(nbChannels, nbSamples, sampleFmt, align);
-
-      assert.ok(result.size > 0, 'Should return positive size');
-      assert.ok(result.linesize > 0, 'Should return positive linesize');
-
-      // For S16 stereo: 2 bytes per sample * 2 channels * 1024 samples = 4096 bytes
-      const expectedSize = 2 * nbChannels * nbSamples;
-      assert.equal(result.size, expectedSize, 'Should calculate correct size');
-    });
-
-    it('should handle alignment in allocation', () => {
-      const nbChannels = 1;
-      const nbSamples = 1023; // Odd number to test alignment
-      const sampleFmt = AV_SAMPLE_FMT_U8;
-      const align = 32; // 32-byte alignment
-
-      const result = avSamplesAlloc(nbChannels, nbSamples, sampleFmt, align);
-
-      assert.ok(result.data instanceof Array, 'Should return data array');
-      assert.ok(result.data[0] instanceof Buffer, 'Should contain Buffer');
-
-      // Linesize should be aligned to 32 bytes
-      assert.equal(result.linesize % align, 0, 'Linesize should be aligned');
-    });
-
-    it('should handle different sample formats', () => {
-      const nbChannels = 1;
-      const nbSamples = 100;
-      const align = 1; // Use align=1 to avoid alignment padding
-
-      // Test various formats
-      const formats = [
-        { fmt: AV_SAMPLE_FMT_U8, bytesPerSample: 1 },
-        { fmt: AV_SAMPLE_FMT_S16, bytesPerSample: 2 },
-        { fmt: AV_SAMPLE_FMT_S32, bytesPerSample: 4 },
-        { fmt: AV_SAMPLE_FMT_FLT, bytesPerSample: 4 },
-        { fmt: AV_SAMPLE_FMT_DBL, bytesPerSample: 8 },
-      ];
-
-      for (const { fmt, bytesPerSample } of formats) {
-        const result = avSamplesGetBufferSize(nbChannels, nbSamples, fmt, align);
-        const expectedSize = bytesPerSample * nbChannels * nbSamples;
-        assert.equal(result.size, expectedSize, `Format ${fmt} should have size ${expectedSize}`);
-      }
-    });
-
-    it('should throw on invalid parameters', () => {
-      assert.throws(() => avSamplesAlloc(-1, 1024, AV_SAMPLE_FMT_S16, 0), 'Should throw for negative channels');
-      assert.throws(() => avSamplesAlloc(2, -1, AV_SAMPLE_FMT_S16, 0), 'Should throw for negative samples');
-      assert.throws(() => avSamplesAlloc(2, 1024, -1 as any, 0), 'Should throw for invalid format');
-    });
-  });
-
   describe('SDP Functions', () => {
     it('should create SDP from FormatContext array', () => {
       // Create output format contexts for RTP
@@ -803,24 +517,6 @@ describe('Utilities', () => {
       await media.close();
     });
 
-    it('should get RFC 6381 codec string for audio', async () => {
-      const media = await Demuxer.open(inputFile);
-      const audioStream = media.audio();
-
-      if (audioStream) {
-        const codecString = avGetCodecString(audioStream.codecpar);
-        assert.ok(codecString, 'Should return codec string');
-        assert.ok(typeof codecString === 'string', 'Should be string');
-
-        // AAC should return format like "mp4a.40.2"
-        console.log('Audio codec string:', codecString);
-      } else {
-        console.log('Skipping audio codec string test: no audio stream');
-      }
-
-      await media.close();
-    });
-
     it('should accept optional frame rate parameter', async () => {
       const media = await Demuxer.open(inputFile);
       const videoStream = media.video();
@@ -851,25 +547,6 @@ describe('Utilities', () => {
       // H.264 should return "video/mp4"
       console.log('Video MIME type:', mimeType);
       assert.ok(mimeType.startsWith('video/'), 'Should start with video/');
-
-      await media.close();
-    });
-
-    it('should get MIME type for audio stream', async () => {
-      const media = await Demuxer.open(inputFile);
-      const audioStream = media.audio();
-
-      if (audioStream) {
-        const mimeType = avGetMimeTypeDash(audioStream.codecpar);
-        assert.ok(mimeType, 'Should return MIME type');
-        assert.ok(typeof mimeType === 'string', 'Should be string');
-
-        // AAC should return "audio/mp4"
-        console.log('Audio MIME type:', mimeType);
-        assert.ok(mimeType.startsWith('audio/'), 'Should start with audio/');
-      } else {
-        console.log('Skipping audio MIME type test: no audio stream');
-      }
 
       await media.close();
     });
@@ -1104,82 +781,5 @@ describe('Utilities', () => {
       assert.ok(typeof lastRef.value === 'bigint');
     });
 
-    it('should handle audio resampling with avRescaleDelta', () => {
-      // Test common audio resampling scenario
-      const inTb = new Rational(1, 48000); // 48kHz input
-      const inTs = 48000n; // 1 second
-      const fsTb = new Rational(1, 44100); // 44.1kHz target
-      const duration = 1024; // AAC frame size
-      const lastRef = { value: 0n };
-      const outTb = new Rational(1, 44100);
-
-      const result = avRescaleDelta(inTb, inTs, fsTb, duration, lastRef, outTb);
-      assert.ok(typeof result === 'bigint');
-      assert.ok(result > 0n);
-    });
-  });
-
-  describe('Audio Frame Duration', () => {
-    it('should get audio frame duration for AAC', async () => {
-      const inputFile = getInputFile('demux.mp4');
-      const media = await Demuxer.open(inputFile);
-      const audioStream = media.audio();
-
-      if (audioStream) {
-        const codecpar = audioStream.codecpar;
-        const frameBytes = 1024;
-
-        const duration = avGetAudioFrameDuration2(codecpar, frameBytes);
-        assert.ok(typeof duration === 'number');
-        assert.ok(duration >= 0);
-
-        // AAC typically has 1024 samples per frame
-        if (duration > 0) {
-          console.log('Audio frame duration:', duration, 'samples');
-        }
-      } else {
-        console.log('Skipping audio frame duration test: no audio stream');
-      }
-
-      await media.close();
-    });
-
-    it('should handle various frame sizes', async () => {
-      const inputFile = getInputFile('demux.mp4');
-      const media = await Demuxer.open(inputFile);
-      const audioStream = media.audio();
-
-      if (audioStream) {
-        const codecpar = audioStream.codecpar;
-
-        // Test different frame byte sizes
-        const testSizes = [512, 1024, 2048, 4096];
-
-        for (const frameBytes of testSizes) {
-          const duration = avGetAudioFrameDuration2(codecpar, frameBytes);
-          assert.ok(typeof duration === 'number');
-          assert.ok(duration >= 0);
-        }
-      }
-
-      await media.close();
-    });
-
-    it('should handle zero frame bytes', async () => {
-      const inputFile = getInputFile('demux.mp4');
-      const media = await Demuxer.open(inputFile);
-      const audioStream = media.audio();
-
-      if (audioStream) {
-        const codecpar = audioStream.codecpar;
-
-        // Zero bytes should return 0 or calculated duration
-        const duration = avGetAudioFrameDuration2(codecpar, 0);
-        assert.ok(typeof duration === 'number');
-        assert.ok(duration >= 0);
-      }
-
-      await media.close();
-    });
   });
 });

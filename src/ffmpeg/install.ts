@@ -26,7 +26,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const __require = createRequire(import.meta.url);
 
-const releasesUrl = 'https://api.github.com/repos/seydx/node-av/releases';
+const releasesUrl = 'https://api.github.com/repos/revizly/node-av/releases';
 const pJson = __require('../../package.json');
 const ffmpegVersion = `v${FFMPEG_VERSION}`;
 

@@ -33,12 +33,12 @@ describe('FilterGraphSegment', () => {
       graph.free();
     });
 
-    it('should parse audio filter segment', () => {
+    it('should parse multi-filter segment', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const segment = graph.segmentParse('volume=0.5,atempo=1.5');
-      assert.ok(segment, 'Should parse audio filter chain');
+      const segment = graph.segmentParse('crop=640:480,hflip');
+      assert.ok(segment, 'Should parse multi-filter chain');
 
       if (segment) {
         segment.free();
@@ -127,7 +127,7 @@ describe('FilterGraphSegment', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const segment = graph.segmentParse('volume=0.5');
+      const segment = graph.segmentParse('crop=640:480');
       assert.ok(segment);
 
       if (segment) {
@@ -193,7 +193,7 @@ describe('FilterGraphSegment', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const segment = graph.segmentParse('scale=w=1920:h=1080,hflip,volume=0.8');
+      const segment = graph.segmentParse('scale=w=1920:h=1080,hflip,vflip');
       assert.ok(segment);
 
       if (segment) {
@@ -211,7 +211,7 @@ describe('FilterGraphSegment', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const segment = graph.segmentParse('volume=0.5');
+      const segment = graph.segmentParse('crop=640:480');
       assert.ok(segment);
 
       if (segment) {
@@ -536,21 +536,21 @@ describe('FilterGraphSegment', () => {
       graph.free();
     });
 
-    it('should handle audio filter segment workflow', () => {
+    it('should handle video filter segment workflow with crop and flip', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      // Create audio buffer and sink
-      const abufferFilter = Filter.getByName('abuffer');
-      const asinkFilter = Filter.getByName('abuffersink');
-      assert.ok(abufferFilter && asinkFilter);
+      // Create video buffer and sink
+      const bufferFilter = Filter.getByName('buffer');
+      const sinkFilter = Filter.getByName('buffersink');
+      assert.ok(bufferFilter && sinkFilter);
 
-      const abuffersrc = graph.createFilter(abufferFilter, 'ain', 'sample_rate=44100:sample_fmt=1:channel_layout=stereo');
-      const abuffersink = graph.createFilter(asinkFilter, 'aout');
-      assert.ok(abuffersrc && abuffersink);
+      const buffersrc = graph.createFilter(bufferFilter, 'vin', 'video_size=1920x1080:pix_fmt=0:time_base=1/30');
+      const buffersink = graph.createFilter(sinkFilter, 'vout');
+      assert.ok(buffersrc && buffersink);
 
-      // Parse audio filter segment
-      const segment = graph.segmentParse('volume=0.5,atempo=1.2');
+      // Parse video filter segment
+      const segment = graph.segmentParse('crop=1280:720,hflip');
       assert.ok(segment);
 
       if (segment) {
@@ -561,17 +561,17 @@ describe('FilterGraphSegment', () => {
         const outputs = new FilterInOut();
 
         const ret = segment.apply(inputs, outputs);
-        assert.equal(ret, 0, 'Should apply audio segment');
+        assert.equal(ret, 0, 'Should apply video segment');
 
         const segmentInput = inputs.filterCtx;
         const segmentOutput = outputs.filterCtx;
 
         if (segmentInput && segmentOutput) {
-          abuffersrc.link(0, segmentInput, inputs.padIdx);
-          segmentOutput.link(outputs.padIdx, abuffersink, 0);
+          buffersrc.link(0, segmentInput, inputs.padIdx);
+          segmentOutput.link(outputs.padIdx, buffersink, 0);
 
           const configRet = graph.configSync();
-          assert.equal(configRet, 0, 'Should configure audio graph');
+          assert.equal(configRet, 0, 'Should configure video graph');
         }
 
         inputs.free();

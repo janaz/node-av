@@ -2,7 +2,6 @@ import assert from 'node:assert';
 import { describe, it } from 'node:test';
 
 import {
-  AV_CODEC_ID_AAC,
   AV_CODEC_ID_H264,
   AVERROR_EAGAIN,
   AVERROR_EOF,
@@ -32,17 +31,6 @@ describe('BitStreamFilter', () => {
       }
     });
 
-    it('should find aac_adtstoasc filter by name', () => {
-      const filter = BitStreamFilter.getByName('aac_adtstoasc');
-      assert.ok(filter, 'aac_adtstoasc filter should exist');
-      assert.equal(filter.name, 'aac_adtstoasc');
-
-      // Check if it supports AAC
-      if (filter.codecIds) {
-        assert.ok(filter.codecIds.includes(AV_CODEC_ID_AAC), 'Should support AAC codec');
-      }
-    });
-
     it('should return null for non-existent filter', () => {
       const filter = BitStreamFilter.getByName('non_existent_filter');
       assert.equal(filter, null);
@@ -58,7 +46,7 @@ describe('BitStreamFilter', () => {
       }
 
       // Common filters that should exist
-      const expectedFilters = ['h264_mp4toannexb', 'aac_adtstoasc', 'null'];
+      const expectedFilters = ['h264_mp4toannexb', 'null'];
       for (const expectedName of expectedFilters) {
         const found = filters.some((f) => f.name === expectedName);
         assert.ok(found, `Should find ${expectedName} filter`);

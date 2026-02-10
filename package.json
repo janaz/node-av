@@ -1,5 +1,5 @@
 {
-  "name": "node-av",
+  "name": "@revizly/node-av",
   "version": "5.2.2-beta.1",
   "description": "FFmpeg bindings for Node.js",
   "author": "seydx (https://github.com/seydx/node-av)",
@@ -71,18 +71,11 @@
     "update": "updates --update ./"
   },
   "dependencies": {
-    "unzipper": "^0.12.3",
-    "werift": "^0.22.4"
+    "unzipper": "^0.12.3"
   },
   "optionalDependencies": {
-    "@seydx/node-av-darwin-arm64": "^5.2.2-beta.1",
-    "@seydx/node-av-darwin-x64": "^5.2.2-beta.1",
-    "@seydx/node-av-linux-arm64": "^5.2.2-beta.1",
-    "@seydx/node-av-linux-x64": "^5.2.2-beta.1",
-    "@seydx/node-av-win32-arm64-mingw": "^5.2.2-beta.1",
-    "@seydx/node-av-win32-arm64-msvc": "^5.2.2-beta.1",
-    "@seydx/node-av-win32-x64-mingw": "^5.2.2-beta.1",
-    "@seydx/node-av-win32-x64-msvc": "^5.2.2-beta.1"
+    "@revizly/node-av-linux-arm64": "^5.2.2-beta.1",
+    "@revizly/node-av-linux-x64": "^5.2.2-beta.1"
   },
   "devDependencies": {
     "@stylistic/eslint-plugin": "^5.7.1",
@@ -112,21 +105,6 @@
     "updates": "^17.3.1",
     "vitepress": "^2.0.0-alpha.16",
     "ws": "^8.19.0"
-  },
-  "overrides": {
-    "werift": {
-      "@shinyoshiaki/binary-data": "npm:@seydx/binary-data@0.6.2",
-      "ip": "npm:neoip@2.1.0"
-    },
-    "werift-dtls": {
-      "@shinyoshiaki/binary-data": "npm:@seydx/binary-data@0.6.2"
-    },
-    "werift-ice": {
-      "ip": "npm:neoip@2.1.0"
-    },
-    "werift-sctp": {
-      "@shinyoshiaki/binary-data": "npm:@seydx/binary-data@0.6.2"
-    }
   },
   "bugs": {
     "url": "https://github.com/seydx/node-av/issues"

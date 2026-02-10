@@ -1,0 +1,314 @@
+name: "Build and Package"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CACHE_VERSION_LINUX: "v34"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to set on packages (e.g. 5.2.2-beta.1). Leave empty to use package.json version."
+        required: false
+        type: string
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "externals/jellyfin-ffmpeg/**"
+      - ".github/workflows/build-and-package.yaml"
+      - "binding-jellyfin.gyp"
+
+jobs:
+  build_linux:
+    name: "Linux ${{ matrix.arch }}"
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            target: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Get Jellyfin FFmpeg commit hash
+        id: ffmpeg-hash
+        run: |
+          echo "hash=$(git -C externals/jellyfin-ffmpeg rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Prepare directories
+        run: |
+          sudo mkdir -p /opt/ffbuild/prefix
+          sudo chown -R $USER:$USER /opt/ffbuild
+          sudo chmod -R 755 /opt/ffbuild
+
+      - name: Restore FFmpeg cache
+        id: cache-ffmpeg
+        uses: actions/cache@v5
+        with:
+          path: |
+            /opt/ffbuild/prefix
+            externals/jellyfin-ffmpeg/config*.h
+          key: ffmpeg-linux-${{ matrix.arch }}-${{ env.CACHE_VERSION_LINUX }}-${{ steps.ffmpeg-hash.outputs.hash }}
+          restore-keys: |
+            ffmpeg-linux-${{ matrix.arch }}-${{ env.CACHE_VERSION_LINUX }}-${{ steps.ffmpeg-hash.outputs.hash }}
+            ffmpeg-linux-${{ matrix.arch }}-${{ env.CACHE_VERSION_LINUX }}-
+
+      - name: Build FFmpeg
+        id: build-ffmpeg
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          sudo rm -rf /opt/ffbuild
+          sudo mkdir -p /opt/ffbuild/prefix
+          sudo chown -R $USER:$USER /opt/ffbuild
+          sudo chmod -R 755 /opt/ffbuild
+
+          cd externals/jellyfin-ffmpeg/builder
+
+          if [ "${{ matrix.target }}" = "amd64" ]; then
+            TARGET="linux64"
+          else
+            TARGET="linuxarm64"
+          fi
+
+          IMAGE="ghcr.io/seydx/jellyfin-ffmpeg/${TARGET}-gpl:latest"
+
+          if docker pull "${IMAGE}" 2>/dev/null; then
+            echo "Using Docker image from registry: ${IMAGE}"
+          else
+            echo "Docker image not in registry, building locally..."
+            GITHUB_REPOSITORY="seydx/jellyfin-ffmpeg" ./makeimage.sh "${TARGET}" gpl
+          fi
+
+          export GITHUB_REPOSITORY="seydx/jellyfin-ffmpeg"
+          ./build.sh "${TARGET}" gpl
+
+          if [ -d ffbuild/prefix ]; then
+            sudo mkdir -p /opt/ffbuild/prefix
+            sudo cp -r ffbuild/prefix/* /opt/ffbuild/prefix/
+
+            echo "Copying config files from FFmpeg build directory..."
+            for config_file in ffbuild/ffmpeg/config*.h; do
+              if [ -f "$config_file" ]; then
+                filename=$(basename "$config_file")
+                sudo cp "$config_file" "../$filename"
+                echo "Copied $filename"
+              fi
+            done
+
+            if [ ! -f ../config.h ] || [ ! -f ../config_components.h ]; then
+              echo "Error: config.h or config_components.h not found!"
+              exit 1
+            fi
+
+            CONTAINER_ID=$(docker create "${IMAGE}")
+            docker cp "${CONTAINER_ID}:/opt/ffbuild/lib" /tmp/codec-libs 2>/dev/null && {
+              sudo cp -n /tmp/codec-libs/*.a /opt/ffbuild/prefix/lib/ 2>/dev/null || true
+              rm -rf /tmp/codec-libs
+            }
+            docker cp "${CONTAINER_ID}:/opt/ffbuild/include" /tmp/codec-includes 2>/dev/null && {
+              sudo cp -rn /tmp/codec-includes/* /opt/ffbuild/prefix/include/ 2>/dev/null || true
+              rm -rf /tmp/codec-includes
+            }
+            docker rm "${CONTAINER_ID}"
+
+            rm -rf ffbuild
+            sudo chown -R $USER:$USER /opt/ffbuild
+          else
+            echo "Error: ffbuild/prefix not found!"
+            exit 1
+          fi
+
+          cd ../..
+
+      - name: Save FFmpeg cache
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true' && steps.build-ffmpeg.outcome == 'success'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            /opt/ffbuild/prefix
+            externals/jellyfin-ffmpeg/config*.h
+          key: ffmpeg-linux-${{ matrix.arch }}-${{ env.CACHE_VERSION_LINUX }}-${{ steps.ffmpeg-hash.outputs.hash }}
+
+      - name: Build Native Addon in Docker
+        run: |
+          cp binding-jellyfin.gyp binding.gyp
+
+          if [ "${{ matrix.target }}" = "amd64" ]; then
+            TARGET="linux64"
+          else
+            TARGET="linuxarm64"
+          fi
+
+          IMAGE="ghcr.io/seydx/jellyfin-ffmpeg/${TARGET}-gpl:latest"
+
+          if ! docker image inspect "${IMAGE}" > /dev/null 2>&1; then
+            docker pull "${IMAGE}"
+          fi
+
+          docker run --rm \
+            -v "$(pwd)":/workspace \
+            -v /opt/ffbuild:/opt/ffbuild \
+            -w /workspace \
+            -e PKG_CONFIG_PATH="/opt/ffbuild/prefix/lib/pkgconfig" \
+            "${IMAGE}" \
+            bash -c "
+              set -e
+              curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+              apt-get install -y nodejs
+              npm install --ignore-scripts
+              npx prebuildify --napi --strip --arch=${{ matrix.arch }} --tag-libc
+              chown -R 1001:127 prebuilds node_modules build 2>/dev/null || true
+            "
+
+          BUILT_FILE=$(find prebuilds -name "*.node" -type f | head -1)
+          if [ -n "$BUILT_FILE" ]; then
+            DIR=$(dirname "$BUILT_FILE")
+            mv "$BUILT_FILE" "$DIR/node-av.node"
+            echo "Renamed $(basename $BUILT_FILE) -> node-av.node"
+
+            mkdir -p binary
+            cp "$DIR/node-av.node" binary/node-av.node
+          else
+            echo "Error: No .node file found in prebuilds directory"
+            exit 1
+          fi
+
+      - name: Run Tests
+        env:
+          AV_FROM_SOURCE: 1
+        run: |
+          npm install --ignore-scripts
+          npm run test:all
+
+      - name: Upload Prebuild
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: prebuild-linux-${{ matrix.arch }}
+          path: prebuilds/
+          if-no-files-found: ignore
+
+  package:
+    name: "Package NPM Tarballs"
+    needs: build_linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: npm install --ignore-scripts
+
+      - name: Build TypeScript
+        run: npm run build:tsc
+
+      - name: Download all prebuilds
+        uses: actions/download-artifact@v7
+        with:
+          pattern: prebuild-*
+          path: prebuilds-artifacts
+
+      - name: Prepare prebuilds structure
+        run: |
+          mkdir -p prebuilds
+
+          for dir in prebuilds-artifacts/*/; do
+            cp -r "$dir"* prebuilds/
+          done
+
+          echo "Combined prebuilds structure:"
+          ls -laR prebuilds/
+
+          echo -e "\nVerifying platform coverage:"
+          for platform in linux-x64 linux-arm64; do
+            if [ -d "prebuilds/$platform" ]; then
+              echo "  $platform"
+            else
+              echo "  MISSING: $platform"
+              exit 1
+            fi
+          done
+
+      - name: Create platform packages
+        run: |
+          node scripts/create-platform-packages.js
+
+          for platform in linux-x64 linux-arm64; do
+            if [ -d "prebuilds/$platform" ]; then
+              cd "prebuilds/$platform"
+              zip -9 "../../packages/$platform/node-av.node.zip" node-av.node
+              cd ../..
+              echo "Compressed binary for $platform"
+            fi
+          done
+
+      - name: Update version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Using version: $VERSION"
+
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          if [ "$CURRENT_VERSION" != "$VERSION" ]; then
+            npm version $VERSION --no-git-tag-version
+          fi
+
+          for pkg in packages/*/package.json; do
+            if [ -f "$pkg" ]; then
+              cd $(dirname "$pkg")
+              PKG_VERSION=$(node -p "require('./package.json').version")
+              if [ "$PKG_VERSION" != "$VERSION" ]; then
+                npm version $VERSION --no-git-tag-version
+              fi
+              cd -
+            fi
+          done
+
+      - name: Create npm tarballs
+        run: |
+          mkdir -p npm-packages
+
+          # Pack platform packages
+          for platform in linux-x64 linux-arm64; do
+            cd "packages/$platform"
+            npm pack --pack-destination ../../npm-packages
+            cd ../..
+          done
+
+          # Pack main package
+          npm pack --pack-destination npm-packages
+
+          echo "Created npm packages:"
+          ls -la npm-packages/
+
+      - name: Upload npm packages
+        uses: actions/upload-artifact@v6
+        with:
+          name: npm-packages
+          path: npm-packages/*.tgz
+          if-no-files-found: error

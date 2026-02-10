@@ -7,7 +7,6 @@
 
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { type } from 'node:os';
 import { resolve } from 'node:path';
 
 import { getDirname } from '../utils/electron.js';
@@ -384,33 +383,11 @@ function loadBinding(): NativeBinding {
   }
 
   if (!loadLocal) {
-    // For Windows, detect MinGW vs MSVC environment
-    if (platform === 'win32') {
-      const useMingW = type() !== 'Windows_NT';
-      if (useMingW) {
-        try {
-          const packageName = `@seydx/node-av-${platformArch}-mingw`;
-          return require(`${packageName}/node-av.node`);
-        } catch (err) {
-          errors.push(new Error(`MinGW package not found or loading failed: ${err}`));
-        }
-      }
-
-      // Fallback to MSVC
-      try {
-        const packageName = `@seydx/node-av-${platformArch}-msvc`;
-        return require(`${packageName}/node-av.node`);
-      } catch (err) {
-        errors.push(new Error(`MSVC package not found or loading failed: ${err}`));
-      }
-    } else {
-      // Non-Windows platforms
-      try {
-        const packageName = `@seydx/node-av-${platformArch}`;
-        return require(`${packageName}/node-av.node`);
-      } catch (err) {
-        errors.push(new Error(`Platform package not found or loading failed: ${err}`));
-      }
+    try {
+      const packageName = `@revizly/node-av-${platformArch}`;
+      return require(`${packageName}/node-av.node`);
+    } catch (err) {
+      errors.push(new Error(`Platform package not found or loading failed: ${err}`));
     }
   }
 

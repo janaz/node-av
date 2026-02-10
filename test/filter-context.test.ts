@@ -2,13 +2,10 @@ import assert from 'node:assert';
 import { describe, it } from 'node:test';
 
 import {
-  AV_CHANNEL_LAYOUT_5POINT1_BACK,
-  AV_CHANNEL_LAYOUT_STEREO,
   AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
   AV_OPT_TYPE_BINARY_INT_ARRAY,
   AV_PIX_FMT_RGB24,
   AV_PIX_FMT_YUV420P,
-  AV_SAMPLE_FMT_S16,
   Filter,
   FilterContext,
   FilterGraph,
@@ -22,12 +19,12 @@ describe('FilterContext', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const anullFilter = Filter.getByName('anull');
-      assert.ok(anullFilter, 'Should find anull filter');
+      const nullFilter = Filter.getByName('null');
+      assert.ok(nullFilter, 'Should find null filter');
 
-      const ctx = graph.createFilter(anullFilter, 'my_anull');
+      const ctx = graph.createFilter(nullFilter, 'my_null');
       assert.ok(ctx instanceof FilterContext, 'Should create FilterContext instance');
-      assert.equal(ctx.name, 'my_anull', 'Should have correct name');
+      assert.equal(ctx.name, 'my_null', 'Should have correct name');
 
       graph.free();
     });
@@ -36,25 +33,25 @@ describe('FilterContext', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const anullFilter = Filter.getByName('anull');
-      const volumeFilter = Filter.getByName('volume');
-      const aformatFilter = Filter.getByName('aformat');
+      const nullFilter = Filter.getByName('null');
+      const scaleFilter = Filter.getByName('scale');
+      const cropFilter = Filter.getByName('crop');
 
-      assert.ok(anullFilter);
-      assert.ok(volumeFilter);
-      assert.ok(aformatFilter);
+      assert.ok(nullFilter);
+      assert.ok(scaleFilter);
+      assert.ok(cropFilter);
 
-      const anullCtx = graph.createFilter(anullFilter, 'in');
-      const volumeCtx = graph.createFilter(volumeFilter, 'vol');
-      const aformatCtx = graph.createFilter(aformatFilter, 'out');
+      const nullCtx = graph.createFilter(nullFilter, 'in');
+      const scaleCtx = graph.createFilter(scaleFilter, 'scl');
+      const cropCtx = graph.createFilter(cropFilter, 'out');
 
-      assert.ok(anullCtx instanceof FilterContext);
-      assert.ok(volumeCtx instanceof FilterContext);
-      assert.ok(aformatCtx instanceof FilterContext);
+      assert.ok(nullCtx instanceof FilterContext);
+      assert.ok(scaleCtx instanceof FilterContext);
+      assert.ok(cropCtx instanceof FilterContext);
 
-      assert.equal(anullCtx.name, 'in');
-      assert.equal(volumeCtx.name, 'vol');
-      assert.equal(aformatCtx.name, 'out');
+      assert.equal(nullCtx.name, 'in');
+      assert.equal(scaleCtx.name, 'scl');
+      assert.equal(cropCtx.name, 'out');
 
       graph.free();
     });
@@ -111,11 +108,11 @@ describe('FilterContext', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const anullFilter = Filter.getByName('anull');
-      assert.ok(anullFilter, 'Should find anull filter');
+      const nullFilter = Filter.getByName('null');
+      assert.ok(nullFilter, 'Should find null filter');
 
       // Some filters don't need arguments - pass null or undefined
-      const ctx = graph.createFilter(anullFilter, 'anull', null);
+      const ctx = graph.createFilter(nullFilter, 'null', null);
       assert.ok(ctx, 'Should create and initialize filter without arguments');
 
       graph.free();
@@ -161,7 +158,7 @@ describe('FilterContext', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const filter = Filter.getByName('anull');
+      const filter = Filter.getByName('null');
       assert.ok(filter);
 
       const ctx = graph.createFilter(filter, 'original_name');
@@ -180,7 +177,7 @@ describe('FilterContext', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const filter = Filter.getByName('anull');
+      const filter = Filter.getByName('null');
       assert.ok(filter);
 
       const ctx = graph.createFilter(filter, 'buf');
@@ -417,44 +414,6 @@ describe('FilterContext', () => {
 
       graph.free();
     });
-
-    it('should create audio processing pipeline', () => {
-      const graph = new FilterGraph();
-      graph.alloc();
-
-      // Get audio filters
-      const filters = {
-        abuffer: Filter.getByName('abuffer'),
-        volume: Filter.getByName('volume'),
-        aformat: Filter.getByName('aformat'),
-        abuffersink: Filter.getByName('abuffersink'),
-      };
-
-      // Verify all filters exist
-      Object.entries(filters).forEach(([name, filter]) => {
-        assert.ok(filter, `Should find ${name} filter`);
-      });
-
-      // Create filter contexts with initialization
-      const contexts = {
-        abuffer: graph.createFilter(filters.abuffer!, 'ain', 'sample_rate=44100:sample_fmt=1:channel_layout=3'),
-        volume: graph.createFilter(filters.volume!, 'vol', '0.5'), // Reduce volume to 50%
-        aformat: graph.createFilter(filters.aformat!, 'fmt', 'sample_rates=48000:sample_fmts=1:channel_layouts=3'),
-        abuffersink: graph.createFilter(filters.abuffersink!, 'aout', null),
-      };
-
-      assert.ok(contexts.abuffer, 'Should create abuffer context');
-      assert.ok(contexts.volume, 'Should create volume context');
-      assert.ok(contexts.aformat, 'Should create aformat context');
-      assert.ok(contexts.abuffersink, 'Should create abuffersink context');
-
-      // Link: abuffer -> volume -> aformat -> abuffersink
-      assert.equal(contexts.abuffer.link(0, contexts.volume, 0), 0);
-      assert.equal(contexts.volume.link(0, contexts.aformat, 0), 0);
-      assert.equal(contexts.aformat.link(0, contexts.abuffersink, 0), 0);
-
-      graph.free();
-    });
   });
 
   describe('Advanced Operations', () => {
@@ -495,26 +454,26 @@ describe('FilterContext', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      // Create a complete audio pipeline to properly initialize buffersink
-      const abufferFilter = Filter.getByName('abuffer');
-      const abuffersinkFilter = Filter.getByName('abuffersink');
-      assert.ok(abufferFilter);
-      assert.ok(abuffersinkFilter);
+      // Create a complete video pipeline to properly initialize buffersink
+      const bufferFilter = Filter.getByName('buffer');
+      const buffersinkFilter = Filter.getByName('buffersink');
+      assert.ok(bufferFilter);
+      assert.ok(buffersinkFilter);
 
-      const abufferCtx = graph.createFilter(abufferFilter, 'src', 'sample_rate=44100:sample_fmt=1:channel_layout=3');
-      const abuffersinkCtx = graph.createFilter(abuffersinkFilter, 'sink', null);
-      assert.ok(abufferCtx);
-      assert.ok(abuffersinkCtx);
+      const bufferCtx = graph.createFilter(bufferFilter, 'src', 'video_size=320x240:pix_fmt=0:time_base=1/25');
+      const buffersinkCtx = graph.createFilter(buffersinkFilter, 'sink', null);
+      assert.ok(bufferCtx);
+      assert.ok(buffersinkCtx);
 
       // Link the filters
-      abufferCtx.link(0, abuffersinkCtx, 0);
+      bufferCtx.link(0, buffersinkCtx, 0);
 
       // Configure the graph
       const configRet = await graph.config();
       assert.equal(configRet, 0, 'Should configure graph');
 
       // Get time base from buffersink
-      const timeBase = abuffersinkCtx.buffersinkGetTimeBase();
+      const timeBase = buffersinkCtx.buffersinkGetTimeBase();
       assert.ok(timeBase, 'Should get time base');
       assert.equal(typeof timeBase.num, 'number', 'Time base numerator should be a number');
       assert.equal(typeof timeBase.den, 'number', 'Time base denominator should be a number');
@@ -527,26 +486,26 @@ describe('FilterContext', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      // Create a complete audio pipeline to properly initialize buffersink
-      const abufferFilter = Filter.getByName('abuffer');
-      const abuffersinkFilter = Filter.getByName('abuffersink');
-      assert.ok(abufferFilter);
-      assert.ok(abuffersinkFilter);
+      // Create a complete video pipeline to properly initialize buffersink
+      const bufferFilter = Filter.getByName('buffer');
+      const buffersinkFilter = Filter.getByName('buffersink');
+      assert.ok(bufferFilter);
+      assert.ok(buffersinkFilter);
 
-      const abufferCtx = graph.createFilter(abufferFilter, 'src', 'sample_rate=44100:sample_fmt=1:channel_layout=3');
-      const abuffersinkCtx = graph.createFilter(abuffersinkFilter, 'sink', null);
-      assert.ok(abufferCtx);
-      assert.ok(abuffersinkCtx);
+      const bufferCtx = graph.createFilter(bufferFilter, 'src', 'video_size=320x240:pix_fmt=0:time_base=1/25');
+      const buffersinkCtx = graph.createFilter(buffersinkFilter, 'sink', null);
+      assert.ok(bufferCtx);
+      assert.ok(buffersinkCtx);
 
       // Link the filters
-      abufferCtx.link(0, abuffersinkCtx, 0);
+      bufferCtx.link(0, buffersinkCtx, 0);
 
       // Configure the graph synchronously
       const configRet = graph.configSync();
       assert.equal(configRet, 0, 'Should configure graph');
 
       // Get time base from buffersink
-      const timeBase = abuffersinkCtx.buffersinkGetTimeBase();
+      const timeBase = buffersinkCtx.buffersinkGetTimeBase();
       assert.ok(timeBase, 'Should get time base');
       assert.equal(typeof timeBase.num, 'number', 'Time base numerator should be a number');
       assert.equal(typeof timeBase.den, 'number', 'Time base denominator should be a number');
@@ -561,7 +520,7 @@ describe('FilterContext', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const filter = Filter.getByName('anull');
+      const filter = Filter.getByName('null');
       assert.ok(filter);
 
       const ctx = graph.createFilter(filter, 'buf');
@@ -599,9 +558,9 @@ describe('FilterContext', () => {
 
       // Create multiple filter contexts
       for (let i = 0; i < 5; i++) {
-        const filter = Filter.getByName('anull');
+        const filter = Filter.getByName('null');
         assert.ok(filter);
-        const ctx = graph.createFilter(filter, `anull_${i}`);
+        const ctx = graph.createFilter(filter, `null_${i}`);
 
         if (ctx) {
           contexts.push(ctx);
@@ -736,53 +695,6 @@ describe('FilterContext', () => {
       graph.free();
     });
 
-    it('should handle audio buffer source and sink', async () => {
-      const graph = new FilterGraph();
-      graph.alloc();
-
-      // Create audio buffer -> sink
-      const abufferFilter = Filter.getByName('abuffer');
-      const abuffersinkFilter = Filter.getByName('abuffersink');
-      assert.ok(abufferFilter);
-      assert.ok(abuffersinkFilter);
-
-      const abufferCtx = graph.createFilter(abufferFilter, 'asrc', 'sample_rate=44100:sample_fmt=1:channel_layout=3:time_base=1/44100');
-      const abuffersinkCtx = graph.createFilter(abuffersinkFilter, 'asink');
-      assert.ok(abufferCtx);
-      assert.ok(abuffersinkCtx);
-
-      // Link and configure
-      const linkRet = abufferCtx.link(0, abuffersinkCtx, 0);
-      assert.equal(linkRet, 0);
-      const configRet = await graph.config();
-      assert.equal(configRet, 0);
-
-      // Create audio frame
-      const audioFrame = new Frame();
-      audioFrame.alloc();
-      audioFrame.format = AV_SAMPLE_FMT_S16;
-      audioFrame.sampleRate = 44100;
-      audioFrame.nbSamples = 1024;
-      audioFrame.pts = 0n;
-      audioFrame.channelLayout = AV_CHANNEL_LAYOUT_STEREO;
-      audioFrame.allocBuffer();
-
-      // Add and get audio frame
-      const addRet = await abufferCtx.buffersrcAddFrame(audioFrame);
-      assert.ok(addRet >= 0, 'Should add audio frame');
-
-      const outFrame = new Frame();
-      outFrame.alloc();
-      const getRet = await abuffersinkCtx.buffersinkGetFrame(outFrame);
-      assert.ok(getRet >= 0, 'Should get audio frame');
-      assert.equal(outFrame.sampleRate, 44100);
-      assert.equal(outFrame.nbSamples, 1024);
-
-      audioFrame.free();
-      outFrame.free();
-      graph.free();
-    });
-
     it('should add frame to buffer source filter (sync)', () => {
       const graph = new FilterGraph();
       graph.alloc();
@@ -867,53 +779,6 @@ describe('FilterContext', () => {
       graph.free();
     });
 
-    it('should handle audio buffer source and sink (sync)', () => {
-      const graph = new FilterGraph();
-      graph.alloc();
-
-      // Create audio buffer -> sink
-      const abufferFilter = Filter.getByName('abuffer');
-      const abuffersinkFilter = Filter.getByName('abuffersink');
-      assert.ok(abufferFilter);
-      assert.ok(abuffersinkFilter);
-
-      const abufferCtx = graph.createFilter(abufferFilter, 'asrc', 'sample_rate=44100:sample_fmt=1:channel_layout=3:time_base=1/44100');
-      const abuffersinkCtx = graph.createFilter(abuffersinkFilter, 'asink');
-      assert.ok(abufferCtx);
-      assert.ok(abuffersinkCtx);
-
-      // Link and configure synchronously
-      const linkRet = abufferCtx.link(0, abuffersinkCtx, 0);
-      assert.equal(linkRet, 0);
-      const configRet = graph.configSync();
-      assert.equal(configRet, 0);
-
-      // Create audio frame
-      const audioFrame = new Frame();
-      audioFrame.alloc();
-      audioFrame.format = AV_SAMPLE_FMT_S16;
-      audioFrame.sampleRate = 44100;
-      audioFrame.nbSamples = 1024;
-      audioFrame.pts = 0n;
-      audioFrame.channelLayout = AV_CHANNEL_LAYOUT_STEREO;
-      audioFrame.allocBuffer();
-
-      // Add frame synchronously
-      const addRet = abufferCtx.buffersrcAddFrameSync(audioFrame);
-      assert.ok(addRet >= 0, 'Should add audio frame');
-
-      // Get frame from sink synchronously
-      const outFrame = new Frame();
-      outFrame.alloc();
-      const getRet = abuffersinkCtx.buffersinkGetFrameSync(outFrame);
-      assert.ok(getRet >= 0, 'Should get audio frame');
-      assert.equal(outFrame.sampleRate, 44100);
-      assert.equal(outFrame.nbSamples, 1024);
-
-      audioFrame.free();
-      outFrame.free();
-      graph.free();
-    });
   });
 
   describe('Hardware Device Context', () => {
@@ -1148,46 +1013,6 @@ describe('FilterContext', () => {
       graph.free();
     });
 
-    it('should get audio format properties from buffersink', async () => {
-      const graph = new FilterGraph();
-      graph.alloc();
-
-      // Create a complete audio pipeline
-      const abufferFilter = Filter.getByName('abuffer');
-      const abuffersinkFilter = Filter.getByName('abuffersink');
-      assert.ok(abufferFilter);
-      assert.ok(abuffersinkFilter);
-
-      const abufferCtx = graph.createFilter(abufferFilter, 'asrc', 'sample_rate=48000:sample_fmt=1:channel_layout=3');
-      const abuffersinkCtx = graph.createFilter(abuffersinkFilter, 'asink');
-      assert.ok(abufferCtx);
-      assert.ok(abuffersinkCtx);
-
-      // Link and configure
-      abufferCtx.link(0, abuffersinkCtx, 0);
-      const configRet = await graph.config();
-      assert.equal(configRet, 0);
-
-      // Get format properties from audio buffersink
-      const format = abuffersinkCtx.buffersinkGetFormat();
-      assert.equal(format, AV_SAMPLE_FMT_S16, 'Should get sample format');
-
-      const sampleRate = abuffersinkCtx.buffersinkGetSampleRate();
-      assert.equal(sampleRate, 48000, 'Should get sample rate');
-
-      const channelLayout = abuffersinkCtx.buffersinkGetChannelLayout();
-      assert.ok(channelLayout, 'Should get channel layout');
-      assert.equal(channelLayout.nbChannels, 2, 'Should have 2 channels');
-      assert.equal(channelLayout.mask, 3n, 'Should have stereo mask');
-
-      const timeBase = abuffersinkCtx.buffersinkGetTimeBase();
-      assert.ok(timeBase, 'Should get time base');
-      assert.equal(timeBase.num, 1, 'Should have correct time base numerator');
-      assert.equal(timeBase.den, 48000, 'Should have correct time base denominator');
-
-      graph.free();
-    });
-
     it('should get format after filter transformation', async () => {
       const graph = new FilterGraph();
       graph.alloc();
@@ -1245,62 +1070,6 @@ describe('FilterContext', () => {
       graph.free();
     });
 
-    it('should get format after audio resampling', async () => {
-      const graph = new FilterGraph();
-      graph.alloc();
-
-      // Create pipeline with aformat filter: abuffer -> aformat -> abuffersink
-      const abufferFilter = Filter.getByName('abuffer');
-      const aformatFilter = Filter.getByName('aformat');
-      const abuffersinkFilter = Filter.getByName('abuffersink');
-      assert.ok(abufferFilter);
-      assert.ok(aformatFilter);
-      assert.ok(abuffersinkFilter);
-
-      // Start with 44100 Hz
-      const abufferCtx = graph.createFilter(abufferFilter, 'asrc', 'sample_rate=44100:sample_fmt=1:channel_layout=3:time_base=1/44100');
-      // Resample to 48000 Hz
-      const aformatCtx = graph.createFilter(aformatFilter, 'fmt', 'sample_rates=48000:sample_fmts=1:channel_layouts=3');
-      const abuffersinkCtx = graph.createFilter(abuffersinkFilter, 'asink');
-      assert.ok(abufferCtx);
-      assert.ok(aformatCtx);
-      assert.ok(abuffersinkCtx);
-
-      // Link and configure
-      abufferCtx.link(0, aformatCtx, 0);
-      aformatCtx.link(0, abuffersinkCtx, 0);
-      const configRet = await graph.config();
-      assert.equal(configRet, 0);
-
-      // Add an audio frame to initialize the pipeline
-      const audioFrame = new Frame();
-      audioFrame.alloc();
-      audioFrame.format = AV_SAMPLE_FMT_S16;
-      audioFrame.sampleRate = 44100;
-      audioFrame.nbSamples = 1024;
-      audioFrame.pts = 0n;
-      audioFrame.channelLayout = AV_CHANNEL_LAYOUT_STEREO;
-      audioFrame.allocBuffer();
-
-      await abufferCtx.buffersrcAddFrame(audioFrame);
-
-      // Get the output frame
-      const outFrame = new Frame();
-      outFrame.alloc();
-      await abuffersinkCtx.buffersinkGetFrame(outFrame);
-
-      // Get resampled format from buffersink
-      const sampleRate = abuffersinkCtx.buffersinkGetSampleRate();
-      assert.equal(sampleRate, 48000, 'Should get resampled rate');
-
-      const format = abuffersinkCtx.buffersinkGetFormat();
-      assert.equal(format, AV_SAMPLE_FMT_S16, 'Format should remain S16');
-
-      audioFrame.free();
-      outFrame.free();
-      graph.free();
-    });
-
     it('should handle video format with non-square pixels', async () => {
       const graph = new FilterGraph();
       graph.alloc();
@@ -1348,55 +1117,6 @@ describe('FilterContext', () => {
       assert.equal(height, 480, 'Should get correct height');
 
       frame.free();
-      outFrame.free();
-      graph.free();
-    });
-
-    it('should handle multichannel audio layouts', async () => {
-      const graph = new FilterGraph();
-      graph.alloc();
-
-      const abufferFilter = Filter.getByName('abuffer');
-      const abuffersinkFilter = Filter.getByName('abuffersink');
-      assert.ok(abufferFilter);
-      assert.ok(abuffersinkFilter);
-
-      // Create 5.1 surround audio (6 channels)
-      // Channel layout mask for 5.1: FL+FR+FC+LFE+BL+BR = 0x3F
-      const abufferCtx = graph.createFilter(abufferFilter, 'asrc', 'sample_rate=48000:sample_fmt=1:channel_layout=0x3f:time_base=1/48000');
-      const abuffersinkCtx = graph.createFilter(abuffersinkFilter, 'asink');
-      assert.ok(abufferCtx);
-      assert.ok(abuffersinkCtx);
-
-      abufferCtx.link(0, abuffersinkCtx, 0);
-      const configRet = await graph.config();
-      assert.equal(configRet, 0);
-
-      // Add an audio frame
-      const audioFrame = new Frame();
-      audioFrame.alloc();
-      audioFrame.format = AV_SAMPLE_FMT_S16;
-      audioFrame.sampleRate = 48000;
-      audioFrame.nbSamples = 1024;
-      audioFrame.pts = 0n;
-      audioFrame.channelLayout = AV_CHANNEL_LAYOUT_5POINT1_BACK;
-      audioFrame.allocBuffer();
-
-      await abufferCtx.buffersrcAddFrame(audioFrame);
-
-      const outFrame = new Frame();
-      outFrame.alloc();
-      await abuffersinkCtx.buffersinkGetFrame(outFrame);
-
-      const channelLayout = abuffersinkCtx.buffersinkGetChannelLayout();
-      assert.ok(channelLayout, 'Should get channel layout');
-      assert.equal(channelLayout.nbChannels, 6, 'Should have 6 channels for 5.1');
-      assert.equal(channelLayout.mask, 0x3fn, 'Should have 5.1 surround mask');
-
-      const sampleRate = abuffersinkCtx.buffersinkGetSampleRate();
-      assert.equal(sampleRate, 48000, 'Should get correct sample rate');
-
-      audioFrame.free();
       outFrame.free();
       graph.free();
     });

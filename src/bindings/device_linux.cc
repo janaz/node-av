@@ -3,28 +3,13 @@
 #include "device.h"
 #include <algorithm>
 #include <map>
-#include <set>
-#include <tuple>
+#include <stdexcept>
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <cstring>
-#include <fstream>
 #include <linux/videodev2.h>
-
-#include <alsa/asoundlib.h>
-#include <X11/Xlib.h>
-#include <X11/extensions/Xrandr.h>
-
-// Suppress ALSA's own stderr error messages.
-// FFmpeg handles ALSA errors through its own logging system (av_log),
-// so the raw ALSA messages are redundant noise for the end user.
-static void alsa_error_handler(const char*, int, const char*, int, const char*, ...) {}
-
-static struct AlsaSilencer {
-  AlsaSilencer() { snd_lib_error_set_handler(alsa_error_handler); }
-} alsa_silencer;
 
 namespace ffmpeg {
 
@@ -82,123 +67,7 @@ std::vector<DeviceInfo> enumerateDevices() {
     closedir(dir);
   }
 
-  // Enumerate ALSA audio devices by reading /proc/asound/cards
-  std::ifstream cardsFile("/proc/asound/cards");
-  if (cardsFile.is_open()) {
-    std::string line;
-    bool isFirstAudio = true;
-
-    while (std::getline(cardsFile, line)) {
-      // Parse lines like " 0 [PCH            ]: HDA-Intel - HDA Intel PCH"
-      if (!line.empty() && line[0] == ' ' && isdigit(line[1])) {
-        // Extract card number
-        size_t pos = 1;
-        while (pos < line.size() && isdigit(line[pos])) pos++;
-
-        std::string cardNum = line.substr(1, pos - 1);
-
-        // Check if this card has capture capability (pcm*c entries)
-        bool hasCapture = false;
-        std::string cardDir = "/proc/asound/card" + cardNum;
-        DIR* cardDirHandle = opendir(cardDir.c_str());
-        if (cardDirHandle) {
-          struct dirent* cardEntry;
-          while ((cardEntry = readdir(cardDirHandle)) != nullptr) {
-            std::string entryName(cardEntry->d_name);
-            if (entryName.size() >= 4 && entryName.substr(0, 3) == "pcm" && entryName.back() == 'c') {
-              hasCapture = true;
-              break;
-            }
-          }
-          closedir(cardDirHandle);
-        }
-        if (!hasCapture) continue;
-
-        // Verify the device can actually be opened for capture.
-        // The pcm*c check only confirms the driver supports capture,
-        // not that hardware (e.g., a microphone) is connected.
-        std::string probeName = "hw:" + cardNum;
-        snd_pcm_t* probeHandle = nullptr;
-        int probeRet = snd_pcm_open(&probeHandle, probeName.c_str(), SND_PCM_STREAM_CAPTURE, SND_PCM_NONBLOCK);
-        if (probeRet < 0) continue;
-        snd_pcm_close(probeHandle);
-
-        // Find the description (after the colon)
-        size_t colonPos = line.find(':');
-        std::string description;
-        if (colonPos != std::string::npos && colonPos + 2 < line.size()) {
-          description = line.substr(colonPos + 2);
-        } else {
-          description = "Audio Card " + cardNum;
-        }
-
-        DeviceInfo info;
-        info.name = "hw:" + cardNum;
-        info.description = description;
-        info.type = "audio";
-        info.isDefault = isFirstAudio;
-        isFirstAudio = false;
-        devices.push_back(info);
-      }
-    }
-    cardsFile.close();
-  }
-
-  // Enumerate screen/display devices
-  const char* waylandDisplay = getenv("WAYLAND_DISPLAY");
-  const char* x11Display = getenv("DISPLAY");
-
-  if (x11Display) {
-    Display* dpy = XOpenDisplay(x11Display);
-    if (dpy) {
-      int screen = DefaultScreen(dpy);
-      XRRScreenResources* res = XRRGetScreenResources(dpy, RootWindow(dpy, screen));
-      if (res) {
-        bool isFirst = true;
-        for (int c = 0; c < res->ncrtc; c++) {
-          XRRCrtcInfo* crtc = XRRGetCrtcInfo(dpy, res, res->crtcs[c]);
-          if (crtc && crtc->width > 0 && crtc->height > 0) {
-            DeviceInfo info;
-            info.type = "screen";
-            info.isDefault = isFirst;
-            isFirst = false;
-            info.name = std::string(x11Display);
-
-            // Try to get output name for description
-            std::string outputName = "Display " + std::to_string(c);
-            if (crtc->noutput > 0) {
-              XRROutputInfo* output = XRRGetOutputInfo(dpy, res, crtc->outputs[0]);
-              if (output) {
-                if (output->name) {
-                  outputName = std::string(output->name);
-                }
-                XRRFreeOutputInfo(output);
-              }
-            }
-            info.description = outputName;
-
-            info.screenX = crtc->x;
-            info.screenY = crtc->y;
-            info.screenWidth = static_cast<int>(crtc->width);
-            info.screenHeight = static_cast<int>(crtc->height);
-
-            devices.push_back(info);
-          }
-          if (crtc) XRRFreeCrtcInfo(crtc);
-        }
-        XRRFreeScreenResources(res);
-      }
-      XCloseDisplay(dpy);
-    }
-  } else if (waylandDisplay) {
-    // Wayland fallback: single display without bounds
-    DeviceInfo info;
-    info.name = "default";
-    info.description = "Wayland Display";
-    info.type = "screen";
-    info.isDefault = true;
-    devices.push_back(info);
-  }
+  // Audio and screen device enumeration removed (not needed for video-only build)
 
   return devices;
 }
@@ -298,84 +167,7 @@ std::vector<DeviceMode> enumerateDeviceModes(const std::string& deviceName) {
 }
 
 std::vector<AudioDeviceMode> enumerateAudioDeviceModes(const std::string& deviceName) {
-  std::vector<AudioDeviceMode> modes;
-
-  snd_pcm_t* pcm = nullptr;
-  snd_pcm_hw_params_t* params = nullptr;
-
-  int err = snd_pcm_open(&pcm, deviceName.c_str(), SND_PCM_STREAM_CAPTURE, SND_PCM_NONBLOCK);
-  if (err < 0) {
-    throw std::runtime_error("Failed to open ALSA device: " + deviceName + " (" + snd_strerror(err) + ")");
-  }
-
-  snd_pcm_hw_params_malloc(&params);
-  snd_pcm_hw_params_any(pcm, params);
-
-  // Collect supported sample rates
-  static const unsigned testRates[] = {8000, 11025, 16000, 22050, 44100, 48000, 88200, 96000, 176400, 192000};
-  std::vector<int> supportedRates;
-  for (unsigned rate : testRates) {
-    if (snd_pcm_hw_params_test_rate(pcm, params, rate, 0) == 0) {
-      supportedRates.push_back(static_cast<int>(rate));
-    }
-  }
-
-  // Collect supported channel counts
-  static const unsigned testChannels[] = {1, 2, 4, 6, 8};
-  std::vector<int> supportedChannels;
-  for (unsigned ch : testChannels) {
-    if (snd_pcm_hw_params_test_channels(pcm, params, ch) == 0) {
-      supportedChannels.push_back(static_cast<int>(ch));
-    }
-  }
-
-  // ALSA format → AVSampleFormat mapping
-  struct FormatMapping {
-    snd_pcm_format_t alsaFormat;
-    AVSampleFormat avFormat;
-  };
-  static const FormatMapping formatMap[] = {
-    {SND_PCM_FORMAT_U8, AV_SAMPLE_FMT_U8},
-    {SND_PCM_FORMAT_S16_LE, AV_SAMPLE_FMT_S16},
-    {SND_PCM_FORMAT_S32_LE, AV_SAMPLE_FMT_S32},
-    {SND_PCM_FORMAT_FLOAT_LE, AV_SAMPLE_FMT_FLT},
-    {SND_PCM_FORMAT_FLOAT64_LE, AV_SAMPLE_FMT_DBL},
-  };
-
-  std::vector<AVSampleFormat> supportedFormats;
-  for (const auto& fm : formatMap) {
-    if (snd_pcm_hw_params_test_format(pcm, params, fm.alsaFormat) == 0) {
-      supportedFormats.push_back(fm.avFormat);
-    }
-  }
-
-  snd_pcm_hw_params_free(params);
-  snd_pcm_close(pcm);
-
-  // Build all (rate, channels, format) combinations
-  std::set<std::tuple<int, int, int>> seen;
-  for (int rate : supportedRates) {
-    for (int ch : supportedChannels) {
-      for (AVSampleFormat fmt : supportedFormats) {
-        auto key = std::make_tuple(rate, ch, static_cast<int>(fmt));
-        if (seen.insert(key).second) {
-          AudioDeviceMode mode;
-          mode.sampleRate = rate;
-          mode.channels = ch;
-          mode.sampleFormat = fmt;
-          modes.push_back(mode);
-        }
-      }
-    }
-  }
-
-  // Sort: sampleRate desc, then channels desc
-  std::sort(modes.begin(), modes.end(), [](const AudioDeviceMode& a, const AudioDeviceMode& b) {
-    if (a.sampleRate != b.sampleRate) return a.sampleRate > b.sampleRate;
-    return a.channels > b.channels;
-  });
-
-  return modes;
+  return {};
 }
 
 std::string getVideoInputFormat() {

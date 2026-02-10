@@ -8,7 +8,6 @@ import {
   AV_OPT_TYPE_SAMPLE_FMT,
   AV_OPT_TYPE_STRING,
   AV_PIX_FMT_YUV420P,
-  AV_SAMPLE_FMT_S16,
   AVFILTER_CMD_FLAG_FAST,
   AVFILTER_CMD_FLAG_ONE,
   AVFILTER_THREAD_SLICE,
@@ -59,7 +58,7 @@ describe('FilterGraph', () => {
       assert.equal(graph.nbFilters, 0, 'Should have no filters initially');
 
       // Add a filter
-      const filter = Filter.getByName('anull');
+      const filter = Filter.getByName('null');
       assert.ok(filter);
       graph.createFilter(filter, 'test');
 
@@ -77,13 +76,13 @@ describe('FilterGraph', () => {
       assert.ok(filters === null || filters?.length === 0, 'Should have no filters initially');
 
       // Add filters
-      const anullFilter = Filter.getByName('anull');
-      const volumeFilter = Filter.getByName('volume');
+      const anullFilter = Filter.getByName('null');
+      const volumeFilter = Filter.getByName('scale');
       assert.ok(anullFilter);
       assert.ok(volumeFilter);
 
-      graph.createFilter(anullFilter, 'anull');
-      graph.createFilter(volumeFilter, 'volume', '0.5');
+      graph.createFilter(anullFilter, 'null_filter');
+      graph.createFilter(volumeFilter, 'my_scale', '640:480');
 
       filters = graph.filters;
       assert.ok(Array.isArray(filters), 'Should return array of filters');
@@ -223,7 +222,7 @@ describe('FilterGraph', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const filter = Filter.getByName('anull');
+      const filter = Filter.getByName('null');
       assert.ok(filter);
 
       const ctx = graph.createFilter(filter, 'test');
@@ -236,7 +235,7 @@ describe('FilterGraph', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const filter = Filter.getByName('anull');
+      const filter = Filter.getByName('null');
       assert.ok(filter);
 
       const ctx = graph.createFilter(filter, 'test', null);
@@ -249,7 +248,7 @@ describe('FilterGraph', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const filter = Filter.getByName('anull');
+      const filter = Filter.getByName('null');
       assert.ok(filter);
 
       const ctx1 = graph.createFilter(filter, 'test');
@@ -296,13 +295,13 @@ describe('FilterGraph', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const anullFilter = Filter.getByName('anull');
-      const volumeFilter = Filter.getByName('volume');
+      const anullFilter = Filter.getByName('null');
+      const volumeFilter = Filter.getByName('scale');
       assert.ok(anullFilter);
       assert.ok(volumeFilter);
 
       graph.createFilter(anullFilter, 'input');
-      graph.createFilter(volumeFilter, 'vol', '0.5');
+      graph.createFilter(volumeFilter, 'vol', '640:480');
 
       const input = graph.getFilter('input');
       const vol = graph.getFilter('vol');
@@ -501,7 +500,7 @@ describe('FilterGraph', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const ret = graph.parse2('anull');
+      const ret = graph.parse2('null');
       // Simple filters might parse successfully
       assert.equal(typeof ret, 'number', 'Should return status code');
 
@@ -512,7 +511,7 @@ describe('FilterGraph', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const ret = graph.parsePtr('anull,volume=0.5');
+      const ret = graph.parsePtr('null,hflip');
       assert.equal(typeof ret, 'number', 'Should return status code');
 
       graph.free();
@@ -600,37 +599,6 @@ describe('FilterGraph', () => {
       assert.ok(sinkCtx);
       const sinkInitRet = sinkCtx.init();
       assert.equal(sinkInitRet, 0, 'Sink should initialize');
-
-      graph.free();
-    });
-
-    it('should support audio filters with allocFilter', () => {
-      const graph = new FilterGraph();
-      graph.alloc();
-
-      const abufferFilter = Filter.getByName('abuffer');
-      const asinkFilter = Filter.getByName('abuffersink');
-      assert.ok(abufferFilter);
-      assert.ok(asinkFilter);
-
-      // Allocate audio buffer source
-      const abufferCtx = graph.allocFilter(abufferFilter, 'ain');
-      assert.ok(abufferCtx);
-
-      // Set audio options
-      abufferCtx.setOption('sample_rate', 44100);
-      abufferCtx.setOption('sample_fmt', AV_SAMPLE_FMT_S16, AV_OPT_TYPE_SAMPLE_FMT);
-      abufferCtx.setOption('channel_layout', 'stereo', AV_OPT_TYPE_STRING);
-      abufferCtx.setOption('time_base', { num: 1, den: 44100 }, AV_OPT_TYPE_RATIONAL);
-
-      // Initialize
-      const initRet = abufferCtx.init();
-      assert.equal(initRet, 0, 'Audio buffer should initialize');
-
-      // Allocate and init sink
-      const asinkCtx = graph.allocFilter(asinkFilter, 'aout');
-      assert.ok(asinkCtx);
-      asinkCtx.init();
 
       graph.free();
     });
@@ -767,86 +735,6 @@ describe('FilterGraph', () => {
       graph.free();
     });
 
-    it('should create an audio processing pipeline (sync)', () => {
-      const graph = new FilterGraph();
-      graph.alloc();
-
-      // Create audio processing chain
-      const filters = {
-        abuffer: Filter.getByName('abuffer'),
-        volume: Filter.getByName('volume'),
-        atempo: Filter.getByName('atempo'),
-        aformat: Filter.getByName('aformat'),
-        abuffersink: Filter.getByName('abuffersink'),
-      };
-
-      Object.values(filters).forEach((f) => assert.ok(f, 'Filter should exist'));
-
-      const contexts = {
-        abuffer: graph.createFilter(filters.abuffer!, 'ain', 'sample_rate=44100:sample_fmt=1:channel_layout=3'),
-        volume: graph.createFilter(filters.volume!, 'vol', '0.5'),
-        atempo: graph.createFilter(filters.atempo!, 'tempo', '1.5'),
-        aformat: graph.createFilter(filters.aformat!, 'fmt', 'sample_rates=48000:sample_fmts=1'),
-        abuffersink: graph.createFilter(filters.abuffersink!, 'aout'),
-      };
-
-      Object.values(contexts).forEach((c) => assert.ok(c, 'Context should be created'));
-
-      // Link: abuffer -> volume -> atempo -> aformat -> abuffersink
-      contexts.abuffer!.link(0, contexts.volume!, 0);
-      contexts.volume!.link(0, contexts.atempo!, 0);
-      contexts.atempo!.link(0, contexts.aformat!, 0);
-      contexts.aformat!.link(0, contexts.abuffersink!, 0);
-
-      const ret = graph.configSync();
-      assert.equal(ret, 0, 'Should configure audio pipeline');
-
-      // FFmpeg may add automatic conversion filters during config
-      assert.ok(graph.nbFilters >= 5, 'Should have at least 5 filters');
-
-      graph.free();
-    });
-
-    it('should create an audio processing pipeline (async)', async () => {
-      const graph = new FilterGraph();
-      graph.alloc();
-
-      // Create audio processing chain
-      const filters = {
-        abuffer: Filter.getByName('abuffer'),
-        volume: Filter.getByName('volume'),
-        atempo: Filter.getByName('atempo'),
-        aformat: Filter.getByName('aformat'),
-        abuffersink: Filter.getByName('abuffersink'),
-      };
-
-      Object.values(filters).forEach((f) => assert.ok(f, 'Filter should exist'));
-
-      const contexts = {
-        abuffer: graph.createFilter(filters.abuffer!, 'ain', 'sample_rate=44100:sample_fmt=1:channel_layout=3'),
-        volume: graph.createFilter(filters.volume!, 'vol', '0.5'),
-        atempo: graph.createFilter(filters.atempo!, 'tempo', '1.5'),
-        aformat: graph.createFilter(filters.aformat!, 'fmt', 'sample_rates=48000:sample_fmts=1'),
-        abuffersink: graph.createFilter(filters.abuffersink!, 'aout'),
-      };
-
-      Object.values(contexts).forEach((c) => assert.ok(c, 'Context should be created'));
-
-      // Link: abuffer -> volume -> atempo -> aformat -> abuffersink
-      contexts.abuffer!.link(0, contexts.volume!, 0);
-      contexts.volume!.link(0, contexts.atempo!, 0);
-      contexts.atempo!.link(0, contexts.aformat!, 0);
-      contexts.aformat!.link(0, contexts.abuffersink!, 0);
-
-      const ret = await graph.config();
-      assert.equal(ret, 0, 'Should configure audio pipeline');
-
-      // FFmpeg may add automatic conversion filters during config
-      assert.ok(graph.nbFilters >= 5, 'Should have at least 5 filters');
-
-      graph.free();
-    });
-
     it('should handle parallel processing paths (sync)', () => {
       const graph = new FilterGraph();
       graph.alloc();
@@ -979,7 +867,7 @@ describe('FilterGraph', () => {
       const graph = new FilterGraph();
       // Don't call alloc()
 
-      const filter = Filter.getByName('anull');
+      const filter = Filter.getByName('null');
       assert.ok(filter);
 
       try {
@@ -994,7 +882,7 @@ describe('FilterGraph', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const filter = Filter.getByName('anull');
+      const filter = Filter.getByName('null');
       assert.ok(filter);
 
       const longName = 'a'.repeat(1000);
@@ -1009,7 +897,7 @@ describe('FilterGraph', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const filter = Filter.getByName('anull');
+      const filter = Filter.getByName('null');
       assert.ok(filter);
 
       const specialName = 'test-filter_123.456';
@@ -1027,7 +915,7 @@ describe('FilterGraph', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const filter = Filter.getByName('anull');
+      const filter = Filter.getByName('null');
       assert.ok(filter);
 
       // Create many filters
@@ -1052,16 +940,16 @@ describe('FilterGraph', () => {
 
       // First cycle
       graph.alloc();
-      const filter1 = Filter.getByName('anull');
+      const filter1 = Filter.getByName('null');
       assert.ok(filter1);
       graph.createFilter(filter1, 'test1');
       graph.free();
 
       // Second cycle
       graph.alloc();
-      const filter2 = Filter.getByName('volume');
+      const filter2 = Filter.getByName('scale');
       assert.ok(filter2);
-      graph.createFilter(filter2, 'test2', '0.5');
+      graph.createFilter(filter2, 'test2', '640:480');
       graph.free();
 
       assert.ok(true, 'Should handle multiple cycles');
@@ -1072,7 +960,7 @@ describe('FilterGraph', () => {
       graph.alloc();
 
       // Create multiple filters
-      const filters = ['anull', 'volume', 'atempo', 'aformat'];
+      const filters = ['null', 'scale', 'hflip', 'vflip'];
       filters.forEach((name, i) => {
         const filter = Filter.getByName(name);
         if (filter) {
@@ -1095,30 +983,30 @@ describe('FilterGraph', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      // Create a filter that supports commands (e.g., volume)
-      const volumeFilter = Filter.getByName('volume');
-      assert.ok(volumeFilter, 'Volume filter should exist');
+      // Create a filter that supports commands (e.g., scale)
+      const scaleFilter = Filter.getByName('scale');
+      assert.ok(scaleFilter, 'Scale filter should exist');
 
-      const volumeCtx = graph.createFilter(volumeFilter, 'volume', 'volume=0.5');
-      assert.ok(volumeCtx, 'Should create volume filter');
+      const scaleCtx = graph.createFilter(scaleFilter, 'scale', 'w=640:h=480');
+      assert.ok(scaleCtx, 'Should create scale filter');
 
       // Need complete graph for commands to work
-      const abufferFilter = Filter.getByName('abuffer');
-      const abuffersinkFilter = Filter.getByName('abuffersink');
-      assert.ok(abufferFilter && abuffersinkFilter);
+      const bufferFilter = Filter.getByName('buffer');
+      const buffersinkFilter = Filter.getByName('buffersink');
+      assert.ok(bufferFilter && buffersinkFilter);
 
-      const src = graph.createFilter(abufferFilter, 'src', 'sample_rate=44100:sample_fmt=1:channel_layout=stereo');
-      const sink = graph.createFilter(abuffersinkFilter, 'sink');
+      const src = graph.createFilter(bufferFilter, 'src', 'video_size=320x240:pix_fmt=0:time_base=1/25');
+      const sink = graph.createFilter(buffersinkFilter, 'sink');
       assert.ok(src && sink);
 
-      src.link(0, volumeCtx, 0);
-      volumeCtx.link(0, sink, 0);
+      src.link(0, scaleCtx, 0);
+      scaleCtx.link(0, sink, 0);
 
       const configRet = await graph.config();
       assert.equal(configRet, 0, 'Should configure graph');
 
-      // Send volume change command
-      const result = graph.sendCommand('volume', 'volume', '0.8');
+      // Send scale change command
+      const result = graph.sendCommand('scale', 'w', '800');
 
       // Check result type
       if (typeof result === 'number') {
@@ -1176,28 +1064,28 @@ describe('FilterGraph', () => {
       graph.alloc();
 
       // Create a filter that supports commands
-      const volumeFilter = Filter.getByName('volume');
-      assert.ok(volumeFilter);
+      const scaleFilter = Filter.getByName('scale');
+      assert.ok(scaleFilter);
 
-      const volumeCtx = graph.createFilter(volumeFilter, 'volume', 'volume=1.0');
-      assert.ok(volumeCtx);
+      const scaleCtx = graph.createFilter(scaleFilter, 'scale', 'w=640:h=480');
+      assert.ok(scaleCtx);
 
-      // Create complete audio graph
-      const abufferFilter = Filter.getByName('abuffer');
-      const abuffersinkFilter = Filter.getByName('abuffersink');
+      // Create complete video graph
+      const bufferFilter = Filter.getByName('buffer');
+      const buffersinkFilter = Filter.getByName('buffersink');
 
-      const src = graph.createFilter(abufferFilter!, 'src', 'sample_rate=44100:sample_fmt=1:channel_layout=stereo');
-      const sink = graph.createFilter(abuffersinkFilter!, 'sink');
+      const src = graph.createFilter(bufferFilter!, 'src', 'video_size=320x240:pix_fmt=0:time_base=1/25');
+      const sink = graph.createFilter(buffersinkFilter!, 'sink');
 
-      src!.link(0, volumeCtx, 0);
-      volumeCtx.link(0, sink!, 0);
+      src!.link(0, scaleCtx, 0);
+      scaleCtx.link(0, sink!, 0);
 
       await graph.config();
 
-      // Queue volume changes at different timestamps
-      const ret1 = graph.queueCommand('volume', 'volume', '0.5', 1.0);
-      const ret2 = graph.queueCommand('volume', 'volume', '0.8', 2.0);
-      const ret3 = graph.queueCommand('volume', 'volume', '0.2', 3.0);
+      // Queue scale changes at different timestamps
+      const ret1 = graph.queueCommand('scale', 'w', '800', 1.0);
+      const ret2 = graph.queueCommand('scale', 'w', '1024', 2.0);
+      const ret3 = graph.queueCommand('scale', 'w', '1280', 3.0);
 
       // Commands are queued, not executed immediately
       // They would be executed when processing frames with matching timestamps

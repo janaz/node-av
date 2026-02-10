@@ -2327,11 +2327,6 @@ export const AV_PTS_WRAP_IGNORE = 0 as AVPTSWrap;
 export const AV_PTS_WRAP_ADD_OFFSET = 1 as AVPTSWrap;
 export const AV_PTS_WRAP_SUB_OFFSET = -1 as AVPTSWrap;
 
-// AV_HAVE constants (from libavutil/avconfig.h)
-export type AVHave = number & { readonly [__ffmpeg_brand]: 'AVHave' };
-
-export const AV_HAVE_BIGENDIAN = 0 as AVHave;
-
 // AV_UTF8_FLAG constants (from libavutil/avstring.h)
 export type AVUTF8Flag = number & { readonly [__ffmpeg_brand]: 'AVUTF8Flag' };
 

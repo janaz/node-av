@@ -11,14 +11,8 @@ const installScriptPath = join(__dirname, 'install.js');
 
 // Platform configurations
 const platforms = [
-  { name: 'darwin-arm64', os: 'darwin', cpu: 'arm64' },
-  { name: 'darwin-x64', os: 'darwin', cpu: 'x64' },
   { name: 'linux-arm64', os: 'linux', cpu: 'arm64' },
   { name: 'linux-x64', os: 'linux', cpu: 'x64' },
-  { name: 'win32-arm64-mingw', os: 'win32', cpu: 'arm64' },
-  { name: 'win32-x64-mingw', os: 'win32', cpu: 'x64' },
-  { name: 'win32-arm64-msvc', os: 'win32', cpu: 'arm64' },
-  { name: 'win32-x64-msvc', os: 'win32', cpu: 'x64' },
 ];
 
 // Read template
@@ -35,7 +29,7 @@ platforms.forEach((platform) => {
 
   // Create package.json
   const packageJson = { ...template };
-  packageJson.name = `@seydx/node-av-${platform.name}`;
+  packageJson.name = `@revizly/node-av-${platform.name}`;
   packageJson.version = mainPackage.version;
   packageJson.description = `node-av (${platform.name} binary)`;
   packageJson.os = [platform.os];
@@ -44,7 +38,7 @@ platforms.forEach((platform) => {
   writeFileSync(join(packageDir, 'package.json'), JSON.stringify(packageJson, null, 2) + '\n');
 
   // Create README
-  const readme = `# @seydx/node-av-${platform.name}
+  const readme = `# @revizly/node-av-${platform.name}
 
 Platform-specific binary for [node-av](https://github.com/seydx/node-av).
 

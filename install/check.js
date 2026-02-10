@@ -4,57 +4,23 @@ import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 
-import { type } from 'node:os';
 import { log, spawnRebuild, useGlobalFFmpeg } from './ffmpeg.js';
 
 const require = createRequire(import.meta.url);
 
 const tryLoadPrebuilt = () => {
-  // Try to load from platform-specific package (optionalDependencies)
   const platform = process.platform;
   const arch = process.arch;
+  const packageName = `@revizly/node-av-${platform}-${arch}`;
 
-  if (platform === 'win32') {
-    const useMingW = type() !== 'Windows_NT';
-    if (useMingW) {
-      try {
-        const packageName = `@seydx/node-av-${platform}-${arch}-mingw`;
-        // Check if the package is installed (don't check for .node file yet - it may be extracted by postinstall)
-        const packageJsonPath = require.resolve(`${packageName}/package.json`);
-        if (existsSync(packageJsonPath)) {
-          log(`Using prebuilt binary from ${packageName}`);
-          return true;
-        }
-      } catch {
-        // Package not installed
-      }
+  try {
+    const packageJsonPath = require.resolve(`${packageName}/package.json`);
+    if (existsSync(packageJsonPath)) {
+      log(`Using prebuilt binary from ${packageName}`);
+      return true;
     }
-
-    // Fallback to MSVC
-    try {
-      const packageName = `@seydx/node-av-${platform}-${arch}-msvc`;
-      // Check if the package is installed (don't check for .node file yet - it may be extracted by postinstall)
-      const packageJsonPath = require.resolve(`${packageName}/package.json`);
-      if (existsSync(packageJsonPath)) {
-        log(`Using prebuilt binary from ${packageName}`);
-        return true;
-      }
-    } catch {
-      // Package not installed
-    }
-  } else {
-    const packageName = `@seydx/node-av-${platform}-${arch}`;
-
-    try {
-      // Check if the package is installed (don't check for .node file yet - it may be extracted by postinstall)
-      const packageJsonPath = require.resolve(`${packageName}/package.json`);
-      if (existsSync(packageJsonPath)) {
-        log(`Using prebuilt binary from ${packageName}`);
-        return true;
-      }
-    } catch {
-      // Package not installed
-    }
+  } catch {
+    // Package not installed
   }
 
   // Try local binary folder (for development)

@@ -326,37 +326,33 @@ describe('FilterInOut', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      // Create multiple sources and sinks
+      // Create multiple video sources and sinks
       const bufferFilter = Filter.getByName('buffer');
-      const abufferFilter = Filter.getByName('abuffer');
       const sinkFilter = Filter.getByName('buffersink');
-      const asinkFilter = Filter.getByName('abuffersink');
 
       assert.ok(bufferFilter);
-      assert.ok(abufferFilter);
       assert.ok(sinkFilter);
-      assert.ok(asinkFilter);
 
-      const videoSrc = graph.createFilter(bufferFilter, 'vsrc', 'video_size=320x240:pix_fmt=0:time_base=1/25');
-      const audioSrc = graph.createFilter(abufferFilter, 'asrc', 'sample_rate=44100:sample_fmt=1:channel_layout=3');
-      const videoSink = graph.createFilter(sinkFilter, 'vsink');
-      const audioSink = graph.createFilter(asinkFilter, 'asink');
+      const videoSrc1 = graph.createFilter(bufferFilter, 'vsrc1', 'video_size=320x240:pix_fmt=0:time_base=1/25');
+      const videoSrc2 = graph.createFilter(bufferFilter, 'vsrc2', 'video_size=640x480:pix_fmt=0:time_base=1/30');
+      const videoSink1 = graph.createFilter(sinkFilter, 'vsink1');
+      const videoSink2 = graph.createFilter(sinkFilter, 'vsink2');
 
-      assert.ok(videoSrc);
-      assert.ok(audioSrc);
-      assert.ok(videoSink);
-      assert.ok(audioSink);
+      assert.ok(videoSrc1);
+      assert.ok(videoSrc2);
+      assert.ok(videoSink1);
+      assert.ok(videoSink2);
 
       // Create input list
       const inputs = FilterInOut.createList([
-        { name: 'vin', filterCtx: videoSrc, padIdx: 0 },
-        { name: 'ain', filterCtx: audioSrc, padIdx: 0 },
+        { name: 'vin1', filterCtx: videoSrc1, padIdx: 0 },
+        { name: 'vin2', filterCtx: videoSrc2, padIdx: 0 },
       ]);
 
       // Create output list
       const outputs = FilterInOut.createList([
-        { name: 'vout', filterCtx: videoSink, padIdx: 0 },
-        { name: 'aout', filterCtx: audioSink, padIdx: 0 },
+        { name: 'vout1', filterCtx: videoSink1, padIdx: 0 },
+        { name: 'vout2', filterCtx: videoSink2, padIdx: 0 },
       ]);
 
       assert.ok(inputs);
@@ -485,7 +481,7 @@ describe('FilterInOut', () => {
       graph.alloc();
 
       // Create contexts
-      const filter = Filter.getByName('anull');
+      const filter = Filter.getByName('null');
       assert.ok(filter);
 
       const contexts = [];
@@ -539,13 +535,11 @@ describe('FilterInOut', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      // Create various filter contexts
+      // Create various video filter contexts
       const filters = {
         videoBuffer: Filter.getByName('buffer'),
-        audioBuffer: Filter.getByName('abuffer'),
         overlay: Filter.getByName('overlay'),
         videoSink: Filter.getByName('buffersink'),
-        audioSink: Filter.getByName('abuffersink'),
       };
 
       Object.values(filters).forEach((f) => assert.ok(f));
@@ -553,10 +547,10 @@ describe('FilterInOut', () => {
       const contexts = {
         video1: graph.createFilter(filters.videoBuffer!, 'video1', 'video_size=640x480:pix_fmt=0:time_base=1/25'),
         video2: graph.createFilter(filters.videoBuffer!, 'video2', 'video_size=640x480:pix_fmt=0:time_base=1/25'),
-        audio: graph.createFilter(filters.audioBuffer!, 'audio', 'sample_rate=44100:sample_fmt=1:channel_layout=3'),
+        video3: graph.createFilter(filters.videoBuffer!, 'video3', 'video_size=320x240:pix_fmt=0:time_base=1/30'),
         overlay: graph.createFilter(filters.overlay!, 'overlay'),
-        videoOut: graph.createFilter(filters.videoSink!, 'vout'),
-        audioOut: graph.createFilter(filters.audioSink!, 'aout'),
+        videoOut1: graph.createFilter(filters.videoSink!, 'vout1'),
+        videoOut2: graph.createFilter(filters.videoSink!, 'vout2'),
       };
 
       Object.values(contexts).forEach((c) => assert.ok(c));
@@ -565,13 +559,13 @@ describe('FilterInOut', () => {
       const inputs = FilterInOut.createList([
         { name: 'main_video', filterCtx: contexts.video1!, padIdx: 0 },
         { name: 'overlay_video', filterCtx: contexts.video2!, padIdx: 0 },
-        { name: 'audio_in', filterCtx: contexts.audio!, padIdx: 0 },
+        { name: 'video3', filterCtx: contexts.video3!, padIdx: 0 },
       ]);
 
       // Create output configuration
       const outputs = FilterInOut.createList([
-        { name: 'video_out', filterCtx: contexts.videoOut!, padIdx: 0 },
-        { name: 'audio_out', filterCtx: contexts.audioOut!, padIdx: 0 },
+        { name: 'video_out1', filterCtx: contexts.videoOut1!, padIdx: 0 },
+        { name: 'video_out2', filterCtx: contexts.videoOut2!, padIdx: 0 },
       ]);
 
       assert.ok(inputs);
@@ -588,7 +582,7 @@ describe('FilterInOut', () => {
       const graph = new FilterGraph();
       graph.alloc();
 
-      const filter = Filter.getByName('anull');
+      const filter = Filter.getByName('null');
       assert.ok(filter);
 
       // Build list dynamically

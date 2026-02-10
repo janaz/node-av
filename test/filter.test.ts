@@ -36,7 +36,6 @@ describe('Filter', () => {
       assert.ok(filterNames.includes('scale'), 'Should include scale filter');
       assert.ok(filterNames.includes('crop'), 'Should include crop filter');
       assert.ok(filterNames.includes('overlay'), 'Should include overlay filter');
-      assert.ok(filterNames.includes('volume'), 'Should include volume filter');
     });
   });
 
@@ -155,13 +154,6 @@ describe('Filter', () => {
         assert.equal(buffer.inputs.length, 0, 'Source filters have no inputs');
       });
 
-      it('should identify audio source filters', () => {
-        const abuffer = Filter.getByName('abuffer');
-        assert.ok(abuffer, 'Should find abuffer filter');
-        assert.ok(abuffer.isSource(), 'Abuffer should be a source filter');
-        assert.equal(abuffer.inputs.length, 0, 'Source filters have no inputs');
-      });
-
       it('should identify color source filter', () => {
         const color = Filter.getByName('color');
         assert.ok(color, 'Should find color filter');
@@ -177,12 +169,6 @@ describe('Filter', () => {
         assert.equal(buffersink.outputs.length, 0, 'Sink filters have no outputs');
       });
 
-      it('should identify audio sink filters', () => {
-        const abuffersink = Filter.getByName('abuffersink');
-        assert.ok(abuffersink, 'Should find abuffersink filter');
-        assert.ok(abuffersink.isSink(), 'Abuffersink should be a sink filter');
-        assert.equal(abuffersink.outputs.length, 0, 'Sink filters have no outputs');
-      });
     });
 
     describe('Video Filters', () => {
@@ -213,33 +199,6 @@ describe('Filter', () => {
       });
     });
 
-    describe('Audio Filters', () => {
-      it('should identify audio filters', () => {
-        const volume = Filter.getByName('volume');
-        assert.ok(volume, 'Should find volume filter');
-        assert.ok(volume.isAudio(), 'Volume should be an audio filter');
-        assert.ok(!volume.isVideo(), 'Volume should not be a video filter');
-      });
-
-      it('should identify aformat as audio filter', () => {
-        const aformat = Filter.getByName('aformat');
-        assert.ok(aformat, 'Should find aformat filter');
-        assert.ok(aformat.isAudio(), 'Aformat should be an audio filter');
-        assert.ok(!aformat.isVideo(), 'Aformat should not be a video filter');
-      });
-
-      it('should identify atempo as audio filter', () => {
-        const atempo = Filter.getByName('atempo');
-        assert.ok(atempo, 'Should find atempo filter');
-        assert.ok(atempo.isAudio(), 'Atempo should be an audio filter');
-      });
-
-      it('should identify amix as audio filter', () => {
-        const amix = Filter.getByName('amix');
-        assert.ok(amix, 'Should find amix filter');
-        assert.ok(amix.isAudio(), 'Amix should be an audio filter');
-      });
-    });
   });
 
   describe('Filter Categories', () => {
@@ -272,10 +231,8 @@ describe('Filter', () => {
 
       // Check some known transform filters
       const scale = transformFilters.find((f) => f.name === 'scale');
-      const volume = transformFilters.find((f) => f.name === 'volume');
 
       assert.ok(scale, 'Scale should be a transform filter');
-      assert.ok(volume, 'Volume should be a transform filter');
     });
   });
 
@@ -308,17 +265,6 @@ describe('Filter', () => {
       assert.equal(overlay.outputs[0].type, 0, 'Output should be video type');
     });
 
-    it('should have correct pad structure for amerge filter', () => {
-      const amerge = Filter.getByName('amerge');
-      assert.ok(amerge);
-
-      // Amerge has dynamic inputs but at least some defined
-      assert.ok(amerge.inputs.length >= 0, 'Amerge can have dynamic inputs');
-      assert.equal(amerge.outputs.length, 1, 'Amerge should have 1 output');
-
-      // Check audio type (1 = AUDIO)
-      assert.equal(amerge.outputs[0].type, 1, 'Output should be audio type');
-    });
   });
 
   describe('Edge Cases', () => {
@@ -353,7 +299,7 @@ describe('Filter', () => {
 
   describe('Common Filter Examples', () => {
     it('should find commonly used video filters', () => {
-      const commonVideoFilters = ['scale', 'crop', 'overlay', 'rotate', 'hflip', 'vflip', 'transpose', 'pad', 'drawtext', 'fade', 'format', 'fps', 'setpts'];
+      const commonVideoFilters = ['scale', 'crop', 'overlay', 'rotate', 'hflip', 'vflip', 'transpose', 'pad', 'fade', 'format', 'fps', 'setpts'];
 
       commonVideoFilters.forEach((name) => {
         const filter = Filter.getByName(name);
@@ -362,17 +308,6 @@ describe('Filter', () => {
       });
     });
 
-    it('should find commonly used audio filters', () => {
-      const commonAudioFilters = ['volume', 'aformat', 'atempo', 'amix', 'amerge', 'aresample', 'loudnorm', 'highpass', 'lowpass', 'equalizer', 'compand'];
-
-      commonAudioFilters.forEach((name) => {
-        const filter = Filter.getByName(name);
-        if (filter) {
-          // Some filters might not be available depending on FFmpeg build
-          assert.ok(filter.isAudio(), `${name} should be an audio filter`);
-        }
-      });
-    });
   });
 
   describe('Performance', () => {
@@ -386,7 +321,7 @@ describe('Filter', () => {
     });
 
     it('should lookup filters by name efficiently', () => {
-      const filterNames = ['scale', 'crop', 'overlay', 'volume', 'aformat'];
+      const filterNames = ['scale', 'crop', 'overlay', 'format', 'fps'];
 
       const start = Date.now();
       filterNames.forEach((name) => {

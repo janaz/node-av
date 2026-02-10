@@ -24,7 +24,7 @@ describe('InputFormat', () => {
     });
 
     it('should find common formats', () => {
-      const formats = ['mp4', 'mov', 'avi', 'matroska', 'mp3', 'wav', 'flac'];
+      const formats = ['mp4', 'mov', 'avi', 'matroska'];
 
       for (const name of formats) {
         const format = InputFormat.findInputFormat(name);
@@ -121,18 +121,6 @@ describe('InputFormat', () => {
       const videoFormats = ['mp4', 'avi', 'mov', 'matroska', 'webm'];
 
       for (const name of videoFormats) {
-        const format = InputFormat.findInputFormat(name);
-        if (format) {
-          assert.ok(format.name);
-          assert.ok(format.longName);
-        }
-      }
-    });
-
-    it('should handle audio formats', () => {
-      const audioFormats = ['mp3', 'wav', 'flac', 'aac', 'ogg'];
-
-      for (const name of audioFormats) {
         const format = InputFormat.findInputFormat(name);
         if (format) {
           assert.ok(format.name);
@@ -341,9 +329,6 @@ describe('InputFormat', () => {
       // Test with real files from testdata
       const tests = [
         { file: getInputFile('video.mp4'), expected: 'mp4' },
-        { file: getInputFile('audio.wav'), expected: 'wav' },
-        { file: getInputFile('audio.aac'), expected: 'aac' },
-        { file: getInputFile('audio.mp2'), expected: 'mp2' },
         { file: getInputFile('image-rgba.png'), expected: 'png' },
         { file: getInputFile('video.m1v'), expected: 'mpegvideo' },
       ];
