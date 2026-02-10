@@ -3,8 +3,6 @@ import { closeSync, openSync, readSync } from 'fs';
 import { open } from 'fs/promises';
 import { Readable } from 'node:stream';
 import { resolve } from 'path';
-import { RtpPacket } from 'werift';
-
 import {
   AV_NOPTS_VALUE,
   AV_PIX_FMT_NONE,
@@ -252,11 +250,11 @@ export interface RTPDemuxer {
   /**
    * Send RTP packet to FFmpeg for decoding.
    *
-   * @param rtpPacket - RTP packet as Buffer or RtpPacket object
+   * @param rtpPacket - RTP packet as Buffer
    *
    * @param streamIndex - Optional stream index for multiplexed RTP
    */
-  sendPacket: (rtpPacket: Buffer | RtpPacket, streamIndex?: number) => void;
+  sendPacket: (rtpPacket: Buffer, streamIndex?: number) => void;
 
   /**
    * Cleanup function.
@@ -1145,13 +1143,12 @@ export class Demuxer implements AsyncDisposable, Disposable {
         },
       });
 
-      const sendPacket = (rtpPacket: Buffer | RtpPacket, streamIndex = 0) => {
+      const sendPacket = (rtpPacket: Buffer, streamIndex = 0) => {
         const port = ports[streamIndex];
         if (!port) {
           throw new Error(`No port found for stream index ${streamIndex}. Available streams: ${ports.length}`);
         }
-        const data = rtpPacket instanceof RtpPacket ? rtpPacket.serialize() : rtpPacket;
-        udpSocket.send(data, port, '127.0.0.1');
+        udpSocket.send(rtpPacket, port, '127.0.0.1');
       };
 
       const close = async () => {
@@ -1270,13 +1267,12 @@ export class Demuxer implements AsyncDisposable, Disposable {
         },
       });
 
-      const sendPacket = (rtpPacket: Buffer | RtpPacket, streamIndex = 0) => {
+      const sendPacket = (rtpPacket: Buffer, streamIndex = 0) => {
         const port = ports[streamIndex];
         if (!port) {
           throw new Error(`No port found for stream index ${streamIndex}. Available streams: ${ports.length}`);
         }
-        const data = rtpPacket instanceof RtpPacket ? rtpPacket.serialize() : rtpPacket;
-        udpSocket.send(data, port, '127.0.0.1');
+        udpSocket.send(rtpPacket, port, '127.0.0.1');
       };
 
       const close = async () => {
