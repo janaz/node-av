@@ -942,7 +942,7 @@ describe('HardwareFramesContext', () => {
         if (platform === 'darwin' && typeName === 'videotoolbox') {
           assert.ok(true, 'macOS uses VideoToolbox');
         } else if (platform === 'linux') {
-          const validTypes = ['vaapi', 'cuda', 'vdpau', 'opencl', 'vulkan'];
+          const validTypes = ['vaapi', 'cuda', 'vdpau', 'opencl', 'vulkan', 'amf'];
           assert.ok(validTypes.includes(typeName ?? ''), `Linux uses valid hardware type: ${typeName}`);
         } else if (platform === 'win32') {
           const validTypes = ['d3d11va', 'd3d12va', 'dxva2', 'qsv', 'cuda', 'opencl', 'vulkan'];

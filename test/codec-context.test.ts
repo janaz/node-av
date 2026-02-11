@@ -6,6 +6,7 @@ import {
   AV_CODEC_FLAG_QSCALE,
   AV_CODEC_ID_H264,
   AV_CODEC_ID_PNG,
+  AV_PIX_FMT_RGB24,
   AV_PIX_FMT_VIDEOTOOLBOX,
   AV_PIX_FMT_YUV420P,
   AV_PROFILE_H264_BASELINE,
@@ -620,14 +621,14 @@ describe('CodecContext', () => {
       ctx.allocContext3(codec);
       ctx.width = 64;
       ctx.height = 64;
-      ctx.pixelFormat = AV_PIX_FMT_YUV420P;
+      ctx.pixelFormat = AV_PIX_FMT_RGB24;
       ctx.timeBase = new Rational(1, 25);
 
       await ctx.open2(codec, null);
 
       const frame = new Frame();
       frame.alloc();
-      frame.format = AV_PIX_FMT_YUV420P;
+      frame.format = AV_PIX_FMT_RGB24;
       frame.width = 64;
       frame.height = 64;
 
