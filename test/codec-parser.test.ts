@@ -5,8 +5,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import {
   AV_CODEC_ID_H264,
   AV_CODEC_ID_HEVC,
-  AV_CODEC_ID_MPEG1VIDEO,
-  AV_CODEC_ID_MPEG2VIDEO,
+  AV_CODEC_ID_VP9,
   AV_INPUT_BUFFER_PADDING_SIZE,
   AV_NOPTS_VALUE,
   Codec,
@@ -20,7 +19,7 @@ import { getInputFile, prepareTestEnvironment } from './index.js';
 
 prepareTestEnvironment();
 
-const inputFile = getInputFile('video.m1v');
+const inputFile = getInputFile('video.mp4');
 
 describe('CodecParser', () => {
   let parser: CodecParser;
@@ -61,34 +60,27 @@ describe('CodecParser', () => {
   });
 
   describe('Parsing', () => {
-    it('should parse MPEG1 video data', async () => {
-      // Find MPEG1 decoder
-      const codec = Codec.findDecoder(AV_CODEC_ID_MPEG1VIDEO);
-      assert.ok(codec, 'MPEG1 video decoder not found');
+    it('should parse H264 video data', async () => {
+      const codec = Codec.findDecoder(AV_CODEC_ID_H264);
+      assert.ok(codec, 'H264 video decoder not found');
 
-      // Initialize parser
-      parser.init(AV_CODEC_ID_MPEG1VIDEO);
+      parser.init(AV_CODEC_ID_H264);
 
-      // Create codec context
       const codecCtx = new CodecContext();
       codecCtx.allocContext3(codec);
       await codecCtx.open2(codec, null);
 
-      // Create packet for output
       const packet = new Packet();
       packet.alloc();
 
-      // Create a simple test buffer (not real MPEG1 data)
+      // Create a simple test buffer (not real H264 data)
       const testData = Buffer.alloc(1024);
 
-      // Parse the data
       const consumed = parser.parse2(codecCtx, packet, testData, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
 
-      // Should consume some or all data (or 0 if needs more)
       assert.ok(consumed >= 0, 'Parser returned error');
       assert.ok(consumed <= testData.length, 'Parser consumed more than provided');
 
-      // Cleanup
       packet.unref();
       packet.free();
       codecCtx.freeContext();
@@ -118,10 +110,10 @@ describe('CodecParser', () => {
     });
 
     it('should pass timestamps through parser', async () => {
-      const codec = Codec.findDecoder(AV_CODEC_ID_MPEG1VIDEO);
+      const codec = Codec.findDecoder(AV_CODEC_ID_H264);
       assert.ok(codec);
 
-      parser.init(AV_CODEC_ID_MPEG1VIDEO);
+      parser.init(AV_CODEC_ID_H264);
 
       const codecCtx = new CodecContext();
       codecCtx.allocContext3(codec);
@@ -145,10 +137,10 @@ describe('CodecParser', () => {
     });
 
     it('should pass timestamps through parser (sync)', () => {
-      const codec = Codec.findDecoder(AV_CODEC_ID_MPEG1VIDEO);
+      const codec = Codec.findDecoder(AV_CODEC_ID_H264);
       assert.ok(codec);
 
-      parser.init(AV_CODEC_ID_MPEG1VIDEO);
+      parser.init(AV_CODEC_ID_H264);
 
       const codecCtx = new CodecContext();
       codecCtx.allocContext3(codec);
@@ -173,11 +165,11 @@ describe('CodecParser', () => {
   });
 
   describe('Integration with CodecContext', () => {
-    it('should work with real MPEG1 video stream (async)', async () => {
-      const codec = Codec.findDecoder(AV_CODEC_ID_MPEG1VIDEO);
+    it('should work with real H264 video stream (async)', async () => {
+      const codec = Codec.findDecoder(AV_CODEC_ID_H264);
       assert.ok(codec);
 
-      parser.init(AV_CODEC_ID_MPEG1VIDEO);
+      parser.init(AV_CODEC_ID_H264);
 
       const codecCtx = new CodecContext();
       codecCtx.allocContext3(codec);
@@ -235,11 +227,11 @@ describe('CodecParser', () => {
       codecCtx.freeContext();
     });
 
-    it('should work with real MPEG1 video stream (sync)', () => {
-      const codec = Codec.findDecoder(AV_CODEC_ID_MPEG1VIDEO);
+    it('should work with real H264 video stream (sync)', () => {
+      const codec = Codec.findDecoder(AV_CODEC_ID_H264);
       assert.ok(codec);
 
-      parser.init(AV_CODEC_ID_MPEG1VIDEO);
+      parser.init(AV_CODEC_ID_H264);
 
       const codecCtx = new CodecContext();
       codecCtx.allocContext3(codec);
@@ -322,8 +314,7 @@ describe('CodecParser', () => {
     const codecIds = [
       { id: AV_CODEC_ID_H264, name: 'H.264' },
       { id: AV_CODEC_ID_HEVC, name: 'HEVC/H.265' },
-      { id: AV_CODEC_ID_MPEG1VIDEO, name: 'MPEG1' },
-      { id: AV_CODEC_ID_MPEG2VIDEO, name: 'MPEG2' },
+      { id: AV_CODEC_ID_VP9, name: 'VP9' },
     ];
 
     for (const { id, name } of codecIds) {
