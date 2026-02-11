@@ -323,10 +323,8 @@ jobs:
 
           for platform in linux-x64 linux-arm64; do
             if [ -d "prebuilds/$platform" ]; then
-              cd "prebuilds/$platform"
-              zip -9 "../../packages/$platform/node-av.node.zip" node-av.node
-              cd ../..
-              echo "Compressed binary for $platform"
+              cp "prebuilds/$platform/node-av.node" "packages/$platform/node-av.node"
+              echo "Copied binary for $platform"
             fi
           done
 

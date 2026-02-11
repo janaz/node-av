@@ -58,7 +58,6 @@
     "lint": "eslint .",
     "lint:fix": "eslint --fix .",
     "patch:ffmpeg": "node scripts/patch-ffmpeg.js",
-    "postinstall": "node dist/ffmpeg/install.js",
     "predocs": "typedoc && cpy README.md docs/ --rename=index.md",
     "release:patch": "npm run build:tsc && node scripts/prepare-release.js patch",
     "release:minor": "npm run build:tsc && node scripts/prepare-release.js minor",
@@ -70,9 +69,7 @@
     "test:all": "npm run build:tests && npm run build:tsc && tsx --test test/*.test.ts",
     "update": "updates --update ./"
   },
-  "dependencies": {
-    "unzipper": "^0.12.3"
-  },
+  "dependencies": {},
   "optionalDependencies": {
     "@revizly/node-av-linux-arm64": "^5.2.2-beta.1",
     "@revizly/node-av-linux-x64": "^5.2.2-beta.1"
@@ -82,7 +79,6 @@
     "@types/node": "^25.2.1",
     "@types/node-abi": "^3.0.3",
     "@types/semver": "^7.7.1",
-    "@types/unzipper": "^0.10.11",
     "@types/ws": "^8.18.1",
     "@typescript-eslint/parser": "^8.54.0",
     "concurrently": "^9.2.1",
