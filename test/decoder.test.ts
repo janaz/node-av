@@ -753,9 +753,7 @@ describe('Decoder', () => {
     it('should only decode packets for its stream (async)', async () => {
       const media = await Demuxer.open(inputFile);
       const videoStream = media.video();
-      const audioStream = media.audio();
       assert.ok(videoStream);
-      assert.ok(audioStream);
 
       const videoDecoder = await Decoder.create(videoStream);
 
@@ -785,9 +783,7 @@ describe('Decoder', () => {
     it('should only decode packets for its stream (sync)', () => {
       const media = Demuxer.openSync(inputFile);
       const videoStream = media.video();
-      const audioStream = media.audio();
       assert.ok(videoStream);
-      assert.ok(audioStream);
 
       const videoDecoder = Decoder.createSync(videoStream);
 

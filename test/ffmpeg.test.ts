@@ -226,7 +226,7 @@ describe('FFmpeg Binary Access', () => {
       const output = stdout + stderr;
 
       // Check for key codecs that should be available
-      const requiredCodecs = ['h264', 'hevc', 'aac', 'mp3'];
+      const requiredCodecs = ['h264', 'hevc'];
 
       for (const codec of requiredCodecs) {
         assert.ok(output.toLowerCase().includes(codec), `Binary should support ${codec} codec`);

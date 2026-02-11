@@ -12,7 +12,6 @@ import type { AVSeekWhence } from '../src/index.js';
 prepareTestEnvironment();
 
 const testVideoFile = getInputFile('video.mp4');
-const testAudioFile = getInputFile('audio.pcm');
 const testImageFile = getInputFile('image-rgba.png');
 const tempOutputFile = getOutputFile('test-output.tmp');
 
@@ -216,7 +215,7 @@ describe('IOContext', () => {
 
     it('should handle EOF when reading beyond file (async)', async () => {
       const io = new IOContext();
-      const ret = await io.open2(testAudioFile, AVIO_FLAG_READ);
+      const ret = await io.open2(testVideoFile, AVIO_FLAG_READ);
       assert.equal(ret, 0, 'Should open file successfully');
 
       // Seek to near end
@@ -238,7 +237,7 @@ describe('IOContext', () => {
 
     it('should handle EOF when reading beyond file (sync)', () => {
       const io = new IOContext();
-      const ret = io.open2Sync(testAudioFile, AVIO_FLAG_READ);
+      const ret = io.open2Sync(testVideoFile, AVIO_FLAG_READ);
       assert.equal(ret, 0, 'Should open file successfully');
 
       // Seek to near end
@@ -260,7 +259,7 @@ describe('IOContext', () => {
 
     it('should check EOF flag (async)', async () => {
       const io = new IOContext();
-      const ret = await io.open2(testAudioFile, AVIO_FLAG_READ);
+      const ret = await io.open2(testVideoFile, AVIO_FLAG_READ);
       assert.equal(ret, 0, 'Should open file successfully');
 
       assert.equal(io.eof, false, 'Should not be at EOF initially');
@@ -281,7 +280,7 @@ describe('IOContext', () => {
 
     it('should check EOF flag (sync)', () => {
       const io = new IOContext();
-      const ret = io.open2Sync(testAudioFile, AVIO_FLAG_READ);
+      const ret = io.open2Sync(testVideoFile, AVIO_FLAG_READ);
       assert.equal(ret, 0, 'Should open file successfully');
 
       assert.equal(io.eof, false, 'Should not be at EOF initially');

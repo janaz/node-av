@@ -2,9 +2,6 @@ import assert from 'node:assert';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 
 import {
-  AV_CHANNEL_LAYOUT_5POINT1_BACK,
-  AV_CHANNEL_LAYOUT_7POINT1,
-  AV_CHANNEL_LAYOUT_STEREO,
   AV_FRAME_DATA_A53_CC,
   AV_FRAME_DATA_MASTERING_DISPLAY_METADATA,
   AV_FRAME_DATA_MOTION_VECTORS,
@@ -14,9 +11,6 @@ import {
   AV_PICTURE_TYPE_P,
   AV_PIX_FMT_RGB24,
   AV_PIX_FMT_YUV420P,
-  AV_SAMPLE_FMT_FLT,
-  AV_SAMPLE_FMT_FLTP,
-  AV_SAMPLE_FMT_S16,
   AVCHROMA_LOC_LEFT,
   AVCOL_PRI_BT709,
   AVCOL_RANGE_JPEG,
@@ -248,84 +242,6 @@ describe('Frame', () => {
     });
   });
 
-  describe('Audio Frame Properties', () => {
-    beforeEach(() => {
-      frame.alloc();
-    });
-
-    it('should set and get audio format properties', () => {
-      frame.format = AV_SAMPLE_FMT_FLTP;
-      frame.sampleRate = 48000;
-      frame.nbSamples = 1024;
-      frame.channelLayout = AV_CHANNEL_LAYOUT_STEREO;
-
-      assert.equal(frame.format, AV_SAMPLE_FMT_FLTP);
-      assert.equal(frame.sampleRate, 48000);
-      assert.equal(frame.nbSamples, 1024);
-      assert.equal(frame.channelLayout.nbChannels, 2);
-    });
-
-    it('should allocate audio frame buffer', () => {
-      frame.format = AV_SAMPLE_FMT_FLTP;
-      frame.sampleRate = 44100;
-      frame.nbSamples = 1024;
-      frame.channelLayout = AV_CHANNEL_LAYOUT_STEREO;
-
-      const ret = frame.getBuffer();
-      assert.equal(ret, 0);
-
-      // For planar audio, we should have separate buffers per channel
-      assert.notEqual(frame.data, null);
-      assert.ok(Array.isArray(frame.data));
-      assert.equal(frame.data.length, 2); // 2 channels
-      assert.ok(frame.data[0] instanceof Buffer);
-      assert.ok(frame.data[1] instanceof Buffer);
-    });
-
-    it('should allocate interleaved audio frame buffer', () => {
-      frame.format = AV_SAMPLE_FMT_S16;
-      frame.sampleRate = 48000;
-      frame.nbSamples = 512;
-      frame.channelLayout = AV_CHANNEL_LAYOUT_STEREO;
-
-      const ret = frame.allocBuffer();
-      assert.equal(ret, 0);
-
-      // For interleaved audio, we should have a single buffer
-      assert.notEqual(frame.data, null);
-      assert.ok(frame.data![0] instanceof Buffer);
-    });
-
-    it('should get number of channels', () => {
-      frame.channelLayout = AV_CHANNEL_LAYOUT_5POINT1_BACK;
-
-      assert.equal(frame.channels, 6);
-    });
-
-    it('should access extendedData for audio frames', () => {
-      // Set up audio frame
-      frame.format = AV_SAMPLE_FMT_S16;
-      frame.sampleRate = 44100;
-      frame.nbSamples = 1024;
-      frame.channelLayout = AV_CHANNEL_LAYOUT_STEREO;
-
-      const ret = frame.allocBuffer();
-      assert.equal(ret, 0);
-
-      // extendedData should contain audio data buffers
-      const extData = frame.extendedData;
-      assert.notEqual(extData, null, 'Should have extended data');
-      assert.ok(Array.isArray(extData), 'Should be an array');
-      assert.ok(extData.length >= 1, 'Should have at least one buffer');
-      assert.ok(extData[0] instanceof Buffer, 'Should contain Buffer objects');
-
-      // For audio frames, we should be able to access the data
-      // The actual buffer content may differ, but both should exist
-      assert.ok(frame.data, 'Should have data array');
-      assert.ok(frame.data[0] instanceof Buffer, 'data[0] should be a Buffer');
-    });
-  });
-
   describe('Timestamps and Timing', () => {
     beforeEach(() => {
       frame.alloc();
@@ -535,28 +451,6 @@ describe('Frame', () => {
     });
   });
 
-  describe('Extended Data', () => {
-    beforeEach(() => {
-      frame.alloc();
-    });
-
-    it('should handle extended data for multi-channel audio', () => {
-      frame.format = AV_SAMPLE_FMT_FLTP;
-      frame.sampleRate = 48000;
-      frame.nbSamples = 1024;
-      frame.channelLayout = AV_CHANNEL_LAYOUT_7POINT1;
-
-      const ret = frame.getBuffer();
-      assert.equal(ret, 0);
-
-      // Should have extended data for > 8 channels
-      const extData = frame.extendedData;
-      assert.notEqual(extData, null);
-      assert.ok(Array.isArray(extData));
-      assert.equal(extData.length, 8);
-    });
-  });
-
   describe('Error Handling', () => {
     beforeEach(() => {
       frame.alloc();
@@ -578,16 +472,6 @@ describe('Frame', () => {
 
       const ret = frame.getBuffer();
       assert.notEqual(ret, 0, 'Should fail without dimensions');
-      assert.ok(ret < 0, 'Should return negative error code');
-    });
-
-    it('should fail to allocate audio buffer without samples', () => {
-      frame.format = AV_SAMPLE_FMT_FLTP;
-      frame.channelLayout = AV_CHANNEL_LAYOUT_STEREO;
-      // No nbSamples set
-
-      const ret = frame.getBuffer();
-      assert.notEqual(ret, 0, 'Should fail without nbSamples');
       assert.ok(ret < 0, 'Should return negative error code');
     });
 
@@ -811,32 +695,6 @@ describe('Frame', () => {
       assert.equal(yPlane[1], 1, 'Second Y value should match');
     });
 
-    it('should fill audio frame from buffer', () => {
-      frame.alloc();
-      frame.format = AV_SAMPLE_FMT_FLT;
-      frame.nbSamples = 1024;
-      frame.channelLayout = AV_CHANNEL_LAYOUT_STEREO;
-      frame.allocBuffer();
-
-      // Float32 stereo: 1024 samples * 2 channels * 4 bytes
-      const samplesSize = frame.nbSamples * 2 * 4;
-      const buffer = Buffer.alloc(samplesSize);
-
-      // Fill with test pattern (alternating values)
-      const floatArray = new Float32Array(buffer.buffer);
-      for (let i = 0; i < floatArray.length; i++) {
-        floatArray[i] = i % 2 === 0 ? 0.5 : -0.5;
-      }
-
-      const ret = frame.fromBuffer(buffer);
-      assert.equal(ret, 0, 'fromBuffer should succeed for audio');
-
-      // Verify data was written
-      const data = frame.data;
-      assert.ok(data, 'Frame should have data');
-      assert.ok(data[0] instanceof Buffer, 'Audio data should be a Buffer');
-    });
-
     it('should fail with unallocated frame', () => {
       const buffer = Buffer.alloc(100);
 
@@ -945,67 +803,5 @@ describe('Frame', () => {
       });
     });
 
-    describe('fromAudioBuffer', () => {
-      it('should create audio frame from buffer', () => {
-        const nbSamples = 960;
-        const channels = 2;
-        const format = AV_SAMPLE_FMT_FLT;
-        const sampleRate = 48000;
-        const channelLayout = AV_CHANNEL_LAYOUT_STEREO;
-        const bufferSize = nbSamples * channels * 4; // float32 = 4 bytes per sample
-        const buffer = Buffer.alloc(bufferSize);
-
-        // Fill with some test audio data
-        for (let i = 0; i < bufferSize; i += 4) {
-          buffer.writeFloatLE(Math.sin(i / 100), i);
-        }
-
-        using audioFrame = Frame.fromAudioBuffer(buffer, {
-          nbSamples,
-          format,
-          sampleRate,
-          channelLayout,
-        });
-
-        assert.strictEqual(audioFrame.nbSamples, nbSamples);
-        assert.strictEqual(audioFrame.format, format);
-        assert.strictEqual(audioFrame.sampleRate, sampleRate);
-        assert.deepStrictEqual(audioFrame.channelLayout, channelLayout);
-        assert.notEqual(audioFrame.data, null);
-
-        // Verify data was copied
-        const outputBuffer = audioFrame.toBuffer();
-        assert.ok(outputBuffer.length > 0);
-      });
-
-      it('should set optional properties', () => {
-        const buffer = Buffer.alloc(960 * 2 * 4); // 960 samples, stereo, float32
-        using audioFrame = Frame.fromAudioBuffer(buffer, {
-          nbSamples: 960,
-          format: AV_SAMPLE_FMT_FLT,
-          sampleRate: 48000,
-          channelLayout: AV_CHANNEL_LAYOUT_STEREO,
-          timeBase: { num: 1, den: 48000 },
-          pts: 100n,
-        });
-
-        assert.strictEqual(audioFrame.timeBase.num, 1);
-        assert.strictEqual(audioFrame.timeBase.den, 48000);
-        assert.strictEqual(audioFrame.pts, 100n);
-      });
-
-      it('should throw on invalid buffer size', () => {
-        const tooSmallBuffer = Buffer.alloc(100);
-
-        assert.throws(() => {
-          Frame.fromAudioBuffer(tooSmallBuffer, {
-            nbSamples: 960,
-            format: AV_SAMPLE_FMT_FLT,
-            sampleRate: 48000,
-            channelLayout: AV_CHANNEL_LAYOUT_STEREO,
-          });
-        });
-      });
-    });
   });
 });

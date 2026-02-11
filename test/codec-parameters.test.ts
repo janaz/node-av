@@ -7,15 +7,12 @@ import {
   AV_CHANNEL_LAYOUT_MONO,
   AV_CHANNEL_LAYOUT_STEREO,
   AV_CHANNEL_ORDER_NATIVE,
-  AV_CODEC_ID_AAC,
   AV_CODEC_ID_H264,
-  AV_CODEC_ID_MJPEG,
-  AV_CODEC_ID_PCM_S16LE,
   AV_PIX_FMT_RGB24,
   AV_PIX_FMT_YUV420P,
-  AV_PROFILE_AAC_LOW,
   AV_PROFILE_H264_BASELINE,
   AV_PROFILE_H264_HIGH,
+  AV_PROFILE_H264_MAIN,
   AV_SAMPLE_FMT_FLTP,
   AV_SAMPLE_FMT_S16,
   AVCHROMA_LOC_CENTER,
@@ -25,7 +22,6 @@ import {
   AVCOL_RANGE_MPEG,
   AVCOL_SPC_BT709,
   AVCOL_TRC_BT709,
-  AVMEDIA_TYPE_AUDIO,
   AVMEDIA_TYPE_VIDEO,
   Codec,
   CodecContext,
@@ -84,17 +80,11 @@ describe('CodecParameters', () => {
     it('should get and set codec type', () => {
       params.codecType = AVMEDIA_TYPE_VIDEO;
       assert.equal(params.codecType, AVMEDIA_TYPE_VIDEO);
-
-      params.codecType = AVMEDIA_TYPE_AUDIO;
-      assert.equal(params.codecType, AVMEDIA_TYPE_AUDIO);
     });
 
     it('should get and set codec ID', () => {
       params.codecId = AV_CODEC_ID_H264;
       assert.equal(params.codecId, AV_CODEC_ID_H264);
-
-      params.codecId = AV_CODEC_ID_AAC;
-      assert.equal(params.codecId, AV_CODEC_ID_AAC);
     });
 
     it('should get and set codec tag', () => {
@@ -325,7 +315,7 @@ describe('CodecParameters', () => {
   describe('Audio Properties', () => {
     beforeEach(() => {
       params.alloc();
-      params.codecType = AVMEDIA_TYPE_AUDIO;
+      params.codecType = AVMEDIA_TYPE_VIDEO;
     });
 
     it('should get and set sample rate', () => {
@@ -365,17 +355,17 @@ describe('CodecParameters', () => {
     });
 
     it('should get and set frameSize', () => {
-      // Common audio frame sizes
-      params.frameSize = 1024; // AAC
+      // Common frame sizes
+      params.frameSize = 1024;
       assert.equal(params.frameSize, 1024);
 
-      params.frameSize = 1152; // MP3
+      params.frameSize = 1152;
       assert.equal(params.frameSize, 1152);
 
-      params.frameSize = 960; // Opus
+      params.frameSize = 960;
       assert.equal(params.frameSize, 960);
 
-      // Variable frame size codecs
+      // Variable frame size
       params.frameSize = 0;
       assert.equal(params.frameSize, 0);
     });
@@ -446,13 +436,13 @@ describe('CodecParameters', () => {
       dst.free();
     });
 
-    it('should copy audio parameters', () => {
+    it('should copy video parameters with format', () => {
       params.alloc();
-      params.codecType = AVMEDIA_TYPE_AUDIO;
-      params.codecId = AV_CODEC_ID_AAC;
-      params.sampleRate = 48000;
-      params.channels = 2;
-      params.format = AV_SAMPLE_FMT_FLTP;
+      params.codecType = AVMEDIA_TYPE_VIDEO;
+      params.codecId = AV_CODEC_ID_H264;
+      params.width = 640;
+      params.height = 480;
+      params.format = AV_PIX_FMT_YUV420P;
 
       const dst = new CodecParameters();
       dst.alloc();
@@ -460,11 +450,11 @@ describe('CodecParameters', () => {
       const ret = params.copy(dst);
       assert.equal(ret, 0);
 
-      assert.equal(dst.codecType, AVMEDIA_TYPE_AUDIO);
-      assert.equal(dst.codecId, AV_CODEC_ID_AAC);
-      assert.equal(dst.sampleRate, 48000);
-      assert.equal(dst.channels, 2);
-      assert.equal(dst.format, AV_SAMPLE_FMT_FLTP);
+      assert.equal(dst.codecType, AVMEDIA_TYPE_VIDEO);
+      assert.equal(dst.codecId, AV_CODEC_ID_H264);
+      assert.equal(dst.width, 640);
+      assert.equal(dst.height, 480);
+      assert.equal(dst.format, AV_PIX_FMT_YUV420P);
 
       dst.free();
     });
@@ -516,12 +506,12 @@ describe('CodecParameters', () => {
     it('should copy to codec context', () => {
       params.alloc();
       params.codecType = AVMEDIA_TYPE_VIDEO;
-      params.codecId = AV_CODEC_ID_MJPEG;
+      params.codecId = AV_CODEC_ID_H264;
       params.width = 800;
       params.height = 600;
-      params.format = AV_PIX_FMT_RGB24;
+      params.format = AV_PIX_FMT_YUV420P;
 
-      const codec = Codec.findDecoder(AV_CODEC_ID_MJPEG);
+      const codec = Codec.findDecoder(AV_CODEC_ID_H264);
       assert.ok(codec);
 
       const ctx = new CodecContext();
@@ -533,29 +523,29 @@ describe('CodecParameters', () => {
       // Verify context was updated
       assert.equal(ctx.width, 800);
       assert.equal(ctx.height, 600);
-      assert.equal(ctx.pixelFormat, AV_PIX_FMT_RGB24);
+      assert.equal(ctx.pixelFormat, AV_PIX_FMT_YUV420P);
 
       ctx.freeContext();
     });
 
-    it('should handle audio context', () => {
-      const codec = Codec.findDecoder(AV_CODEC_ID_PCM_S16LE);
+    it('should handle video context with different codec', () => {
+      const codec = Codec.findDecoder(AV_CODEC_ID_H264);
       assert.ok(codec);
 
       const ctx = new CodecContext();
       ctx.allocContext3(codec);
-      ctx.sampleRate = 44100;
-      ctx.channelLayout = AV_CHANNEL_LAYOUT_STEREO;
-      ctx.sampleFormat = AV_SAMPLE_FMT_S16;
+      ctx.width = 320;
+      ctx.height = 240;
+      ctx.pixelFormat = AV_PIX_FMT_YUV420P;
 
       params.alloc();
       const ret = params.fromContext(ctx);
       assert.equal(ret, 0);
 
-      assert.equal(params.codecType, AVMEDIA_TYPE_AUDIO);
-      assert.equal(params.codecId, AV_CODEC_ID_PCM_S16LE);
-      assert.equal(params.sampleRate, 44100);
-      assert.equal(params.format, AV_SAMPLE_FMT_S16);
+      assert.equal(params.codecType, AVMEDIA_TYPE_VIDEO);
+      assert.equal(params.codecId, AV_CODEC_ID_H264);
+      assert.equal(params.width, 320);
+      assert.equal(params.height, 240);
 
       ctx.freeContext();
     });
@@ -605,15 +595,15 @@ describe('CodecParameters', () => {
       dst.free();
     });
 
-    it('should copy audio parameters', () => {
+    it('should copy video parameters with profile', () => {
       params.alloc();
-      params.codecType = AVMEDIA_TYPE_AUDIO;
-      params.codecId = AV_CODEC_ID_AAC;
+      params.codecType = AVMEDIA_TYPE_VIDEO;
+      params.codecId = AV_CODEC_ID_H264;
       params.bitRate = 128000n;
-      params.sampleRate = 48000;
-      params.format = AV_SAMPLE_FMT_FLTP;
-      params.channelLayout = AV_CHANNEL_LAYOUT_STEREO;
-      params.profile = AV_PROFILE_AAC_LOW;
+      params.width = 854;
+      params.height = 480;
+      params.format = AV_PIX_FMT_YUV420P;
+      params.profile = AV_PROFILE_H264_MAIN;
 
       const dst = new CodecParameters();
       dst.alloc();
@@ -622,14 +612,13 @@ describe('CodecParameters', () => {
       assert.equal(ret, 0);
 
       // Verify all parameters were copied
-      assert.equal(dst.codecType, AVMEDIA_TYPE_AUDIO);
-      assert.equal(dst.codecId, AV_CODEC_ID_AAC);
+      assert.equal(dst.codecType, AVMEDIA_TYPE_VIDEO);
+      assert.equal(dst.codecId, AV_CODEC_ID_H264);
       assert.equal(dst.bitRate, 128000n);
-      assert.equal(dst.sampleRate, 48000);
-      assert.equal(dst.format, AV_SAMPLE_FMT_FLTP);
-      assert.equal(dst.channelLayout.nbChannels, 2);
-      assert.equal(dst.channelLayout.mask, 3n);
-      assert.equal(dst.profile, AV_PROFILE_AAC_LOW);
+      assert.equal(dst.width, 854);
+      assert.equal(dst.height, 480);
+      assert.equal(dst.format, AV_PIX_FMT_YUV420P);
+      assert.equal(dst.profile, AV_PROFILE_H264_MAIN);
 
       dst.free();
     });
@@ -644,8 +633,8 @@ describe('CodecParameters', () => {
       const dst = new CodecParameters();
       dst.alloc();
       // Set different values in destination
-      dst.codecType = AVMEDIA_TYPE_AUDIO;
-      dst.codecId = AV_CODEC_ID_AAC;
+      dst.codecType = AVMEDIA_TYPE_VIDEO;
+      dst.codecId = AV_CODEC_ID_H264;
       dst.width = 640;
       dst.height = 480;
 

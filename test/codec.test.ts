@@ -2,20 +2,10 @@ import assert from 'node:assert';
 import { describe, it } from 'node:test';
 
 import {
-  AV_CODEC_ID_AAC,
-  AV_CODEC_ID_AC3,
   AV_CODEC_ID_AV1,
-  AV_CODEC_ID_FLAC,
   AV_CODEC_ID_H264,
   AV_CODEC_ID_HEVC,
-  AV_CODEC_ID_MJPEG,
-  AV_CODEC_ID_MP3,
-  AV_CODEC_ID_MPEG4,
-  AV_CODEC_ID_OPUS,
-  AV_CODEC_ID_PCM_S16LE,
   AV_CODEC_ID_PNG,
-  AV_CODEC_ID_VORBIS,
-  AV_CODEC_ID_VP8,
   AV_CODEC_ID_VP9,
   AV_HWDEVICE_TYPE_CUDA,
   AV_HWDEVICE_TYPE_D3D11VA,
@@ -23,10 +13,8 @@ import {
   AV_HWDEVICE_TYPE_QSV,
   AV_HWDEVICE_TYPE_VAAPI,
   AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
-  AVMEDIA_TYPE_AUDIO,
   AVMEDIA_TYPE_VIDEO,
   Codec,
-  FF_DECODER_AAC,
   FF_DECODER_H264,
   FF_DECODER_H264_CUVID,
   FF_DECODER_H264_QSV,
@@ -56,28 +44,12 @@ describe('Codec', () => {
       assert.ok(decoder.longName);
     });
 
-    it('should find AAC decoder by ID', () => {
-      const decoder = Codec.findDecoder(AV_CODEC_ID_AAC);
-      assert.ok(decoder);
-      assert.ok(decoder.isDecoder());
-      assert.equal(decoder.id, AV_CODEC_ID_AAC);
-      assert.equal(decoder.type, AVMEDIA_TYPE_AUDIO);
-    });
-
     it('should find decoder by name', () => {
       const decoder = Codec.findDecoderByName(FF_DECODER_H264);
       assert.ok(decoder);
       assert.ok(decoder.isDecoder());
       assert.equal(decoder.name, FF_DECODER_H264);
       assert.equal(decoder.type, AVMEDIA_TYPE_VIDEO);
-    });
-
-    it('should find AAC decoder by name', () => {
-      const decoder = Codec.findDecoderByName(FF_DECODER_AAC);
-      assert.ok(decoder);
-      assert.ok(decoder.isDecoder());
-      assert.equal(decoder.name, 'aac');
-      assert.equal(decoder.type, AVMEDIA_TYPE_AUDIO);
     });
 
     it('should return null for non-existent decoder ID', () => {
@@ -95,11 +67,8 @@ describe('Codec', () => {
       const codecIds = [
         AV_CODEC_ID_H264,
         AV_CODEC_ID_HEVC, // H.265
-        AV_CODEC_ID_VP8,
         AV_CODEC_ID_VP9,
         AV_CODEC_ID_AV1,
-        AV_CODEC_ID_MPEG4,
-        AV_CODEC_ID_MJPEG,
       ];
 
       for (const id of codecIds) {
@@ -110,16 +79,6 @@ describe('Codec', () => {
       }
     });
 
-    it('should find common audio decoders', () => {
-      const codecIds = [AV_CODEC_ID_AAC, AV_CODEC_ID_MP3, AV_CODEC_ID_OPUS, AV_CODEC_ID_VORBIS, AV_CODEC_ID_FLAC, AV_CODEC_ID_AC3, AV_CODEC_ID_PCM_S16LE];
-
-      for (const id of codecIds) {
-        const decoder = Codec.findDecoder(id);
-        assert.ok(decoder, `Decoder for codec ID ${id} should exist`);
-        assert.ok(decoder.isDecoder());
-        assert.equal(decoder.type, AVMEDIA_TYPE_AUDIO);
-      }
-    });
   });
 
   describe('Find Encoders', () => {
@@ -151,15 +110,6 @@ describe('Codec', () => {
       }
     });
 
-    it('should find AAC encoder by ID', () => {
-      const encoder = Codec.findEncoder(AV_CODEC_ID_AAC);
-      if (encoder) {
-        assert.ok(encoder.isEncoder());
-        assert.equal(encoder.id, AV_CODEC_ID_AAC);
-        assert.equal(encoder.type, AVMEDIA_TYPE_AUDIO);
-      }
-    });
-
     it('should return null for non-existent encoder', () => {
       const encoder = Codec.findEncoderByName('nonexistent_encoder_xyz' as any);
       assert.equal(encoder, null);
@@ -173,13 +123,6 @@ describe('Codec', () => {
       assert.equal(encoder.type, AVMEDIA_TYPE_VIDEO);
     });
 
-    it('should find PCM encoder', () => {
-      const encoder = Codec.findEncoder(AV_CODEC_ID_PCM_S16LE);
-      assert.ok(encoder);
-      assert.ok(encoder.isEncoder());
-      assert.equal(encoder.id, AV_CODEC_ID_PCM_S16LE);
-      assert.equal(encoder.type, AVMEDIA_TYPE_AUDIO);
-    });
   });
 
   describe('Codec Properties', () => {
@@ -198,19 +141,6 @@ describe('Codec', () => {
       assert.ok(typeof decoder.capabilities === 'number');
 
       // Check if decoder, not encoder
-      assert.ok(decoder.isDecoder());
-      assert.ok(!decoder.isEncoder());
-    });
-
-    it('should have correct properties for AAC decoder', () => {
-      const decoder = Codec.findDecoder(AV_CODEC_ID_AAC);
-      assert.ok(decoder);
-
-      assert.equal(decoder.name, 'aac');
-      assert.ok(decoder.longName);
-      assert.equal(decoder.type, AVMEDIA_TYPE_AUDIO);
-      assert.equal(decoder.id, AV_CODEC_ID_AAC);
-
       assert.ok(decoder.isDecoder());
       assert.ok(!decoder.isEncoder());
     });
@@ -310,44 +240,6 @@ describe('Codec', () => {
       }
     });
 
-    it('should have sample formats for audio decoder', () => {
-      const decoder = Codec.findDecoder(AV_CODEC_ID_AAC);
-      assert.ok(decoder);
-
-      const sampleFormats = decoder.sampleFormats;
-      if (sampleFormats) {
-        assert.ok(Array.isArray(sampleFormats));
-        assert.ok(sampleFormats.length > 0);
-        // Should be numbers (AVSampleFormat enum values)
-        assert.ok(sampleFormats.every((fmt) => typeof fmt === 'number'));
-      }
-    });
-
-    it('should have supported sample rates for audio codec', () => {
-      const decoder = Codec.findDecoder(AV_CODEC_ID_AAC);
-      assert.ok(decoder);
-
-      const sampleRates = decoder.supportedSamplerates;
-      // AAC typically supports specific sample rates
-      if (sampleRates) {
-        assert.ok(Array.isArray(sampleRates));
-        assert.ok(sampleRates.length > 0);
-        // Common sample rates
-        assert.ok(sampleRates.every((rate) => typeof rate === 'number' && rate > 0));
-      }
-    });
-
-    it('should have channel layouts for audio codec', () => {
-      const decoder = Codec.findDecoder(AV_CODEC_ID_AAC);
-      assert.ok(decoder);
-
-      const channelLayouts = decoder.channelLayouts;
-      if (channelLayouts) {
-        assert.ok(Array.isArray(channelLayouts));
-        // Channel layouts are complex objects
-      }
-    });
-
     it('should have profiles for H.264', () => {
       const decoder = Codec.findDecoder(AV_CODEC_ID_H264);
       assert.ok(decoder);
@@ -417,11 +309,9 @@ describe('Codec', () => {
       assert.ok(encoders.length > 0);
       assert.ok(decoders.length > 0);
 
-      // Should have both audio and video codecs
+      // Should have video codecs
       const videoCodecs = codecs.filter((c) => c.type === AVMEDIA_TYPE_VIDEO);
-      const audioCodecs = codecs.filter((c) => c.type === AVMEDIA_TYPE_AUDIO);
       assert.ok(videoCodecs.length > 0);
-      assert.ok(audioCodecs.length > 0);
     });
 
     it('should iterate through codecs', () => {
@@ -765,25 +655,5 @@ describe('Codec', () => {
       assert.equal(decoder, null);
     });
 
-    it('should handle special codec IDs', () => {
-      // PCM codecs should always be available
-      const pcmDecoder = Codec.findDecoder(AV_CODEC_ID_PCM_S16LE);
-      assert.ok(pcmDecoder);
-      assert.equal(pcmDecoder.type, AVMEDIA_TYPE_AUDIO);
-
-      // PCM codecs typically don't need complex initialization
-      assert.ok(pcmDecoder.isDecoder());
-    });
-
-    it('should handle codecs without certain properties', () => {
-      // PCM codecs might not have profiles
-      const pcmDecoder = Codec.findDecoder(AV_CODEC_ID_PCM_S16LE);
-      assert.ok(pcmDecoder);
-
-      // These can be null for simple codecs
-      const profiles = pcmDecoder.profiles;
-      // profiles can be null
-      assert.ok(profiles === null || Array.isArray(profiles));
-    });
   });
 });

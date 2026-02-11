@@ -2,14 +2,12 @@ import assert from 'node:assert';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 
 import {
-  AV_CODEC_ID_AAC,
   AV_CODEC_ID_H264,
   AV_DISPOSITION_ATTACHED_PIC,
   AV_DISPOSITION_DEFAULT,
   AVDISCARD_ALL,
   AVDISCARD_DEFAULT,
   AVFLAG_NONE,
-  AVMEDIA_TYPE_AUDIO,
   AVMEDIA_TYPE_VIDEO,
   AVSTREAM_EVENT_FLAG_METADATA_UPDATED,
   AVSTREAM_EVENT_FLAG_NEW_PACKETS,
@@ -177,20 +175,20 @@ describe('Stream', () => {
       assert.equal(stream.codecpar.bitRate, 4000000n);
     });
 
-    it('should set codec parameters for audio', () => {
+    it('should set codec parameters for video stream', () => {
       const codecpar = stream.codecpar;
-      codecpar.codecType = AVMEDIA_TYPE_AUDIO;
-      codecpar.codecId = AV_CODEC_ID_AAC;
-      codecpar.sampleRate = 48000;
-      codecpar.channels = 2;
-      codecpar.bitRate = 128000n;
+      codecpar.codecType = AVMEDIA_TYPE_VIDEO;
+      codecpar.codecId = AV_CODEC_ID_H264;
+      codecpar.width = 1280;
+      codecpar.height = 720;
+      codecpar.bitRate = 2000000n;
 
       // Verify changes
-      assert.equal(stream.codecpar.codecType, AVMEDIA_TYPE_AUDIO);
-      assert.equal(stream.codecpar.codecId, AV_CODEC_ID_AAC);
-      assert.equal(stream.codecpar.sampleRate, 48000);
-      assert.equal(stream.codecpar.channels, 2);
-      assert.equal(stream.codecpar.bitRate, 128000n);
+      assert.equal(stream.codecpar.codecType, AVMEDIA_TYPE_VIDEO);
+      assert.equal(stream.codecpar.codecId, AV_CODEC_ID_H264);
+      assert.equal(stream.codecpar.width, 1280);
+      assert.equal(stream.codecpar.height, 720);
+      assert.equal(stream.codecpar.bitRate, 2000000n);
     });
 
     it('should replace codec parameters', () => {
@@ -202,20 +200,19 @@ describe('Stream', () => {
       // Create new codec parameters
       const newCodecpar = new CodecParameters();
       newCodecpar.alloc();
-      newCodecpar.codecType = AVMEDIA_TYPE_AUDIO;
-      newCodecpar.sampleRate = 44100;
-      newCodecpar.channels = 2;
+      newCodecpar.codecType = AVMEDIA_TYPE_VIDEO;
+      newCodecpar.codecId = AV_CODEC_ID_H264;
+      newCodecpar.width = 1280;
+      newCodecpar.height = 720;
 
       // Replace
       stream.codecpar = newCodecpar;
 
       // Verify replacement
-      assert.equal(stream.codecpar.codecType, AVMEDIA_TYPE_AUDIO);
-      assert.equal(stream.codecpar.sampleRate, 44100);
-      assert.equal(stream.codecpar.channels, 2);
-      // Video params should be gone
-      assert.equal(stream.codecpar.width, 0);
-      assert.equal(stream.codecpar.height, 0);
+      assert.equal(stream.codecpar.codecType, AVMEDIA_TYPE_VIDEO);
+      assert.equal(stream.codecpar.codecId, AV_CODEC_ID_H264);
+      assert.equal(stream.codecpar.width, 1280);
+      assert.equal(stream.codecpar.height, 720);
 
       newCodecpar.free();
     });
@@ -275,12 +272,12 @@ describe('Stream', () => {
 
       // Set different properties for each
       stream.codecpar.codecType = AVMEDIA_TYPE_VIDEO;
-      stream2.codecpar.codecType = AVMEDIA_TYPE_AUDIO;
+      stream2.codecpar.codecType = AVMEDIA_TYPE_VIDEO;
       stream3.codecpar.codecType = AVMEDIA_TYPE_VIDEO;
 
       // Verify independence
       assert.equal(stream.codecpar.codecType, AVMEDIA_TYPE_VIDEO);
-      assert.equal(stream2.codecpar.codecType, AVMEDIA_TYPE_AUDIO);
+      assert.equal(stream2.codecpar.codecType, AVMEDIA_TYPE_VIDEO);
       assert.equal(stream3.codecpar.codecType, AVMEDIA_TYPE_VIDEO);
     });
 

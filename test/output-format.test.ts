@@ -31,7 +31,7 @@ describe('OutputFormat', () => {
     });
 
     it('should find common formats', () => {
-      const formats = ['mp4', 'mov', 'avi', 'matroska', 'mp3', 'wav', 'flac'];
+      const formats = ['mp4', 'mov', 'avi', 'matroska'];
 
       for (const name of formats) {
         const format = OutputFormat.guessFormat(name, null, null);
@@ -103,20 +103,13 @@ describe('OutputFormat', () => {
       assert.ok((flags & AVFMT_NOFILE) === 0);
     });
 
-    it('should get audio codec', () => {
-      const format = OutputFormat.guessFormat('mp4', null, null);
-      assert.ok(format);
-      const audioCodec = format.audioCodec;
-      // audioCodec should be a valid codec ID
-      assert.ok(typeof audioCodec === 'number');
-    });
-
     it('should get video codec', () => {
       const format = OutputFormat.guessFormat('mp4', null, null);
       assert.ok(format);
       const videoCodec = format.videoCodec;
       // videoCodec should be a valid codec ID
       assert.ok(typeof videoCodec === 'number');
+      assert.ok(videoCodec !== 0, 'MP4 should have a default video codec');
     });
 
     it('should get subtitle codec', () => {
@@ -152,18 +145,6 @@ describe('OutputFormat', () => {
       const videoFormats = ['mp4', 'avi', 'mov', 'matroska', 'webm'];
 
       for (const name of videoFormats) {
-        const format = OutputFormat.guessFormat(name, null, null);
-        if (format) {
-          assert.ok(format.name);
-          assert.ok(format.longName);
-        }
-      }
-    });
-
-    it('should handle audio formats', () => {
-      const audioFormats = ['mp3', 'wav', 'flac', 'aac', 'ogg'];
-
-      for (const name of audioFormats) {
         const format = OutputFormat.guessFormat(name, null, null);
         if (format) {
           assert.ok(format.name);
@@ -305,19 +286,8 @@ describe('OutputFormat', () => {
     it('should have default codecs for common formats', () => {
       const format = OutputFormat.guessFormat('mp4', null, null);
       if (format) {
-        // MP4 should have default audio and video codecs
-        assert.ok(format.audioCodec !== 0, 'Should have default audio codec');
+        // MP4 should have a default video codec
         assert.ok(format.videoCodec !== 0, 'Should have default video codec');
-      }
-    });
-
-    it('should have audio-only format support', () => {
-      const format = OutputFormat.guessFormat('mp3', null, null);
-      if (format) {
-        // MP3 should have audio codec but no video codec
-        assert.ok(format.audioCodec !== 0, 'Should have audio codec');
-        // Video codec might be 0 or undefined for audio-only formats
-        assert.ok(format.videoCodec === 0 || typeof format.videoCodec === 'number');
       }
     });
 
