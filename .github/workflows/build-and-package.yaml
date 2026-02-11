@@ -20,6 +20,7 @@ on:
       - stripped-ffmpeg
     paths:
       - "src/**"
+      - "test/**"
       - "externals/jellyfin-ffmpeg/**"
       - ".github/workflows/build-and-package.yaml"
       - "binding-jellyfin.gyp"
