@@ -1,4 +1,5 @@
 import type {
+  AVAlphaMode,
   AVBufferSrcFlag,
   AVChromaLocation,
   AVCodecCap,
@@ -116,6 +117,7 @@ export interface NativeFrame extends Disposable {
   colorTrc: AVColorTransferCharacteristic;
   colorSpace: AVColorSpace;
   chromaLocation: AVChromaLocation;
+  alphaMode: AVAlphaMode;
   hwFramesCtx: NativeHardwareFramesContext | null;
   flags: number;
   decodeErrorFlags: number;
@@ -144,6 +146,7 @@ export interface NativeFrame extends Disposable {
   getMetadata(): NativeDictionary;
   applyCropping(flags?: number): number;
   importIOSurface(handleData: Buffer, hwFramesCtx: NativeHardwareFramesContext): number;
+  importNSImage(handleData: Buffer): number;
   importD3D11Texture(handleData: Buffer, hwDeviceCtx: NativeHardwareDeviceContext): number;
   importDmaBuf(planes: { fd: number; stride: number; offset: number; size: number }[], width: number, height: number, modifier: bigint, swFormat: AVPixelFormat): number;
 

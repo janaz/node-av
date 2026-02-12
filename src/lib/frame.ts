@@ -5,6 +5,7 @@ import { HardwareFramesContext } from './hardware-frames-context.js';
 import { Rational } from './rational.js';
 
 import type {
+  AVAlphaMode,
   AVChromaLocation,
   AVColorPrimaries,
   AVColorRange,
@@ -31,6 +32,7 @@ export interface VideoFrame {
   timeBase?: IRational;
   sampleAspectRatio?: IRational;
   pts?: bigint;
+  alphaMode?: AVAlphaMode;
 }
 
 /**
@@ -65,6 +67,17 @@ export interface IOSurfaceFrame {
  */
 export interface D3D11TextureFrame {
   hwDeviceCtx: HardwareDeviceContext;
+  timeBase?: IRational;
+  pts?: bigint;
+}
+
+/**
+ * Options for {@link Frame.fromNSImage} (macOS only).
+ *
+ * Creates a zero-copy software frame from an NSImage native handle.
+ * Width, height, and pixel format are auto-detected from NSBitmapImageRep.
+ */
+export interface NSImageFrame {
   timeBase?: IRational;
   pts?: bigint;
 }
@@ -185,6 +198,10 @@ export class Frame implements Disposable, NativeWrapper<NativeFrame> {
       frame.sampleAspectRatio = new Rational(props.sampleAspectRatio.num, props.sampleAspectRatio.den);
     }
 
+    if (props.alphaMode !== undefined) {
+      frame.alphaMode = props.alphaMode;
+    }
+
     const ret = frame.getBuffer();
     FFmpegError.throwIfError(ret, 'Failed to allocate frame buffers');
 
@@ -280,6 +297,43 @@ export class Frame implements Disposable, NativeWrapper<NativeFrame> {
     }
     const ret = frame.native.importIOSurface(ioSurface, props.hwFramesCtx.getNative());
     FFmpegError.throwIfError(ret, 'Failed to import IOSurface');
+    return frame;
+  }
+
+  /**
+   * Create a software frame from an NSImage native handle (macOS only).
+   *
+   * Zero-copy: the frame references the NSBitmapImageRep pixel data directly.
+   * Width, height, and pixel format are auto-detected.
+   *
+   * @param nsImageHandle - NSImage pointer as Buffer
+   *
+   * @param props - Timing options
+   *
+   * @returns Software frame referencing the NSImage pixel data
+   *
+   * @throws {FFmpegError} If the import fails (e.g., no NSBitmapImageRep, wrong platform)
+   *
+   * @example
+   * ```typescript
+   * import { Frame } from 'node-av/lib';
+   *
+   * // Electron: nativeImage.getNativeHandle() returns 8-byte NSImage* pointer
+   * const frame = Frame.fromNSImage(nativeImage.getNativeHandle(), {
+   *   pts: 0n,
+   *   timeBase: { num: 1, den: 30 },
+   * });
+   * ```
+   */
+  static fromNSImage(nsImageHandle: Buffer, props?: NSImageFrame): Frame {
+    const frame = new Frame();
+    frame.alloc();
+    frame.pts = props?.pts ?? AV_NOPTS_VALUE;
+    if (props?.timeBase) {
+      frame.timeBase = new Rational(props.timeBase.num, props.timeBase.den);
+    }
+    const ret = frame.native.importNSImage(nsImageHandle);
+    FFmpegError.throwIfError(ret, 'Failed to import NSImage');
     return frame;
   }
 
@@ -661,6 +715,21 @@ export class Frame implements Disposable, NativeWrapper<NativeFrame> {
 
   set chromaLocation(value: AVChromaLocation) {
     this.native.chromaLocation = value;
+  }
+
+  /**
+   * Alpha channel mode.
+   *
+   * Specifies how the alpha channel relates to color values.
+   *
+   * Direct mapping to AVFrame->alpha_mode.
+   */
+  get alphaMode(): AVAlphaMode {
+    return this.native.alphaMode;
+  }
+
+  set alphaMode(value: AVAlphaMode) {
+    this.native.alphaMode = value;
   }
 
   /**

@@ -36,39 +36,41 @@ Napi::Object Frame::Init(Napi::Env env, Napi::Object exports) {
     InstanceMethod<&Frame::GetMetadata>("getMetadata"),
     InstanceMethod<&Frame::ApplyCropping>("applyCropping"),
     InstanceMethod<&Frame::ImportIOSurface>("importIOSurface"),
+    InstanceMethod<&Frame::ImportNSImage>("importNSImage"),
     InstanceMethod<&Frame::ImportD3D11Texture>("importD3D11Texture"),
     InstanceMethod<&Frame::ImportDmaBuf>("importDmaBuf"),
     InstanceMethod<&Frame::Dispose>(Napi::Symbol::WellKnown(env, "dispose")),
 
-    InstanceAccessor<&Frame::GetFormat, &Frame::SetFormat>("format"),
-    InstanceAccessor<&Frame::GetWidth, &Frame::SetWidth>("width"),
-    InstanceAccessor<&Frame::GetHeight, &Frame::SetHeight>("height"),
-    InstanceAccessor<&Frame::GetNbSamples, &Frame::SetNbSamples>("nbSamples"),
-    InstanceAccessor<&Frame::GetPts, &Frame::SetPts>("pts"),
-    InstanceAccessor<&Frame::GetPktDts, &Frame::SetPktDts>("pktDts"),
-    InstanceAccessor<&Frame::GetBestEffortTimestamp, &Frame::SetBestEffortTimestamp>("bestEffortTimestamp"),
-    InstanceAccessor<&Frame::GetTimeBase, &Frame::SetTimeBase>("timeBase"),
-    InstanceAccessor<&Frame::GetKeyFrame, &Frame::SetKeyFrame>("keyFrame"),
-    InstanceAccessor<&Frame::GetPictType, &Frame::SetPictType>("pictType"),
-    InstanceAccessor<&Frame::GetQuality, &Frame::SetQuality>("quality"),
-    InstanceAccessor<&Frame::GetSampleAspectRatio, &Frame::SetSampleAspectRatio>("sampleAspectRatio"),
-    InstanceAccessor<&Frame::GetSampleRate, &Frame::SetSampleRate>("sampleRate"),
-    InstanceAccessor<&Frame::GetChannelLayout, &Frame::SetChannelLayout>("channelLayout"),
+    InstanceAccessor("format", &Frame::GetFormat, &Frame::SetFormat, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("width", &Frame::GetWidth, &Frame::SetWidth, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("height", &Frame::GetHeight, &Frame::SetHeight, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("nbSamples", &Frame::GetNbSamples, &Frame::SetNbSamples, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("pts", &Frame::GetPts, &Frame::SetPts, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("pktDts", &Frame::GetPktDts, &Frame::SetPktDts, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("bestEffortTimestamp", &Frame::GetBestEffortTimestamp, &Frame::SetBestEffortTimestamp, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("timeBase", &Frame::GetTimeBase, &Frame::SetTimeBase, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("keyFrame", &Frame::GetKeyFrame, &Frame::SetKeyFrame, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("pictType", &Frame::GetPictType, &Frame::SetPictType, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("quality", &Frame::GetQuality, &Frame::SetQuality, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("sampleAspectRatio", &Frame::GetSampleAspectRatio, &Frame::SetSampleAspectRatio, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("sampleRate", &Frame::GetSampleRate, &Frame::SetSampleRate, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("channelLayout", &Frame::GetChannelLayout, &Frame::SetChannelLayout, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
     InstanceAccessor<&Frame::GetChannels>("channels"),
     InstanceAccessor<&Frame::GetLinesize>("linesize"),
-    InstanceAccessor<&Frame::GetColorRange, &Frame::SetColorRange>("colorRange"),
-    InstanceAccessor<&Frame::GetColorPrimaries, &Frame::SetColorPrimaries>("colorPrimaries"),
-    InstanceAccessor<&Frame::GetColorTrc, &Frame::SetColorTrc>("colorTrc"),
-    InstanceAccessor<&Frame::GetColorSpace, &Frame::SetColorSpace>("colorSpace"),
-    InstanceAccessor<&Frame::GetChromaLocation, &Frame::SetChromaLocation>("chromaLocation"),
+    InstanceAccessor("colorRange", &Frame::GetColorRange, &Frame::SetColorRange, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("colorPrimaries", &Frame::GetColorPrimaries, &Frame::SetColorPrimaries, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("colorTrc", &Frame::GetColorTrc, &Frame::SetColorTrc, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("colorSpace", &Frame::GetColorSpace, &Frame::SetColorSpace, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("chromaLocation", &Frame::GetChromaLocation, &Frame::SetChromaLocation, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("alphaMode", &Frame::GetAlphaMode, &Frame::SetAlphaMode, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
     InstanceAccessor<&Frame::GetData>("data"),
     InstanceAccessor<&Frame::GetExtendedData>("extendedData"),
     InstanceAccessor<&Frame::GetIsWritable>("isWritable"),
-    InstanceAccessor<&Frame::GetHwFramesCtx, &Frame::SetHwFramesCtx>("hwFramesCtx"),
-    InstanceAccessor<&Frame::GetFlags, &Frame::SetFlags>("flags"),
-    InstanceAccessor<&Frame::GetDecodeErrorFlags, &Frame::SetDecodeErrorFlags>("decodeErrorFlags"),
-    InstanceAccessor<&Frame::GetDuration, &Frame::SetDuration>("duration"),
-    InstanceAccessor<&Frame::GetRepeatPict, &Frame::SetRepeatPict>("repeatPict"),
+    InstanceAccessor("hwFramesCtx", &Frame::GetHwFramesCtx, &Frame::SetHwFramesCtx, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("flags", &Frame::GetFlags, &Frame::SetFlags, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("decodeErrorFlags", &Frame::GetDecodeErrorFlags, &Frame::SetDecodeErrorFlags, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("duration", &Frame::GetDuration, &Frame::SetDuration, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
+    InstanceAccessor("repeatPict", &Frame::GetRepeatPict, &Frame::SetRepeatPict, static_cast<napi_property_attributes>(napi_writable | napi_configurable)),
   });
   
   constructor = Napi::Persistent(func);
@@ -778,6 +780,20 @@ void Frame::SetChromaLocation(const Napi::CallbackInfo& info, const Napi::Value&
   }
 }
 
+Napi::Value Frame::GetAlphaMode(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!frame_) {
+    return Napi::Number::New(env, AVALPHA_MODE_UNSPECIFIED);
+  }
+  return Napi::Number::New(env, frame_->alpha_mode);
+}
+
+void Frame::SetAlphaMode(const Napi::CallbackInfo& info, const Napi::Value& value) {
+  if (frame_) {
+    frame_->alpha_mode = static_cast<AVAlphaMode>(value.As<Napi::Number>().Int32Value());
+  }
+}
+
 Napi::Value Frame::GetData(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   
@@ -1190,6 +1206,28 @@ Napi::Value Frame::ImportIOSurface(const Napi::CallbackInfo& info) {
 #else
   // IOSurface is only available on macOS
   Napi::Error::New(env, "importIOSurface is only available on macOS").ThrowAsJavaScriptException();
+  return Napi::Number::New(env, AVERROR(ENOSYS));
+#endif
+}
+
+Napi::Value Frame::ImportNSImage(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+
+#ifdef __APPLE__
+  if (!frame_) {
+    return Napi::Number::New(env, AVERROR(EINVAL));
+  }
+
+  if (info.Length() < 1 || !info[0].IsBuffer()) {
+    Napi::TypeError::New(env, "Expected (buffer)").ThrowAsJavaScriptException();
+    return Napi::Number::New(env, AVERROR(EINVAL));
+  }
+
+  Napi::Buffer<uint8_t> buffer = info[0].As<Napi::Buffer<uint8_t>>();
+  int ret = importNSImage(frame_, buffer.Data(), buffer.Length());
+  return Napi::Number::New(env, ret);
+#else
+  Napi::Error::New(env, "importNSImage is only available on macOS").ThrowAsJavaScriptException();
   return Napi::Number::New(env, AVERROR(ENOSYS));
 #endif
 }
