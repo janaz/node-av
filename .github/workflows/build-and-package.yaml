@@ -21,6 +21,7 @@ on:
     paths:
       - "src/**"
       - "test/**"
+      - "externals/jellyfin-ffmpeg"
       - "externals/jellyfin-ffmpeg/**"
       - ".github/workflows/build-and-package.yaml"
       - "binding-jellyfin.gyp"
