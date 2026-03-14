@@ -1,6 +1,6 @@
 {
   "name": "@revizly/node-av",
-  "version": "5.2.3-revizly1",
+  "version": "5.2.3-revizly2",
   "description": "FFmpeg bindings for Node.js",
   "author": "seydx (https://github.com/seydx/node-av)",
   "type": "module",
@@ -71,8 +71,8 @@
   },
   "dependencies": {},
   "optionalDependencies": {
-    "@revizly/node-av-linux-arm64": "^5.2.3-revizly1",
-    "@revizly/node-av-linux-x64": "^5.2.3-revizly1"
+    "@revizly/node-av-linux-arm64": "^5.2.3-revizly2",
+    "@revizly/node-av-linux-x64": "^5.2.3-revizly2"
   },
   "devDependencies": {
     "@stylistic/eslint-plugin": "^5.9.0",
