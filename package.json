@@ -1,6 +1,6 @@
 {
   "name": "@revizly/node-av",
-  "version": "5.2.3-revizly3",
+  "version": "5.2.3-revizly4",
   "description": "FFmpeg bindings for Node.js",
   "author": "seydx (https://github.com/seydx/node-av)",
   "type": "module",
