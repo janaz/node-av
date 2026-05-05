@@ -237,8 +237,10 @@ jobs:
             "${IMAGE}" \
             bash -c "
               set -e
-              curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
-              apt-get install -y nodejs
+              npm install -g n
+              n 22
+              export PATH=/usr/local/bin:\$PATH
+              hash -r
               npm install --ignore-scripts
               npx prebuildify --napi --strip --arch=${{ matrix.arch }} --tag-libc
               chown -R 1001:127 prebuilds node_modules build 2>/dev/null || true
