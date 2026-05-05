@@ -237,10 +237,9 @@ jobs:
             "${IMAGE}" \
             bash -c "
               set -e
-              npm install -g n
-              n 22
-              export PATH=/usr/local/bin:\$PATH
-              hash -r
+              apt-get remove -y nodejs npm 2>/dev/null || true
+              curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+              apt-get install -y nodejs
               npm install --ignore-scripts
               npx prebuildify --napi --strip --arch=${{ matrix.arch }} --tag-libc
               chown -R 1001:127 prebuilds node_modules build 2>/dev/null || true
