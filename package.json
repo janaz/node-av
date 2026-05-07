@@ -100,7 +100,11 @@
     "typescript-eslint": "^8.58.2",
     "updates": "^17.15.3",
     "vitepress": "^2.0.0-alpha.17",
-    "ws": "^8.20.0"
+    "ws": "^8.20.0",
+    "prebuildify": "^6.0.1"
+  },
+  "overrides": {
+    "node-abi": "3.78.0"
   },
   "bugs": {
     "url": "https://github.com/seydx/node-av/issues"
