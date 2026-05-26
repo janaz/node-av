@@ -394,3 +394,11 @@ jobs:
             --title "$TAG" \
             --notes "npm tarballs for version ${VERSION}" \
             npm-packages/*.tgz
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for tgz in npm-packages/*.tgz; do
+            npm publish "$tgz" --access public --tag latest
+          done
