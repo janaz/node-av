@@ -400,5 +400,5 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for tgz in npm-packages/*.tgz; do
-            npm publish "$tgz" --access public --tag latest
+            npm publish "./$tgz" --access public --tag latest
           done
