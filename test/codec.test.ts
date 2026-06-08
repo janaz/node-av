@@ -28,6 +28,7 @@ import {
   FF_ENCODER_H264_VIDEOTOOLBOX,
   FF_ENCODER_HEVC_NVENC,
   FF_ENCODER_HEVC_VIDEOTOOLBOX,
+  FF_ENCODER_LIBWEBP,
   FF_ENCODER_LIBX264,
   type AVHWDeviceType,
   type FFDecoderCodec,
@@ -373,16 +374,16 @@ describe('Codec', () => {
 
   describe('Codec Options (getOptions)', () => {
     it('should return private options for an encoder', () => {
-      const libx264 = Codec.findEncoderByName(FF_ENCODER_LIBX264);
-      assert.ok(libx264);
+      const libwebp = Codec.findEncoderByName(FF_ENCODER_LIBWEBP);
+      assert.ok(libwebp);
 
-      const options = libx264.getOptions();
+      const options = libwebp.getOptions();
       assert.ok(Array.isArray(options));
       assert.ok(options.length > 0);
 
-      // libx264 exposes the well-known 'preset' option
+      // libwebp exposes the well-known 'preset' option
       const preset = options.find((o) => o.name === 'preset');
-      assert.ok(preset, "libx264 should expose a 'preset' option");
+      assert.ok(preset, "libwebp should expose a 'preset' option");
     });
 
     it('should expose valid metadata for each option', () => {
