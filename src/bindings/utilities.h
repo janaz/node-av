@@ -79,6 +79,10 @@ public:
   
   // Channel layout utilities
   static Napi::Value ChannelLayoutDescribe(const Napi::CallbackInfo& info);
+  static Napi::Value ChannelLayoutDefault(const Napi::CallbackInfo& info);
+
+  // Pixel format negotiation
+  static Napi::Value FindBestPixFmtOfList(const Napi::CallbackInfo& info);
   
   // SDP utilities
   static Napi::Value SdpCreate(const Napi::CallbackInfo& info);

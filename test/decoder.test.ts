@@ -294,17 +294,17 @@ describe('Decoder', () => {
   });
 
   describe('options', () => {
-    it('should create decoder with hwaccelOutputFormat option', async () => {
+    it('should create decoder with rescale option', async () => {
       const media = await Demuxer.open(inputFile);
       const videoStream = media.video();
       assert.ok(videoStream);
 
-      // Test with hwaccelOutputFormat option (won't use HW acceleration without hardware context)
+      // Test with rescale option (replaces former hwaccelOutputFormat)
       const decoder = await Decoder.create(videoStream, {
-        hwaccelOutputFormat: AV_PIX_FMT_YUV420P,
+        rescale: { pixelFormat: AV_PIX_FMT_YUV420P },
       });
 
-      assert.ok(decoder, 'Should create decoder with hwaccelOutputFormat');
+      assert.ok(decoder, 'Should create decoder with rescale');
 
       decoder.close();
       await media.close();
@@ -361,7 +361,7 @@ describe('Decoder', () => {
       assert.ok(videoStream);
 
       const decoder = await Decoder.create(videoStream, {
-        hwaccelOutputFormat: AV_PIX_FMT_YUV420P,
+        rescale: { pixelFormat: AV_PIX_FMT_YUV420P },
         forcedFramerate: { num: 25, den: 1 },
         sarOverride: { num: 1, den: 1 },
         applyCropping: true,

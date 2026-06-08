@@ -210,8 +210,8 @@ export class FilterAPI implements Disposable {
     this.graph = graph;
     this.description = description;
     this.options = options;
-    this.inputQueue = new AsyncQueue<Frame>(FRAME_THREAD_QUEUE_SIZE);
-    this.outputQueue = new AsyncQueue<Frame>(FRAME_THREAD_QUEUE_SIZE);
+    this.inputQueue = new AsyncQueue<Frame>(FRAME_THREAD_QUEUE_SIZE, (f) => f.free());
+    this.outputQueue = new AsyncQueue<Frame>(FRAME_THREAD_QUEUE_SIZE, (f) => f.free());
   }
 
   /**
@@ -1604,9 +1604,11 @@ export class FilterAPI implements Disposable {
 
     this.isClosed = true;
 
-    // Close queues
     this.inputQueue.close();
     this.outputQueue.close();
+
+    this.inputQueue.clear();
+    this.outputQueue.clear();
 
     this.buffersrcCtx?.free();
     this.buffersinkCtx?.free();
@@ -2084,6 +2086,9 @@ export class FilterAPI implements Disposable {
       throw new Error('Failed to parse filter segment');
     }
 
+    let inputs: FilterInOut | undefined;
+    let outputs: FilterInOut | undefined;
+
     try {
       // Step 2: Create filter instances (but don't initialize yet)
       let ret = segment.createFilters();
@@ -2112,8 +2117,8 @@ export class FilterAPI implements Disposable {
       // Step 5: Initialize and link filters in the segment
       // Create empty FilterInOut objects - segment.apply() will populate them with
       // the segment's unconnected input/output pads
-      const inputs = new FilterInOut();
-      const outputs = new FilterInOut();
+      inputs = new FilterInOut();
+      outputs = new FilterInOut();
 
       // Apply the segment - this initializes and links all filters within the segment,
       // and returns the segment's unconnected pads in inputs/outputs
@@ -2144,12 +2149,11 @@ export class FilterAPI implements Disposable {
         // No segment outputs means the filter doesn't produce output
         throw new Error('Segment has no output pads - cannot connect buffersink');
       }
-
-      // Clean up FilterInOut structures
-      inputs.free();
-      outputs.free();
     } finally {
-      // Always free the segment
+      // Always free the FilterInOut structures and the segment, including on the
+      // error paths above (link/apply failures) where they would otherwise leak.
+      inputs?.free();
+      outputs?.free();
       segment.free();
     }
   }

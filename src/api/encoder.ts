@@ -1,4 +1,6 @@
+/* eslint-disable @stylistic/indent-binary-ops */
 import {
+  AV_CHANNEL_ORDER_UNSPEC,
   AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
   AV_CODEC_CAP_PARAM_CHANGE,
   AV_CODEC_FLAG_COPY_OPAQUE,
@@ -15,6 +17,7 @@ import {
   AVMEDIA_TYPE_AUDIO,
   AVMEDIA_TYPE_VIDEO,
   EOF,
+  SWS_BILINEAR,
 } from '../constants/constants.js';
 import { CodecContext } from '../lib/codec-context.js';
 import { Codec } from '../lib/codec.js';
@@ -23,14 +26,18 @@ import { FFmpegError } from '../lib/error.js';
 import { Frame } from '../lib/frame.js';
 import { Packet } from '../lib/packet.js';
 import { Rational } from '../lib/rational.js';
-import { avRescaleQ } from '../lib/utilities.js';
+import { SoftwareResampleContext } from '../lib/software-resample-context.js';
+import { SoftwareScaleContext } from '../lib/software-scale-context.js';
+import { avChannelLayoutDefault, avGetPixFmtName, avGetSampleFmtName, avRescaleQ } from '../lib/utilities.js';
 import { AudioFrameBuffer } from './audio-frame-buffer.js';
 import { FRAME_THREAD_QUEUE_SIZE, PACKET_THREAD_QUEUE_SIZE } from './constants.js';
 import { AsyncQueue } from './utilities/async-queue.js';
+import { pickSupportedLayout, pickSupportedPixelFormat, pickSupportedRate, pickSupportedSampleFormat } from './utilities/codec-format.js';
 import { SchedulerControl } from './utilities/scheduler.js';
 import { parseBitrate } from './utils.js';
 
-import type { AVCodecFlag, AVCodecID, AVPixelFormat, AVSampleFormat, AVThreadType, EOFSignal, FFEncoderCodec } from '../constants/index.js';
+import type { AVCodecFlag, AVCodecID, AVPixelFormat, AVSampleFormat, AVThreadType, EncoderOptionsFor, EOFSignal, FFEncoderCodec } from '../constants/index.js';
+import type { ChannelLayout } from '../lib/types.js';
 import type { Decoder } from './decoder.js';
 import type { FilterComplexAPI } from './filter-complex.js';
 import type { FilterAPI } from './filter.js';
@@ -40,7 +47,7 @@ import type { SchedulableComponent } from './utilities/scheduler.js';
 /**
  * Options for encoder creation.
  */
-export interface EncoderOptions {
+export interface EncoderOptions<C = unknown> {
   /**
    * Target bitrate.
    *
@@ -130,12 +137,48 @@ export interface EncoderOptions {
   threadType?: AVThreadType;
 
   /**
+   * Automatically resample incoming audio to a format the codec supports.
+   *
+   * Audio encoders only accept specific sample rates, sample formats, and channel
+   * layouts (e.g. libmp3lame rejects 96 kHz; AAC needs planar `fltp`). When `true`,
+   * the encoder transparently converts each frame to the nearest supported
+   * sample rate / sample format / channel layout (like `ffmpeg`'s automatic
+   * `aresample`). When `false` (default), an unsupported input raises a descriptive
+   * error instead — keeping behaviour explicit and 1:1 with the codec.
+   *
+   * Has no effect on video.
+   *
+   * @default false
+   */
+  autoResample?: boolean;
+
+  /**
+   * Automatically convert incoming video to a pixel format the codec supports.
+   *
+   * Video encoders only accept specific pixel formats (e.g. libx264 wants planar
+   * YUV like `yuv420p` and rejects `rgb24`). When `true`, the encoder transparently
+   * converts each frame to the least-loss supported pixel format via swscale (like
+   * `ffmpeg`'s automatic `format` filter), keeping the same resolution. When `false`
+   * (default), an unsupported input raises a descriptive error instead — keeping
+   * behaviour explicit and 1:1 with the codec.
+   *
+   * Resolution is never changed (the encoder already adopts the frame's dimensions),
+   * and hardware frames are left untouched (their format is negotiated via the
+   * hardware frames context). Has no effect on audio.
+   *
+   * @default false
+   */
+  autoFormat?: boolean;
+
+  /**
    * Additional codec-specific options.
    *
-   * Key-value pairs of FFmpeg AVCodecContext options.
-   * These are passed directly to the encoder.
+   * Key-value pairs of FFmpeg private codec options, passed directly to the encoder.
+   * When the codec is created from a branded constant (e.g. `FF_ENCODER_LIBX264`),
+   * these are strongly typed to that codec's known options (autocomplete + validation);
+   * otherwise any string/number/boolean values are accepted.
    */
-  options?: Record<string, string | number | boolean | undefined | null>;
+  options?: EncoderOptionsFor<C>;
 
   /**
    * AbortSignal for cancellation.
@@ -213,6 +256,16 @@ export class Encoder implements Disposable {
   private opts?: Dictionary | null;
   private options: EncoderOptions;
   private audioFrameBuffer?: AudioFrameBuffer;
+  private autoResample: boolean;
+  private audioResampler?: SoftwareResampleContext;
+  private resampledFrame?: Frame;
+  private audioInputLayout?: ChannelLayout;
+  private autoFormat: boolean;
+  private videoScaler?: SoftwareScaleContext;
+  private scaledFrame?: Frame;
+  private videoTargetFormat?: AVPixelFormat;
+  private supportsParamChange?: boolean;
+  private encoderChannels?: number;
 
   // Worker pattern for push-based processing
   private inputQueue: AsyncQueue<Frame>;
@@ -237,11 +290,13 @@ export class Encoder implements Disposable {
     this.codec = codec;
     this.options = options;
     this.opts = opts;
+    this.autoResample = options.autoResample ?? false;
+    this.autoFormat = options.autoFormat ?? false;
 
     this.packet = new Packet();
     this.packet.alloc();
-    this.inputQueue = new AsyncQueue<Frame>(FRAME_THREAD_QUEUE_SIZE);
-    this.outputQueue = new AsyncQueue<Packet>(PACKET_THREAD_QUEUE_SIZE);
+    this.inputQueue = new AsyncQueue<Frame>(FRAME_THREAD_QUEUE_SIZE, (f) => f.free());
+    this.outputQueue = new AsyncQueue<Packet>(PACKET_THREAD_QUEUE_SIZE, (p) => p.free());
   }
 
   /**
@@ -298,7 +353,7 @@ export class Encoder implements Disposable {
    * @see {@link EncoderOptions} For configuration options
    * @see {@link createSync} For synchronous version
    */
-  static async create(encoderCodec: FFEncoderCodec | AVCodecID | Codec, options: EncoderOptions = {}): Promise<Encoder> {
+  static async create<const C extends FFEncoderCodec | AVCodecID | Codec>(encoderCodec: C, options: EncoderOptions<C> = {}): Promise<Encoder> {
     let codec: Codec | null = null;
 
     if (encoderCodec instanceof Codec) {
@@ -357,9 +412,12 @@ export class Encoder implements Disposable {
       codecContext.threadType = options.threadType;
     }
 
-    const opts = options.options ? Dictionary.fromObject(options.options) : undefined;
+    // Loose view for internal use: the public signature narrows `options` to the
+    // codec, but internally codec options are handled as a generic dictionary.
+    const looseOptions = options as EncoderOptions;
+    const opts = looseOptions.options ? Dictionary.fromObject(looseOptions.options) : undefined;
 
-    const encoder = new Encoder(codecContext, codec, options, opts);
+    const encoder = new Encoder(codecContext, codec, looseOptions, opts);
 
     if (options.signal) {
       options.signal.throwIfAborted();
@@ -426,7 +484,7 @@ export class Encoder implements Disposable {
    * @see {@link EncoderOptions} For configuration options
    * @see {@link create} For async version
    */
-  static createSync(encoderCodec: FFEncoderCodec | AVCodecID | Codec, options: EncoderOptions = {}): Encoder {
+  static createSync<const C extends FFEncoderCodec | AVCodecID | Codec>(encoderCodec: C, options: EncoderOptions<C> = {}): Encoder {
     let codec: Codec | null = null;
 
     if (encoderCodec instanceof Codec) {
@@ -485,9 +543,12 @@ export class Encoder implements Disposable {
       codecContext.threadType = options.threadType;
     }
 
-    const opts = options.options ? Dictionary.fromObject(options.options) : undefined;
+    // Loose view for internal use: the public signature narrows `options` to the
+    // codec, but internally codec options are handled as a generic dictionary.
+    const looseOptions = options as EncoderOptions;
+    const opts = looseOptions.options ? Dictionary.fromObject(looseOptions.options) : undefined;
 
-    const encoder = new Encoder(codecContext, codec, options, opts);
+    const encoder = new Encoder(codecContext, codec, looseOptions, opts);
 
     if (options.signal) {
       options.signal.throwIfAborted();
@@ -495,6 +556,96 @@ export class Encoder implements Disposable {
     }
 
     return encoder;
+  }
+
+  /**
+   * Encode a single frame into a self-contained image buffer.
+   *
+   * One-shot, stateless helper for intra-only image codecs (MJPEG, PNG, WebP, ...).
+   * Creates a fresh encoder, encodes the frame, flushes and frees everything in one call.
+   * The encoder adopts dimensions, pixel format and hardware context from the frame,
+   * so any frame size works without reconfiguration.
+   *
+   * @param encoderCodec - Encoder codec (name, ID, branded constant, or Codec)
+   *
+   * @param frame - Frame to encode
+   *
+   * @param options - Optional encoder configuration (e.g. `{ options: { q: 3 } }` for MJPEG quality)
+   *
+   * @returns Encoded image bytes
+   *
+   * @throws {FFmpegError} If the encoder is not found or encoding fails
+   *
+   * @throws {Error} If the encoder produced no output
+   *
+   * @example
+   * ```typescript
+   * const jpeg = await Encoder.encodeOne(FF_ENCODER_MJPEG, frame, { options: { q: 3 } });
+   * ```
+   *
+   * @see {@link EncoderPool} For reusing encoders across recurring resolutions
+   */
+  static async encodeOne<const C extends FFEncoderCodec | AVCodecID | Codec>(encoderCodec: C, frame: Frame, options: EncoderOptions<C> = {}): Promise<Buffer> {
+    using encoder = await Encoder.create(encoderCodec, options);
+
+    const packets = [...(await encoder.encodeAll(frame)), ...(await encoder.encodeAll(null))];
+    try {
+      const data = packets[0]?.data;
+      if (!data) {
+        throw new Error(`Encoder '${encoder.getCodec().name}' produced no output for frame`);
+      }
+      return data;
+    } finally {
+      for (const packet of packets) {
+        packet.free();
+      }
+    }
+  }
+
+  /**
+   * Encode a single frame into a self-contained image buffer synchronously.
+   * Synchronous version of encodeOne.
+   *
+   * One-shot, stateless helper for intra-only image codecs (MJPEG, PNG, WebP, ...).
+   * Creates a fresh encoder, encodes the frame, flushes and frees everything in one call.
+   * The encoder adopts dimensions, pixel format and hardware context from the frame,
+   * so any frame size works without reconfiguration.
+   *
+   * @param encoderCodec - Encoder codec (name, ID, branded constant, or Codec)
+   *
+   * @param frame - Frame to encode
+   *
+   * @param options - Optional encoder configuration (e.g. `{ options: { q: 3 } }` for MJPEG quality)
+   *
+   * @returns Encoded image bytes
+   *
+   * @throws {FFmpegError} If the encoder is not found or encoding fails
+   *
+   * @throws {Error} If the encoder produced no output
+   *
+   * @example
+   * ```typescript
+   * const jpeg = Encoder.encodeOneSync(FF_ENCODER_MJPEG, frame, { options: { q: 3 } });
+   * ```
+   *
+   * @see {@link encodeOne} For async version
+   * @see {@link EncoderPool} For reusing encoders across recurring resolutions
+   */
+  static encodeOneSync<const C extends FFEncoderCodec | AVCodecID | Codec>(encoderCodec: C, frame: Frame, options: EncoderOptions<C> = {}): Buffer {
+    using encoder = Encoder.createSync(encoderCodec, options);
+
+    const packets = [...encoder.encodeAllSync(frame), ...encoder.encodeAllSync(null)];
+    try {
+      const data = packets[0]?.data;
+      if (!data) {
+        throw new Error(`Encoder '${encoder.getCodec().name}' produced no output for frame`);
+      }
+      return data;
+    } finally {
+      for (const packet of packets) {
+        packet.free();
+      }
+    }
   }
 
   /**
@@ -748,8 +899,17 @@ export class Encoder implements Disposable {
     this.initializePromise ??= this.initialize(frame);
     await this.initializePromise;
 
+    // Give an unspecified-layout frame the concrete native layout the codec was
+    // opened with (and the resampler configured for), so both accept it.
+    if (this.audioInputLayout) {
+      frame.channelLayout = this.audioInputLayout;
+    }
+
+    // Convert to the codec's format first (audio resample / video pixfmt).
+    const input = this.audioResampler ? this.resampleAudio(frame) : this.videoScaler ? this.scaleVideo(frame) : frame;
+
     // Prepare frame for encoding (set quality, validate channel count)
-    this.prepareFrameForEncoding(frame);
+    this.prepareFrameForEncoding(input);
 
     const encode = async (newFrame: Frame) => {
       const sendRet = await this.codecContext.sendFrame(newFrame);
@@ -761,9 +921,9 @@ export class Encoder implements Disposable {
 
     if (this.audioFrameBuffer) {
       // Push frame into buffer - actual sending happens in receive()
-      await this.audioFrameBuffer.push(frame);
+      await this.audioFrameBuffer.push(input);
     } else {
-      await encode(frame);
+      await encode(input);
     }
   }
 
@@ -821,8 +981,17 @@ export class Encoder implements Disposable {
       this.initializeSync(frame);
     }
 
+    // Give an unspecified-layout frame the concrete native layout the codec was
+    // opened with (and the resampler configured for), so both accept it.
+    if (this.audioInputLayout) {
+      frame.channelLayout = this.audioInputLayout;
+    }
+
+    // Convert to the codec's format first (audio resample / video pixfmt).
+    const input = this.audioResampler ? this.resampleAudio(frame) : this.videoScaler ? this.scaleVideo(frame) : frame;
+
     // Prepare frame for encoding (set quality, validate channel count)
-    this.prepareFrameForEncoding(frame);
+    this.prepareFrameForEncoding(input);
 
     const encode = (newFrame: Frame) => {
       const sendRet = this.codecContext.sendFrameSync(newFrame);
@@ -834,9 +1003,9 @@ export class Encoder implements Disposable {
 
     if (this.audioFrameBuffer) {
       // Push frame into buffer - actual sending happens in receiveSync()
-      this.audioFrameBuffer.pushSync(frame);
+      this.audioFrameBuffer.pushSync(input);
     } else {
-      encode(frame);
+      encode(input);
     }
   }
 
@@ -1199,6 +1368,16 @@ export class Encoder implements Disposable {
       return;
     }
 
+    // Drain samples buffered inside the resampler into the FIFO/encoder first.
+    const drained = this.drainResampler();
+    if (drained) {
+      if (this.audioFrameBuffer) {
+        await this.audioFrameBuffer.push(drained);
+      } else {
+        await this.codecContext.sendFrame(drained);
+      }
+    }
+
     // If using AudioFrameBuffer, flush remaining buffered samples first
     if (this.audioFrameBuffer && this.audioFrameBuffer.size > 0) {
       // Pull any remaining partial frame (may be less than frameSize)
@@ -1250,6 +1429,16 @@ export class Encoder implements Disposable {
   flushSync(): void {
     if (this.isClosed || !this.initialized) {
       return;
+    }
+
+    // Drain samples buffered inside the resampler into the FIFO/encoder first.
+    const drained = this.drainResampler();
+    if (drained) {
+      if (this.audioFrameBuffer) {
+        this.audioFrameBuffer.pushSync(drained);
+      } else {
+        this.codecContext.sendFrameSync(drained);
+      }
     }
 
     // If using AudioFrameBuffer, flush remaining buffered samples first
@@ -1599,11 +1788,27 @@ export class Encoder implements Disposable {
 
     this.isClosed = true;
 
-    // Close queues
     this.inputQueue.close();
     this.outputQueue.close();
 
+    this.inputQueue.clear();
+    this.outputQueue.clear();
+
     this.packet.free();
+
+    this.audioFrameBuffer?.[Symbol.dispose]();
+    this.audioFrameBuffer = undefined;
+
+    this.audioResampler?.[Symbol.dispose]();
+    this.audioResampler = undefined;
+    this.resampledFrame?.free();
+    this.resampledFrame = undefined;
+
+    this.videoScaler?.[Symbol.dispose]();
+    this.videoScaler = undefined;
+    this.scaledFrame?.free();
+    this.scaledFrame = undefined;
+
     this.codecContext.freeContext();
 
     this.initialized = false;
@@ -1799,7 +2004,8 @@ export class Encoder implements Disposable {
       }
       this.codecContext.width = frame.width;
       this.codecContext.height = frame.height;
-      this.codecContext.pixelFormat = frame.format as AVPixelFormat;
+      // Pick a codec-supported pixel format (converting on demand when autoFormat).
+      this.setupVideoFormat(frame);
       this.codecContext.sampleAspectRatio = frame.sampleAspectRatio;
       this.codecContext.colorRange = frame.colorRange;
       this.codecContext.colorPrimaries = frame.colorPrimaries;
@@ -1811,13 +2017,8 @@ export class Encoder implements Disposable {
         this.codecContext.chromaLocation = frame.chromaLocation;
       }
     } else {
-      // Audio: Always use frame timebase (which is typically 1/sample_rate)
-      // This ensures correct PTS progression for audio frames
-      this.codecContext.timeBase = frame.timeBase;
-
-      this.codecContext.sampleRate = frame.sampleRate;
-      this.codecContext.sampleFormat = frame.format as AVSampleFormat;
-      this.codecContext.channelLayout = frame.channelLayout;
+      // Audio: pick codec-supported sample rate/format/layout (resampling on demand).
+      this.setupAudioParams(frame);
     }
 
     // Setup hardware acceleration with validation
@@ -1908,7 +2109,8 @@ export class Encoder implements Disposable {
       }
       this.codecContext.width = frame.width;
       this.codecContext.height = frame.height;
-      this.codecContext.pixelFormat = frame.format as AVPixelFormat;
+      // Pick a codec-supported pixel format (converting on demand when autoFormat).
+      this.setupVideoFormat(frame);
       this.codecContext.sampleAspectRatio = frame.sampleAspectRatio;
       this.codecContext.colorRange = frame.colorRange;
       this.codecContext.colorPrimaries = frame.colorPrimaries;
@@ -1920,13 +2122,8 @@ export class Encoder implements Disposable {
         this.codecContext.chromaLocation = frame.chromaLocation;
       }
     } else {
-      // Audio: Always use frame timebase (which is typically 1/sample_rate)
-      // This ensures correct PTS progression for audio frames
-      this.codecContext.timeBase = frame.timeBase;
-
-      this.codecContext.sampleRate = frame.sampleRate;
-      this.codecContext.sampleFormat = frame.format as AVSampleFormat;
-      this.codecContext.channelLayout = frame.channelLayout;
+      // Audio: pick codec-supported sample rate/format/layout (resampling on demand).
+      this.setupAudioParams(frame);
     }
 
     // Setup hardware acceleration with validation
@@ -2037,6 +2234,222 @@ export class Encoder implements Disposable {
   }
 
   /**
+   * Configure the codec context's audio parameters from the first frame.
+   *
+   * Audio encoders only accept specific sample rates / sample formats / channel
+   * layouts. This picks codec-supported targets; if they differ from the input it
+   * either sets up a resampler (when `autoResample`) or throws a descriptive error.
+   *
+   * @param frame - First audio frame
+   *
+   * @throws {Error} If the input is unsupported and `autoResample` is disabled
+   *
+   * @throws {FFmpegError} If the resampler fails to configure
+   *
+   * @internal
+   */
+  private setupAudioParams(frame: Frame): void {
+    // Always use frame timebase (typically 1/sample_rate) for correct audio PTS.
+    this.codecContext.timeBase = frame.timeBase;
+
+    const inRate = frame.sampleRate;
+    const inFmt = frame.format as AVSampleFormat;
+
+    // Codec open and swr both need a concrete layout. PCM/raw frames often carry
+    // an unspecified layout (order UNSPEC, mask 0); normalize it to the canonical
+    // native layout and re-apply it to each incoming frame (see encode()) so it
+    // matches the opened codec context / resampler input.
+    let inLayout = frame.channelLayout;
+    if (inLayout.order === AV_CHANNEL_ORDER_UNSPEC) {
+      inLayout = avChannelLayoutDefault(inLayout.nbChannels);
+      this.audioInputLayout = inLayout;
+    }
+
+    const targetRate = pickSupportedRate(inRate, this.codec.supportedSamplerates);
+    const targetFmt = pickSupportedSampleFormat(inFmt, this.codec.sampleFormats);
+    const targetLayout = pickSupportedLayout(inLayout, this.codec.channelLayouts);
+
+    const needsResample = targetRate !== inRate || targetFmt !== inFmt || targetLayout.nbChannels !== inLayout.nbChannels;
+
+    if (needsResample && !this.autoResample) {
+      const rates = this.codec.supportedSamplerates;
+      throw new Error(
+        `Encoder '${this.codec.name}' does not support the input audio format ` +
+          `(${inRate} Hz, ${avGetSampleFmtName(inFmt) ?? inFmt}, ${inLayout.nbChannels}ch)` +
+          (rates && rates.length > 0 ? `. Supported sample rates: ${rates.join(', ')}` : '') +
+          '. Set { autoResample: true } on the encoder, or convert the input with an aresample/aformat filter first.',
+      );
+    }
+
+    this.codecContext.sampleRate = targetRate;
+    this.codecContext.sampleFormat = targetFmt;
+    this.codecContext.channelLayout = targetLayout;
+
+    if (needsResample) {
+      const swr = new SoftwareResampleContext();
+      FFmpegError.throwIfError(swr.allocSetOpts2(targetLayout, targetFmt, targetRate, inLayout, inFmt, inRate), 'Failed to configure audio resampler');
+      FFmpegError.throwIfError(swr.init(), 'Failed to initialize audio resampler');
+      this.audioResampler = swr;
+    }
+  }
+
+  /**
+   * Lazily allocate the reused resampler output frame.
+   *
+   * @returns The allocated output frame
+   *
+   * @internal
+   */
+  private getResampleFrame(): Frame {
+    if (!this.resampledFrame) {
+      this.resampledFrame = new Frame();
+      this.resampledFrame.alloc();
+    }
+    return this.resampledFrame;
+  }
+
+  /**
+   * Resample an incoming audio frame to the codec's target format.
+   *
+   * Reuses a single output frame; `swr_convert_frame` allocates/sizes its buffer.
+   * The (fixed-frame-size) audio FIFO copies the samples and re-stamps PTS, so the
+   * reused frame and its carried timing are only relevant on the non-FIFO path.
+   *
+   * @param frame - Source audio frame
+   *
+   * @returns The resampled frame (owned by the encoder, reused across calls)
+   *
+   * @internal
+   */
+  private resampleAudio(frame: Frame): Frame {
+    const out = this.getResampleFrame();
+    out.unref();
+    out.format = this.codecContext.sampleFormat;
+    out.sampleRate = this.codecContext.sampleRate;
+    out.channelLayout = this.codecContext.channelLayout;
+    FFmpegError.throwIfError(this.audioResampler!.convertFrame(out, frame), 'Failed to resample audio frame');
+    out.timeBase = frame.timeBase;
+    out.pts = frame.pts;
+    return out;
+  }
+
+  /**
+   * Drain samples buffered inside the resampler (rate-conversion delay) into the
+   * encoder path. Returns the drained frame if any, else null.
+   *
+   * @returns The drained frame (reused), or null when the resampler is empty
+   *
+   * @internal
+   */
+  private drainResampler(): Frame | null {
+    if (!this.audioResampler) {
+      return null;
+    }
+    const out = this.getResampleFrame();
+    out.unref();
+    out.format = this.codecContext.sampleFormat;
+    out.sampleRate = this.codecContext.sampleRate;
+    out.channelLayout = this.codecContext.channelLayout;
+    const ret = this.audioResampler.convertFrame(out, null);
+    if (ret < 0 || out.nbSamples <= 0) {
+      return null;
+    }
+    return out;
+  }
+
+  /**
+   * Configure the codec context's pixel format from the first video frame.
+   *
+   * Video encoders only accept specific pixel formats. This keeps the input format
+   * when the codec accepts it; otherwise it either sets up a swscale converter to
+   * the least-loss supported format (when `autoFormat`) or throws a descriptive
+   * error. Hardware frames are left untouched - their format is negotiated through
+   * the hardware frames context, not swscale.
+   *
+   * @param frame - First video frame
+   *
+   * @throws {Error} If the input is unsupported and `autoFormat` is disabled
+   *
+   * @throws {FFmpegError} If the converter fails to configure
+   *
+   * @internal
+   */
+  private setupVideoFormat(frame: Frame): void {
+    const inFmt = frame.format as AVPixelFormat;
+
+    // Hardware frames carry a hw pixfmt negotiated via hw_frames_ctx; swscale can't
+    // touch them - leave the format untouched.
+    if (frame.isHwFrame()) {
+      this.codecContext.pixelFormat = inFmt;
+      return;
+    }
+
+    const targetFmt = pickSupportedPixelFormat(inFmt, this.codec.pixelFormats);
+    const needsConversion = targetFmt !== inFmt;
+
+    if (needsConversion && !this.autoFormat) {
+      const supported = this.codec.pixelFormats!;
+      throw new Error(
+        `Encoder '${this.codec.name}' does not support the input pixel format ` +
+          `(${avGetPixFmtName(inFmt) ?? inFmt}). Supported: ${supported.map((f) => avGetPixFmtName(f) ?? f).join(', ')}` +
+          '. Set { autoFormat: true } on the encoder, or convert the input with a scale/format filter first.',
+      );
+    }
+
+    this.codecContext.pixelFormat = targetFmt;
+
+    // Set up a same-size swscale converter when the codec needs a different format.
+    if (needsConversion) {
+      this.videoTargetFormat = targetFmt;
+      const sws = new SoftwareScaleContext();
+      sws.getContext(frame.width, frame.height, inFmt, frame.width, frame.height, targetFmt, SWS_BILINEAR);
+      FFmpegError.throwIfError(sws.initContext(), 'Failed to configure pixel-format converter');
+      this.videoScaler = sws;
+    }
+  }
+
+  /**
+   * Lazily allocate the reused scaler output frame.
+   *
+   * @returns The allocated output frame
+   *
+   * @internal
+   */
+  private getScaledFrame(): Frame {
+    if (!this.scaledFrame) {
+      this.scaledFrame = new Frame();
+      this.scaledFrame.alloc();
+    }
+    return this.scaledFrame;
+  }
+
+  /**
+   * Convert an incoming video frame to the codec's target pixel format.
+   *
+   * Reuses a single output frame; `sws_scale_frame` allocates/sizes its buffer.
+   * Resolution is unchanged - only the pixel format differs. Timing is carried over
+   * explicitly so the encoder's PTS rescale stays correct.
+   *
+   * @param frame - Source video frame
+   *
+   * @returns The converted frame (owned by the encoder, reused across calls)
+   *
+   * @internal
+   */
+  private scaleVideo(frame: Frame): Frame {
+    const out = this.getScaledFrame();
+    out.unref();
+    out.format = this.videoTargetFormat!;
+    out.width = frame.width;
+    out.height = frame.height;
+    FFmpegError.throwIfError(this.videoScaler!.scaleFrameSync(out, frame), 'Failed to convert video frame format');
+    out.timeBase = frame.timeBase;
+    out.pts = frame.pts;
+    out.duration = frame.duration;
+    return out;
+  }
+
+  /**
    * Prepare frame for encoding.
    *
    * Implements FFmpeg's frame_encode() pre-encoding logic:
@@ -2067,6 +2480,8 @@ export class Encoder implements Disposable {
     // - Audio: frame.timeBase from first frame (typically 1/sample_rate)
     const encoderTimebase = this.codecContext.timeBase;
     const oldTimebase = frame.timeBase;
+    const pts = frame.pts;
+    const duration = frame.duration;
 
     // IMPORTANT: Calculate duration BEFORE converting frame timebase
     // This matches FFmpeg's video_sync_process() which calculates:
@@ -2074,19 +2489,19 @@ export class Encoder implements Disposable {
     // We need the OLD timebase to convert duration properly
     let frameDuration: bigint;
 
-    if (frame.duration && frame.duration > 0n) {
+    if (duration && duration > 0n) {
       // Convert duration from frame timebase to encoder timebase
       // This ensures encoder gets correct frame duration for timestamps
-      frameDuration = avRescaleQ(frame.duration, oldTimebase, encoderTimebase);
+      frameDuration = avRescaleQ(duration, oldTimebase, encoderTimebase);
     } else {
       // Default to 1 (constant frame rate behavior)
       // Matches FFmpeg's CFR mode: frame->duration = 1
       frameDuration = 1n;
     }
 
-    if (frame.pts !== null && frame.pts !== undefined) {
+    if (pts !== null && pts !== undefined) {
       // Convert PTS to encoder timebase
-      frame.pts = avRescaleQ(frame.pts, oldTimebase, encoderTimebase);
+      frame.pts = avRescaleQ(pts, oldTimebase, encoderTimebase);
 
       // IMPORTANT: Set frame timebase to encoder timebase
       // FFmpeg does this in adjust_frame_pts_to_encoder_tb(): frame->time_base = tb_dst
@@ -2100,23 +2515,29 @@ export class Encoder implements Disposable {
     // Since we don't have automatic filter like FFmpeg, we always set it here
     frame.duration = frameDuration;
 
-    if (this.codecContext.codecType === AVMEDIA_TYPE_VIDEO) {
+    const codecType = this.codecContext.codecType;
+    if (codecType === AVMEDIA_TYPE_VIDEO) {
       // Video: Set frame quality from encoder's global quality
       // Only set if encoder has globalQuality configured and frame doesn't already have quality set
-      if (this.codecContext.globalQuality > 0 && frame.quality <= 0) {
-        frame.quality = this.codecContext.globalQuality;
+      const globalQuality = this.codecContext.globalQuality;
+      if (globalQuality > 0 && frame.quality <= 0) {
+        frame.quality = globalQuality;
       }
-    } else if (this.codecContext.codecType === AVMEDIA_TYPE_AUDIO) {
+    } else if (codecType === AVMEDIA_TYPE_AUDIO) {
       // Audio: Validate channel count consistency
-      // If encoder doesn't support AV_CODEC_CAP_PARAM_CHANGE, channel count must remain constant
-      const supportsParamChange = this.codec.hasCapabilities(AV_CODEC_CAP_PARAM_CHANGE);
+      // If encoder doesn't support AV_CODEC_CAP_PARAM_CHANGE, channel count must remain
+      // constant. The capability and the encoder's channel count are stable after open,
+      // so resolve them once instead of per frame.
+      this.supportsParamChange ??= this.codec.hasCapabilities(AV_CODEC_CAP_PARAM_CHANGE);
 
-      if (!supportsParamChange) {
-        const encoderChannels = this.codecContext.channelLayout.nbChannels;
+      if (!this.supportsParamChange) {
+        this.encoderChannels ??= this.codecContext.channelLayout.nbChannels;
         const frameChannels = frame.channelLayout?.nbChannels ?? 0;
 
-        if (encoderChannels !== frameChannels) {
-          throw new Error(`Audio channel count changed (${encoderChannels} -> ${frameChannels}) and encoder '${this.codec.name}' does not support parameter changes`);
+        if (this.encoderChannels !== frameChannels) {
+          throw new Error(
+            `Audio channel count changed (${this.encoderChannels} -> ${frameChannels}) and encoder '${this.codec.name}' does not support parameter changes`,
+          );
         }
       }
     }

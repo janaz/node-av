@@ -7,7 +7,7 @@ import type { AVCodecCap, AVCodecID, AVHWDeviceType, AVMediaType, AVPixelFormat,
 import type { FFDecoderCodec } from '../constants/decoders.js';
 import type { FFEncoderCodec } from '../constants/encoders.js';
 import type { FFHWDeviceType } from '../constants/hardware.js';
-import type { NativeCodec, NativeWrapper } from './native-types.js';
+import type { NativeCodec, NativeCodecOption, NativeWrapper } from './native-types.js';
 import type { ChannelLayout } from './types.js';
 
 /**
@@ -122,14 +122,16 @@ export class Codec implements NativeWrapper<NativeCodec> {
    *
    * @example
    * ```typescript
+   * import { FF_DECODER_H264, FF_DECODER_H264_CUVID } from 'node-av/constants';
+   *
    * // Find specific H.264 decoder
-   * const decoder = Codec.findDecoderByName('h264_cuvid');
+   * const decoder = Codec.findDecoderByName(FF_DECODER_H264_CUVID);
    * if (decoder) {
    *   console.log('Found NVIDIA hardware decoder');
    * }
    *
    * // Find software decoder
-   * const sw = Codec.findDecoderByName('h264');
+   * const sw = Codec.findDecoderByName(FF_DECODER_H264);
    * ```
    *
    * @see {@link findDecoder} To find by codec ID
@@ -186,6 +188,8 @@ export class Codec implements NativeWrapper<NativeCodec> {
    *
    * @example
    * ```typescript
+   * import { FF_ENCODER_H264_NVENC, FF_ENCODER_LIBX264 } from 'node-av/constants';
+   *
    * // Find specific H.264 encoder
    * const x264 = Codec.findEncoderByName(FF_ENCODER_LIBX264);
    * if (x264) {
@@ -193,7 +197,7 @@ export class Codec implements NativeWrapper<NativeCodec> {
    * }
    *
    * // Find hardware encoder
-   * const nvenc = Codec.findEncoderByName('h264_nvenc');
+   * const nvenc = Codec.findEncoderByName(FF_ENCODER_H264_NVENC);
    * ```
    *
    * @see {@link findEncoder} To find by codec ID
@@ -512,7 +516,9 @@ export class Codec implements NativeWrapper<NativeCodec> {
    *
    * @example
    * ```typescript
-   * const codec = Codec.findDecoderByName('h264_cuvid');
+   * import { FF_DECODER_H264_CUVID } from 'node-av/constants';
+   *
+   * const codec = Codec.findDecoderByName(FF_DECODER_H264_CUVID);
    * if (codec?.hasHardwareAcceleration()) {
    *   console.log('Hardware acceleration available');
    * }
@@ -746,6 +752,34 @@ export class Codec implements NativeWrapper<NativeCodec> {
     deviceType: AVHWDeviceType;
   } | null {
     return this.native.getHwConfig(index);
+  }
+
+  /**
+   * Enumerate the codec's private options.
+   *
+   * Returns the codec-specific tunables exposed by the codec's private
+   * `AVClass` (e.g. libx264's `preset`, `crf`, `tune`). These are the options
+   * accepted via the `options` dictionary when creating an encoder/decoder, and
+   * are distinct from the generic `AVCodecContext` fields (bitrate, gop_size, ...).
+   *
+   * Options of type `AV_OPT_TYPE_CONST` are the named values belonging to a
+   * parent option's `unit` (i.e. enum members). Returns an empty array when the
+   * codec has no private options.
+   *
+   * Direct mapping to iterating `codec->priv_class` via av_opt_next().
+   *
+   * @returns Array of private option descriptors
+   *
+   * @example
+   * ```typescript
+   * const codec = Codec.findEncoderByName(FF_ENCODER_LIBX264);
+   * for (const opt of codec?.getOptions() ?? []) {
+   *   console.log(opt.name, opt.type, opt.unit);
+   * }
+   * ```
+   */
+  getOptions(): NativeCodecOption[] {
+    return this.native.getOptions();
   }
 
   /**

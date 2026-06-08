@@ -6,19 +6,31 @@ import {
   AV_FRAME_DATA_MASTERING_DISPLAY_METADATA,
   AV_FRAME_DATA_MOTION_VECTORS,
   AV_FRAME_DATA_STEREO3D,
+  AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
   AV_NOPTS_VALUE,
   AV_PICTURE_TYPE_I,
   AV_PICTURE_TYPE_P,
   AV_PIX_FMT_RGB24,
+  AV_PIX_FMT_VIDEOTOOLBOX,
   AV_PIX_FMT_YUV420P,
   AVCHROMA_LOC_LEFT,
   AVCOL_PRI_BT709,
   AVCOL_RANGE_JPEG,
   AVCOL_SPC_BT709,
   AVCOL_TRC_BT709,
+  AVMEDIA_TYPE_VIDEO,
+  Codec,
+  CodecContext,
+  Decoder,
+  Demuxer,
+  FormatContext,
   Frame,
+  HardwareContext,
+  Packet,
   Rational,
 } from '../src/index.js';
+
+import { getInputFile, skipInCI } from './index.js';
 
 describe('Frame', () => {
   let frame: Frame;
@@ -527,6 +539,49 @@ describe('Frame', () => {
       assert.equal(frame.isHwFrame(), false, 'Unallocated frame should not be hardware');
     });
 
+    it('should return null from exportIOSurface for a software frame', () => {
+      frame.alloc();
+      frame.format = AV_PIX_FMT_YUV420P;
+      frame.width = 640;
+      frame.height = 480;
+      frame.allocBuffer();
+
+      // Software (non-VideoToolbox) frames have no backing IOSurface.
+      // On non-macOS platforms this is also null. The positive path requires
+      // an actual hardware-decoded VideoToolbox frame.
+      assert.equal(frame.exportIOSurface(), null, 'Software frame should not expose an IOSurface');
+    });
+
+    it('should return null from exportIOSurface for an unallocated frame', () => {
+      frame.alloc();
+      assert.equal(frame.exportIOSurface(), null, 'Unallocated frame should not expose an IOSurface');
+    });
+
+    it('should export an IOSurface from a decoded VideoToolbox frame', skipInCI, async () => {
+      using hw = HardwareContext.create(AV_HWDEVICE_TYPE_VIDEOTOOLBOX);
+      if (!hw) {
+        console.log('VideoToolbox not available - skipping');
+        return;
+      }
+
+      await using input = await Demuxer.open(getInputFile('video.mp4'));
+      const videoStream = input.video();
+      assert.ok(videoStream, 'Should have video stream');
+
+      using decoder = await Decoder.create(videoStream, { hardware: hw });
+
+      let handle: Buffer | null = null;
+      for await (using decoded of decoder.frames(input.packets(videoStream.index))) {
+        if (decoded?.format === AV_PIX_FMT_VIDEOTOOLBOX) {
+          handle = decoded.exportIOSurface();
+          break;
+        }
+      }
+
+      assert.ok(handle, 'Should export an IOSurface from a VideoToolbox frame');
+      assert.equal(handle.length, 8, 'IOSurface handle should be an 8-byte pointer');
+    });
+
     it('should transfer data between frames (async)', async () => {
       const srcFrame = new Frame();
       srcFrame.alloc();
@@ -803,5 +858,143 @@ describe('Frame', () => {
       });
     });
 
+  });
+
+  describe('data cache', () => {
+    // The data/extendedData getters cache the JS plane array and drop it whenever
+    // the frame's buffers may have changed. Cache hits are observable via identity.
+    function allocVideoFrame(target: Frame): void {
+      target.alloc();
+      target.width = 64;
+      target.height = 48;
+      target.format = AV_PIX_FMT_YUV420P;
+      assert.equal(target.getBuffer(), 0, 'Should allocate frame buffer');
+    }
+
+    it('returns the same array on repeated access', () => {
+      allocVideoFrame(frame);
+      const a = frame.data;
+      assert.ok(a, 'frame has data');
+      assert.strictEqual(frame.data, a, 'repeated data access serves the cached array');
+      const ext = frame.extendedData;
+      assert.ok(ext, 'frame has extended data');
+      assert.strictEqual(frame.extendedData, ext, 'repeated extendedData access serves the cached array');
+    });
+
+    it('writes through the cached planes are visible on re-access', () => {
+      allocVideoFrame(frame);
+      const a = frame.data;
+      assert.ok(a?.[0]);
+      a[0][0] = 42;
+      const b = frame.data;
+      assert.ok(b?.[0]);
+      assert.equal(b[0][0], 42, 'cached buffers view the same native memory');
+    });
+
+    it('invalidates when the buffers change (unref + getBuffer)', () => {
+      allocVideoFrame(frame);
+      const a = frame.data;
+      assert.ok(a);
+      frame.unref();
+      assert.equal(frame.data, null, 'no data after unref');
+      frame.width = 64;
+      frame.height = 48;
+      frame.format = AV_PIX_FMT_YUV420P;
+      assert.equal(frame.getBuffer(), 0);
+      const b = frame.data;
+      assert.ok(b);
+      assert.notStrictEqual(b, a, 'new buffers produce a new plane array');
+    });
+
+    it('invalidates when ref() re-points the planes', () => {
+      allocVideoFrame(frame);
+      const a = frame.data;
+      assert.ok(a);
+
+      using other = new Frame();
+      allocVideoFrame(other);
+
+      frame.unref();
+      assert.equal(frame.ref(other), 0, 'Should ref the other frame');
+      const b = frame.data;
+      assert.ok(b);
+      assert.notStrictEqual(b, a, 'ref() drops the cached planes');
+    });
+
+    it('invalidates on applyCropping and fromBuffer', () => {
+      allocVideoFrame(frame);
+      const a = frame.data;
+      assert.ok(a);
+      // av_frame_apply_cropping can shift the data pointers without changing buf[],
+      // so the cache must be dropped even for a zero crop.
+      assert.equal(frame.applyCropping(1), 0);
+      const b = frame.data;
+      assert.notStrictEqual(b, a, 'applyCropping drops the cached planes');
+
+      using rgb = new Frame();
+      rgb.alloc();
+      rgb.width = 64;
+      rgb.height = 48;
+      rgb.format = AV_PIX_FMT_RGB24;
+      assert.equal(rgb.getBuffer(), 0);
+      const c = rgb.data;
+      assert.ok(c);
+      const raw = Buffer.alloc(64 * 48 * 3, 7);
+      assert.ok(rgb.fromBuffer(raw) >= 0, 'fromBuffer succeeds');
+      const d = rgb.data;
+      assert.notStrictEqual(d, c, 'fromBuffer re-points the planes and drops the cache');
+    });
+
+    it('hands out fresh planes after each native fill (receiveFrame)', async () => {
+      // Critical invalidation path: avcodec_receive_frame refills the SAME reused
+      // frame object - the cache must never hand out the previous frame's views.
+      await using fmt = new FormatContext();
+      await fmt.openInput(getInputFile('demux.mp4'), null, null);
+      await fmt.findStreamInfo(null);
+      const vIdx = fmt.findBestStream(AVMEDIA_TYPE_VIDEO, -1, -1);
+      assert.ok(vIdx >= 0, 'found a video stream');
+      const stream = fmt.streams[vIdx];
+      const dec = Codec.findDecoder(stream.codecpar.codecId);
+      assert.ok(dec, 'found a decoder');
+
+      using codecContext = new CodecContext();
+      codecContext.allocContext3(dec);
+      codecContext.parametersToContext(stream.codecpar);
+      await codecContext.open2(dec, null);
+
+      using packet = new Packet();
+      packet.alloc();
+      using decoded = new Frame();
+      decoded.alloc();
+
+      let prev: Buffer[] | null = null;
+      let frames = 0;
+      for (let i = 0; i < 200 && frames < 2; i++) {
+        if ((await fmt.readFrame(packet)) < 0) break;
+        if (packet.streamIndex !== vIdx) {
+          packet.unref();
+          continue;
+        }
+        if ((await codecContext.sendPacket(packet)) < 0) {
+          packet.unref();
+          continue;
+        }
+        packet.unref();
+
+        while (frames < 2) {
+          const ret = await codecContext.receiveFrame(decoded);
+          if (ret < 0) break;
+          const data = decoded.data;
+          assert.ok(data, 'decoded frame has data');
+          assert.strictEqual(decoded.data, data, 'repeated access within one frame is cached');
+          if (prev) {
+            assert.notStrictEqual(data, prev, 'each native fill drops the previous cache');
+          }
+          prev = data;
+          frames++;
+        }
+      }
+      assert.equal(frames, 2, 'decoded two frames');
+    });
   });
 });

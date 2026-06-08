@@ -4,6 +4,266 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [6.0.0] - 2026-06-04
+
+### Breaking Changes
+
+#### WebRTC / RTP moved to the `node-av/webrtc` subpath
+
+`WebRTCStream`, `RTPStream`, and the re-exported werift primitives (`RTCPeerConnection`, `MediaStreamTrack`, `RtpPacket`, `RTCSessionDescription`, `RTCIceCandidate`, `RTCRtpCodecParameters`, `PeerConfig`) are no longer exported from the main package. They now live under the dedicated `node-av/webrtc` entry point. This removes the werift dependency chain from the core import graph.
+
+`werift` is now an **optional dependency** — only required when using `node-av/webrtc`.
+
+**Migration:**
+```typescript
+// Before
+import { WebRTCStream, RTPStream, RTCPeerConnection } from 'node-av';
+
+// After
+import { WebRTCStream, RTPStream, RTCPeerConnection } from 'node-av/webrtc';
+```
+
+#### `FilterPreset` thin wrappers replaced by the generic `filter()`
+
+The hand-written single-filter convenience methods on `FilterPreset` (e.g. `fps`, `rotate`, `fade`, `volume`, `drawtext`, `trim`, `concat`, `highpass`, `aresample`, …) were removed in favor of the type-safe generic `filter(name, options)`, which covers **every** FFmpeg filter with autocomplete and validation. The hardware-aware / auto-mapping methods (`scale`, `crop`, `overlay`, `tonemap`, `deinterlace`, `format`, `aformat`, `whisper`, …) and `custom()` remain.
+
+**Migration:**
+```typescript
+// Before
+FilterPreset.chain().fps(30).drawtext('hi', { x: 10 }).build();
+
+// After
+FilterPreset.chain()
+  .filter('fps', { fps: 30 })
+  .filter('drawtext', { text: 'hi', x: 10 })
+  .build();
+```
+
+#### `Decoder` `hwaccelOutputFormat` replaced by `rescale`
+
+The `hwaccelOutputFormat` decoder option was removed in favor of the new `rescale` option (see Added), which both downloads hardware frames to system memory **and** guarantees the final pixel format/size in one step. Unlike `hwaccelOutputFormat` (whose value had to be a format the hardware could transfer to directly — typically `nv12`), `rescale: { pixelFormat }` accepts any pixel format and converts on the CPU after the download, so it actually delivers the format you ask for across both hardware- and software-decoded streams.
+
+**Migration:**
+```typescript
+// Before
+const decoder = await Decoder.create(stream, { hardware: hw, hwaccelOutputFormat: AV_PIX_FMT_YUV420P });
+
+// After
+const decoder = await Decoder.create(stream, { hardware: hw, rescale: { pixelFormat: AV_PIX_FMT_YUV420P } });
+```
+
+### Added
+
+#### `Encoder` audio auto-resampling (`autoResample`)
+
+New `autoResample` option (default `false`) on `Encoder.create()`/`createSync()`. When enabled, the encoder transparently converts incoming audio to the nearest codec-supported sample rate, sample format, and channel layout — e.g. a 96 kHz microphone feeding libmp3lame (which only supports up to 48 kHz), or packed `s16` feeding AAC (which needs planar `fltp`). When disabled, an unsupported input now raises a descriptive error naming the mismatch.
+
+#### `Encoder` video auto pixel-format conversion (`autoFormat`)
+
+New `autoFormat` option (default `false`) on `Encoder.create()`/`createSync()` — the video counterpart of `autoResample`. When enabled, the encoder transparently converts incoming video to a codec-supported pixel format via swscale — e.g. `rgb24` or `yuv444p` feeding libx264. The target is chosen with `avcodec_find_best_pix_fmt_of_list`, so it keeps as much of the source as possible (an RGB input picks `yuv444p` over `yuv420p`) instead of always falling back to the codec's first format. Resolution is never changed (the encoder already adopts the frame's dimensions) and hardware frames are left untouched (their format is negotiated through the hardware frames context). When disabled, an unsupported input now raises a descriptive error naming the mismatch. Also adds the `avcodecFindBestPixFmtOfList()` utility.
+
+#### `Decoder` audio output resampling (`resample`)
+
+New `resample` option on `Decoder.create()`/`createSync()` — the audio mirror of the encoder's `autoResample` and of `rescale` for video. When set, decoded audio frames are transparently converted to the requested `{ sampleRate, sampleFormat, channelLayout }` (any omitted field keeps the decoded value, and conversion is skipped when the source already matches). Unspecified PCM channel layouts are normalized to their canonical native layout automatically. Useful when a capture device delivers a rate you cannot control (e.g. avfoundation ignoring a microphone sample-rate request) and every downstream stage should still receive the rate you asked for. Also adds the `avChannelLayoutDefault()` utility.
+
+#### `Decoder` video output rescaling (`rescale`)
+
+New `rescale` option on `Decoder.create()`/`createSync()` — the video mirror of `resample`. When set, decoded video frames are transparently converted to the requested `{ width, height, pixelFormat }` (any omitted field keeps the decoded value, and conversion is skipped when the source already matches). Hardware frames are automatically transferred to a supported software format first and then converted, so a single option normalizes both hardware- and software-decoded streams; software frames are converted directly. Hardware frames are left on the GPU (zero-copy) when `rescale` is not set. This **replaces** the former `hwaccelOutputFormat` (see Breaking Changes) — `rescale: { pixelFormat }` both downloads hardware frames and guarantees the format. Useful to normalize a heterogeneous set of sources (e.g. RTSP cameras each delivering a different pixel format) so every downstream stage receives a uniform format/size.
+
+#### `Scaler` — hardware-aware image scale / crop / convert / encode
+
+High-level `Scaler` (from `node-av/api`) that scales, crops, and converts decoded frames to raw pixel buffers or JPEG/PNG. Pools its contexts, GPU graphs, and encoders for the detection/thumbnail/snapshot workload; hardware frames are processed on the GPU.
+
+#### `EncoderPool` — pooled image encoders
+
+`EncoderPool` (from `node-av/api`) reuses image encoders across recurring resolutions. Adds `Encoder.encodeOne()` / `encodeOneSync()` for one-shot single-frame encodes.
+
+#### `Frame.exportIOSurface()` — zero-copy IOSurface export (macOS)
+
+Exports the `IOSurfaceRef` backing a decoded VideoToolbox frame as an 8-byte pointer `Buffer` — the inverse of `Frame.fromIOSurface()`. Enables zero-copy interop with Metal / CoreVideo (e.g. feeding hardware-decoded frames into a GPU compositor) without a GPU → CPU readback.
+
+```typescript
+const handle = frame.exportIOSurface();
+if (handle) {
+  // Pass to a Metal-based compositor; keep `frame` alive while using the handle.
+}
+```
+
+Returns `null` for non-VideoToolbox frames and on non-macOS platforms. The IOSurface stays owned by the frame's `CVPixelBuffer`, so the frame must be kept alive while the handle is in use.
+
+#### Type-safe codec options
+
+`Encoder.create()` / `createSync()` and `Decoder.create()` / `createSync()` now infer the codec-specific private options from the codec constant. When you pass a branded constant (e.g. `FF_ENCODER_LIBX264`), the `options` field is strongly typed to that codec's known options — with editor autocomplete, and compile-time errors for unknown keys or invalid enum values:
+
+```typescript
+// Autocomplete + validation for libx264's private options
+await Encoder.create(FF_ENCODER_LIBX264, {
+  options: { preset: 'fast', crf: 23 },
+});
+
+await Encoder.create(FF_ENCODER_H264_VIDEOTOOLBOX, {
+  options: { coder: 'nope' }, // ✗ Type error: not assignable to 'cavlc' | 'vlc' | 'cabac' | 'ac'
+});
+```
+
+The option types are generated from FFmpeg's `AVOption` metadata, covering every codec known to FFmpeg. Each codec's bag also includes the generic `AVCodecContext` options (e.g. `strict`, `flags`, `bf`), with the codec's private options taking precedence on name clashes (`profile`, `level`). Codecs passed by `AVCodecID`, by `Codec` instance, or as a plain string still accept a loose option bag, so existing dynamic usage is unchanged. Combinable flag options (e.g. `mpv_flags`) suggest the known tokens while still accepting any combined string (`'+a+b'`).
+
+#### Type-safe container & bitstream-filter options
+
+The same generated-from-source typing now extends to containers and bitstream filters:
+
+**`Muxer.open()` / `openSync()` and `Demuxer.open()` / `openSync()`** — when `format` is given as a literal (e.g. `'mp4'`, `'mov'`), the `options` bag is typed to that (de)muxer's private options plus the generic `AVFormatContext` options, with autocomplete for keys and enum/flag values:
+
+```typescript
+await Muxer.open('out.mp4', {
+  format: 'mp4',
+  options: { movflags: '+faststart+frag_keyframe' }, // autocomplete of mov flags
+});
+```
+
+The `format` field itself autocompletes every available muxer/demuxer name (the generated `MuxerFormat` / `DemuxerFormat` unions, covering libavformat **and** libavdevice), while still accepting any string. Because container option bags also legitimately carry protocol and codec-child options (e.g. `rtsp_transport` on a demuxer), unknown keys remain accepted — typing is additive autocomplete, never a hard gate.
+
+**`BitStreamFilterAPI.create()`** — the filter name autocompletes every available bitstream filter (the generated `BsfName` union), and the `options` bag is strongly typed to the named filter's options (strict, like codecs), so `h264_metadata`'s `aud?: 'pass' | 'insert' | 'remove'` is validated at compile time. Unknown names still pass through via the `(string & {})` fallback.
+
+Formats/filters referenced dynamically (no literal name) still accept a loose option bag.
+
+#### Bitstream filters in transcode pipelines
+
+`BitStreamFilterAPI.create()` now accepts a `Stream` (copy), an `Encoder` (transcode), or another filter (chain) as its input source, and initializes lazily on the first packet. This makes coded-bitstream filters like `h264_metadata` work after a re-encode the same way the FFmpeg CLI does — the filter derives its parameters from the encoder's output once it is open, and the muxer writes the filter's output parameters to the container (so e.g. a rewritten `level` is reflected in the file):
+
+```typescript
+using bsf = BitStreamFilterAPI.create('h264_metadata', encoder, {
+  options: { aud: 'remove', level: '4.1' },
+});
+pipeline(input, decoder, filter, encoder, bsf, output);
+```
+
+#### Type-safe filters via `FilterPreset.filter()`
+
+`FilterPreset` gained a generic `filter(name, options)` that exposes **every** FFmpeg filter (≈580) with autocomplete for both the filter name and its options, generated from FFmpeg's `AVOption` metadata — including each filter's description and a link to the FFmpeg docs as JSDoc:
+
+```typescript
+FilterPreset.chain()
+  .filter('drawtext', { text: 'hello', fontsize: 24 })
+  .filter('haldclut', { clut: 'all' })   // 'bogus' → compile error
+  .build();
+```
+
+Enum options are validated (typos are compile errors), while expression options (e.g. `scale` geometry, `setpts`) accept both strings and numbers. Values are escaped for the filtergraph automatically. Filters not in the map can still be added with `custom()`.
+
+#### `Codec.getOptions()` — runtime codec option introspection
+
+New low-level method that returns a codec's private (`priv_class`) AVOptions at runtime — name, help, `AVOptionType`, unit, flags, min/max and default — mirroring `ffmpeg -h encoder=<name>`:
+
+```typescript
+const codec = Codec.findEncoderByName(FF_ENCODER_LIBX264);
+for (const opt of codec?.getOptions() ?? []) {
+  console.log(opt.name, opt.type, opt.help);
+}
+```
+
+Returns an empty array for codecs without private options.
+
+#### `probe()` — high-level media probing
+
+New high-level helper that opens a source, reads stream info, and returns a typed, structured summary - the `ffprobe -show_format -show_streams` equivalent as a plain object, without managing a `Demuxer`:
+
+```typescript
+import { probe } from 'node-av/api';
+
+const info = await probe('input.mkv');
+console.log(info.format, info.duration, info.bitrate);
+if (info.video) {
+  console.log(`${info.video.codec} ${info.video.width}x${info.video.height} @ ${info.video.frameRate}fps`);
+}
+```
+
+Returns `format`, `duration`, `bitrate`, per-stream `ProbeStream[]` (codec, type, dimensions, frame rate, sample rate, channels, language, …), plus `video`/`audio` convenience accessors. A `probeSync()` variant is also available. When `format` is a known literal, the options bag is typed to that demuxer's options.
+
+#### Typed `FFmpegError` code helpers
+
+`FFmpegError` instances gained boolean getters for the common FFmpeg/POSIX codes, so error branching no longer needs manual numeric comparison:
+
+```typescript
+const error = FFmpegError.fromCode(ret);
+if (error?.isEAGAIN) {
+  // feed more input, then retry
+} else if (error?.isEOF) {
+  // end of stream
+} else if (error?.isInvalidData) {
+  // corrupt input
+}
+```
+
+Adds `isEAGAIN`, `isEOF`, `isInvalidData`, `isEINVAL`, `isENOMEM`, `isENOENT`, `isEACCES`, `isEIO`, `isEPIPE`, `isExit`, and an instance `is(code)` for arbitrary codes.
+
+#### Type-safe `filter_complex` graph builder
+
+New `FilterComplexGraph` builder brings the type-safe `filter(name, options)` API (autocomplete + enum validation, generated from FFmpeg's `AVOption` metadata) to multi-input/output graphs. It composes labeled chains and renders the description string `FilterComplexAPI.create()` accepts (and can be passed to it directly):
+
+```typescript
+const graph = FilterComplexGraph.create()
+  .chain({ inputs: ['0:v', '1:v'], outputs: 'tmp' }, (c) => c.filter('overlay', { x: 100, y: 50 }))
+  .chain({ inputs: 'tmp', outputs: 'out' }, (c) => c.filter('hue', { s: 0 }))
+  .build();
+// "[0:v][1:v]overlay=x=100:y=50[tmp];[tmp]hue=s=0[out]"
+
+using complex = FilterComplexAPI.create(graph, { inputs: [{ label: '0:v' }, { label: '1:v' }], outputs: [{ label: 'out' }] });
+```
+
+#### Pipeline progress reporting
+
+`pipeline()` now reports progress. Pass `onProgress` (throttled via `progressInterval`) for push updates, or poll `control.progress` - mirroring FFmpeg's CLI figures (`frame= fps= time= bitrate= speed=`):
+
+```typescript
+const control = pipeline(input, decoder, encoder, output, {
+  progressInterval: 200,
+  onProgress: (p) => console.log(`frame=${p.frames} fps=${p.fps.toFixed(1)} time=${p.time.toFixed(2)}s speed=${p.speed.toFixed(2)}x`),
+});
+await control.completion;
+```
+
+`PipelineProgress` exposes `frames`, `bytes`, `time` (media seconds), `fps`, `bitrate`, `speed`, and `elapsed`. Works across simple, stream-copy, and named pipelines.
+
+### Performance
+
+#### `Frame.data` / `Frame.extendedData` / `Packet.data` are cached
+
+The `Frame` `data`/`extendedData` getters used to build a fresh array (plus one `Buffer` wrapper per plane) on **every** access, which could dominate per-sample/per-pixel loops — `frame.data[0][i]` re-paid the allocation on each iteration. The plane array is now built once and cached on the native wrapper, and dropped whenever the frame's buffers may have changed (alloc/free/ref/unref/getBuffer/makeWritable/applyCropping/fromBuffer and every native fill site such as decode/filter/scale/resample/hw-transfer). An un-hoisted per-pixel loop over ten RGB frames drops from ~20 s to ~120 ms.
+
+`Packet.data` similarly used to **memcpy the full payload on every access**; the copy is now made once and cached, dropped whenever the payload may have changed (alloc/free/ref/unref/clone/`data=`/side-data ops and native fills such as demuxing). Setting `packet.data = null` now also reconciles the external-memory report immediately (previously left stale until the next buffer operation).
+
+Observable side effect: `frame.data === frame.data` and `packet.data === packet.data` now hold between buffer changes (each access used to return a new array/buffer).
+
+#### `Frame` and `Packet` buffers now report their size to V8's garbage collector
+
+Native frame and packet buffers are reported to V8 via `napi_adjust_external_memory`, so the GC sees the real memory pressure of decoded/filtered/resampled/scaled/transferred/hardware-allocated frames and demuxed/decoded/encoded/filtered packets instead of just the tiny JS wrapper. Objects abandoned without an explicit `close()`/`using`/`free()` are now reclaimed far sooner — in a decode-and-drop loop the steady-state RSS dropped from ~2.7 GB to ~0.6 GB. Explicit disposal remains the deterministic path; this only lowers the watermark when you rely on the GC.
+
+### Changed
+
+- Synced FFmpeg with the latest master (~700 upstream commits) — numerous bug fixes, stability and performance improvements. Highlights relevant to node-av users:
+  - **Animated WebP** — new demuxer and decoding support
+  - **ProRes RAW** — VideoToolbox (Apple) and Vulkan hardware decoding
+  - **APV** (Samsung Advanced Professional Video) — hardware decoding and `liboapv` encoder
+  - **HE-AAC (DAB+)** — decoding of 960-frame streams
+  - **FFV1 on Vulkan** — GPU encoding/decoding, including 32-bit float video
+  - New filters: `transpose_cuda` (CUDA transpose), `frc_amf` (AMD frame rate converter)
+  - Faster VVC/H.266 and HEVC decoding (AArch64 NEON, x86 SSSE3)
+- Regenerated constants, encoders, and decoders from updated FFmpeg headers
+
+### Fixed
+
+- **`Muxer` `startTime` produced a broken edit list when a stream's timestamps did not actually carry the offset.** Forwarding a live device's `startTime` (a large boot-relative clock value, e.g. ~500000 s from avfoundation) subtracted it from streams that were already zero-based — audio encoders re-stamp their output to a 0 baseline — pushing timestamps hugely negative and overflowing the MP4 edit list (`elst`) media time. Lenient players (ffprobe, VLC) ignored it, but strict ones (QuickTime) honored the garbage edit list and showed a 0:00 duration / refused to play. The offset is now decided per stream on its first packet and clamped to what the stream carries (`min(startTime, max(0, firstPts))`): boot-relative streams still normalize to zero, already-zero-based streams are left untouched.
+- **`Encoder` failed to open on audio frames with an unspecified channel layout (e.g. raw PCM / WAV).** Such frames carry `order = AV_CHANNEL_ORDER_UNSPEC` with no mask, which `avcodec_open2()` rejects with "Invalid argument", so encoding decoded PCM to AAC/Opus/etc. errored out. The encoder now normalizes an unspecified input layout to its canonical native layout (and applies it to each frame so the codec and resampler accept it).
+- **`Packet.data` setter leaked the previous buffer and side data when a packet was reused.** Assigning `packet.data = buffer` called `av_new_packet()` without first releasing the packet's existing payload, so reusing one packet across a decode/encode loop (the common pattern) leaked the prior buffer and any side data every iteration. The setter now unreferences the packet before allocating, so re-assigning `data` cleanly replaces it. Reported via [mediabunny#392](https://github.com/Vanilagy/mediabunny/issues/392).
+- **`CodecParameters.addCodedSideData()` corrupted memory by handing FFmpeg a JS-owned buffer.** It passed the `Buffer`'s pointer directly to `av_packet_side_data_add()`, which takes ownership of the pointer (it does not copy) and later `av_free()`s it — freeing non-FFmpeg memory and leaving a dangling read after GC. It now copies the data into FFmpeg-allocated memory first, like `Packet.addSideData()`.
+- **`Frame.importDmaBuf()` (Linux) and `Frame.importD3D11Texture()` (Windows) leaked the previous backing on frame reuse.** Importing into a frame that already held an imported descriptor/texture overwrote `buf[0]` without releasing it, leaking the prior DMA-BUF descriptor or D3D11 texture reference. Both now unreference the existing `buf[0]` before re-importing.
+- **`Encoder.close()` did not release its audio frame buffer.** Fixed-frame-size audio encoders (AAC, Opus, MP3, …) allocate an internal `AudioFrameBuffer` (a native `Frame` + `AudioFifo`) that `close()` never disposed, leaking it on every such encoder. It is now disposed in `close()`.
+- **`FilterAPI` / `FilterComplexAPI` leaked `FilterInOut` structures when graph construction failed.** The `inputs`/`outputs` were freed only on the success path, so a link/apply error left them allocated. They are now freed in `finally`.
+- **`Muxer` leaked a dictionary when copying container metadata.** The temporary `Dictionary` built for the format context (which copies it via `av_dict_copy`) was never freed; it now is.
+- **High-level pipeline components dropped buffered frames/packets on abort.** `Decoder`, `Encoder`, `FilterAPI`, and `BitStreamFilterAPI` close their internal queues on teardown; any frame/packet still buffered (e.g. a pipeline aborted before draining) was dropped without being freed, pinning hardware/GPU memory until GC. `close()` now frees buffered items deterministically.
+- **`SharedTexture.mapTo()` used a hardware wrapper as the mapping software format.** The mapping `HardwareFramesContext` was configured with `sw_format = srcFrame.format`, which for an imported GPU frame is a hardware format (`AV_PIX_FMT_DRM_PRIME` on Linux DMA-BUF, `AV_PIX_FMT_D3D11` on Windows, `AV_PIX_FMT_VIDEOTOOLBOX` on macOS) — never a valid software layout, so `av_hwframe_ctx_init()` rejected it (e.g. "Unsupported format: drm_prime" mapping DMA-BUF → VAAPI). It now uses the source frame's own hwframe context software format when present (macOS IOSurface imports), and otherwise the software layout used at import time, which also fixes a stale-format case when `importHandle()` was called with a per-call `pixelFormat`. Thanks to @alyssaxuu ([#243](https://github.com/seydx/node-av/pull/243)).
+
 ## [5.2.3] - 2026-04-14
 
 ### Changed

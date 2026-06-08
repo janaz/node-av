@@ -6,7 +6,9 @@ import {
   AV_CODEC_ID_H264,
   AV_CODEC_ID_HEVC,
   AV_CODEC_ID_PNG,
+  AV_CODEC_ID_RAWVIDEO,
   AV_CODEC_ID_VP9,
+  AV_CODEC_ID_WEBP,
   AV_HWDEVICE_TYPE_CUDA,
   AV_HWDEVICE_TYPE_D3D11VA,
   AV_HWDEVICE_TYPE_DXVA2,
@@ -366,6 +368,49 @@ describe('Codec', () => {
       assert.ok(listH264);
       assert.ok(iterH264);
       assert.equal(listH264.id, iterH264.id);
+    });
+  });
+
+  describe('Codec Options (getOptions)', () => {
+    it('should return private options for an encoder', () => {
+      const libx264 = Codec.findEncoderByName(FF_ENCODER_LIBX264);
+      assert.ok(libx264);
+
+      const options = libx264.getOptions();
+      assert.ok(Array.isArray(options));
+      assert.ok(options.length > 0);
+
+      // libx264 exposes the well-known 'preset' option
+      const preset = options.find((o) => o.name === 'preset');
+      assert.ok(preset, "libx264 should expose a 'preset' option");
+    });
+
+    it('should expose valid metadata for each option', () => {
+      const webp = Codec.findEncoder(AV_CODEC_ID_WEBP);
+      assert.ok(webp);
+
+      const options = webp.getOptions();
+      assert.ok(options.length > 0);
+
+      for (const opt of options) {
+        assert.equal(typeof opt.name, 'string');
+        assert.ok(opt.name.length > 0);
+        assert.equal(typeof opt.type, 'number'); // AVOptionType
+        assert.equal(typeof opt.flags, 'number');
+        assert.equal(typeof opt.min, 'number');
+        assert.equal(typeof opt.max, 'number');
+        assert.ok(opt.help === null || typeof opt.help === 'string');
+        assert.ok(opt.unit === null || typeof opt.unit === 'string');
+      }
+    });
+
+    it('should return an empty array for codecs without private options', () => {
+      const rawvideo = Codec.findEncoder(AV_CODEC_ID_RAWVIDEO);
+      assert.ok(rawvideo);
+
+      const options = rawvideo.getOptions();
+      assert.ok(Array.isArray(options));
+      assert.equal(options.length, 0);
     });
   });
 

@@ -13,6 +13,9 @@ export { Decoder, type DecoderOptions } from './decoder.js';
 // Encoder
 export { Encoder, type EncoderOptions } from './encoder.js';
 
+// EncoderPool
+export { EncoderPool, type EncoderPoolOptions } from './encoder-pool.js';
+
 // AudioFrameBuffer
 export { AudioFrameBuffer } from './audio-frame-buffer.js';
 
@@ -23,15 +26,39 @@ export { HardwareContext, type BaseCodecName, type HardwareOptions } from './har
 export { DeviceAPI, type CameraOptions, type DeviceOptions, type MicrophoneOptions, type ScreenCaptureOptions } from './device.js';
 
 // Filter
-export { FilterComplexAPI, type FilterComplexInput, type FilterComplexOutput } from './filter-complex.js';
-export { FilterPreset, type FilterSupport } from './filter-presets.js';
+export { FilterComplexAPI, type FilterComplexInput, type FilterComplexOptions, type FilterComplexOutput } from './filter-complex.js';
+export { FilterComplexGraph, FilterPreset, type FilterComplexLabels, type FilterSupport } from './filter-presets.js';
 export { FilterAPI, type FilterOptions } from './filter.js';
 
 // BitStreamFilter
 export { BitStreamFilterAPI, type BitstreamFilterOptions } from './bitstream-filter.js';
 
 // Pipeline
-export { pipeline, type NamedInputs, type NamedOutputs, type NamedStages, type PipelineControl, type PipelineOptions, type StreamName } from './pipeline.js';
+export {
+  pipeline,
+  type NamedInputs,
+  type NamedOutputs,
+  type NamedStages,
+  type PipelineControl,
+  type PipelineOptions,
+  type PipelineProgress,
+  type StreamName,
+} from './pipeline.js';
+
+// Probe
+export { probe, probeSync, type ProbeOptions, type ProbeResult, type ProbeStream, type ProbeStreamType } from './probe.js';
+
+// Scaler
+export {
+  Scaler,
+  type JpegOptions,
+  type PngOptions,
+  type ScaledImageFormat,
+  type ScaleOptions,
+  type ScalerCrop,
+  type ScalerOptions,
+  type ScalerResize,
+} from './scaler.js';
 
 // fMP4 Stream
 export { FMP4_CODECS, FMP4Stream, type FMP4Data, type FMP4Fragment, type FMP4StreamOptions, type MP4Box, type MP4BoxType } from './fmp4-stream.js';
@@ -42,4 +69,3 @@ export { WhisperTranscriber, type WhisperSegment, type WhisperTranscriberOptions
 // Utilities
 export * from './utilities/index.js';
 export * from './utils.js';
-

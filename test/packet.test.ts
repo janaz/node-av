@@ -273,6 +273,22 @@ describe('Packet', () => {
       assert.equal(packet.size, 0);
       // Note: Actual data is set during demuxing/encoding operations
     });
+
+    it('replaces data cleanly on a reused packet (no buffer/side-data leak)', () => {
+      // Regression: setting `data` must release the packet's previous buffer and
+      // side data. av_new_packet() overwrites pkt->buf without freeing it, so
+      // reusing one packet (the common decode/encode loop pattern) used to leak.
+      packet.data = Buffer.from([1, 2, 3, 4]);
+      assert.equal(packet.size, 4);
+      packet.addSideData(AV_PKT_DATA_NEW_EXTRADATA, Buffer.from([9, 9, 9]));
+      assert.ok(packet.getSideData(AV_PKT_DATA_NEW_EXTRADATA));
+
+      // Re-assigning data resets the packet: new payload, side data cleared.
+      packet.data = Buffer.from([5, 6]);
+      assert.equal(packet.size, 2);
+      assert.deepEqual([...packet.data], [5, 6]);
+      assert.equal(packet.getSideData(AV_PKT_DATA_NEW_EXTRADATA), null);
+    });
   });
 
   describe('Error Handling', () => {
@@ -491,13 +507,13 @@ describe('Packet', () => {
       assert.equal(packet.flags, AVFLAG_NONE);
 
       packet.setFlags(AV_PKT_FLAG_KEY, AV_PKT_FLAG_CORRUPT);
-      assert.equal(packet.flags, (AV_PKT_FLAG_KEY | AV_PKT_FLAG_CORRUPT) as AVPacketFlag);
+      assert.equal(packet.flags, AV_PKT_FLAG_KEY | AV_PKT_FLAG_CORRUPT);
       assert.equal(packet.isKeyframe, true);
     });
 
     it('should clear single flag using clearFlags', () => {
       packet.setFlags(AV_PKT_FLAG_KEY, AV_PKT_FLAG_CORRUPT);
-      assert.equal(packet.flags, (AV_PKT_FLAG_KEY | AV_PKT_FLAG_CORRUPT) as AVPacketFlag);
+      assert.equal(packet.flags, AV_PKT_FLAG_KEY | AV_PKT_FLAG_CORRUPT);
 
       packet.clearFlags(AV_PKT_FLAG_CORRUPT);
       assert.equal(packet.flags, AV_PKT_FLAG_KEY);
@@ -506,7 +522,7 @@ describe('Packet', () => {
 
     it('should clear multiple flags using clearFlags', () => {
       packet.setFlags(AV_PKT_FLAG_KEY, AV_PKT_FLAG_CORRUPT, AV_PKT_FLAG_DISCARD);
-      assert.equal(packet.flags, (AV_PKT_FLAG_KEY | AV_PKT_FLAG_CORRUPT | AV_PKT_FLAG_DISCARD) as AVPacketFlag);
+      assert.equal(packet.flags, AV_PKT_FLAG_KEY | AV_PKT_FLAG_CORRUPT | AV_PKT_FLAG_DISCARD);
 
       packet.clearFlags(AV_PKT_FLAG_CORRUPT, AV_PKT_FLAG_DISCARD);
       assert.equal(packet.flags, AV_PKT_FLAG_KEY);
@@ -518,12 +534,12 @@ describe('Packet', () => {
       assert.equal(packet.flags, AV_PKT_FLAG_KEY);
 
       packet.setFlags(AV_PKT_FLAG_DISCARD);
-      assert.equal(packet.flags, (AV_PKT_FLAG_KEY | AV_PKT_FLAG_DISCARD) as AVPacketFlag);
+      assert.equal(packet.flags, AV_PKT_FLAG_KEY | AV_PKT_FLAG_DISCARD);
     });
 
     it('should support direct flag assignment (backward compatibility)', () => {
       packet.flags = (AV_PKT_FLAG_KEY | AV_PKT_FLAG_CORRUPT) as AVPacketFlag;
-      assert.equal(packet.flags, (AV_PKT_FLAG_KEY | AV_PKT_FLAG_CORRUPT) as AVPacketFlag);
+      assert.equal(packet.flags, AV_PKT_FLAG_KEY | AV_PKT_FLAG_CORRUPT);
 
       packet.flags = AVFLAG_NONE;
       assert.equal(packet.flags, AVFLAG_NONE);
@@ -562,6 +578,69 @@ describe('Packet', () => {
       assert.equal(packet.hasFlags(AV_PKT_FLAG_KEY), true);
       assert.equal(packet.hasFlags(AV_PKT_FLAG_KEY, AV_PKT_FLAG_CORRUPT), false);
       assert.equal(packet.hasFlags(AV_PKT_FLAG_KEY, AV_PKT_FLAG_DISCARD), false);
+    });
+  });
+
+  describe('data cache', () => {
+    // The data getter copies the payload once and caches the copy; the cache is
+    // dropped whenever the packet's payload may have changed. Hits are observable
+    // via identity.
+    it('returns the same buffer on repeated access', () => {
+      packet.alloc();
+      packet.data = Buffer.from([1, 2, 3, 4]);
+      const a = packet.data;
+      assert.ok(a, 'packet has data');
+      assert.strictEqual(packet.data, a, 'repeated access serves the cached copy');
+      assert.equal(a[0], 1);
+    });
+
+    it('invalidates when the payload changes (data setter)', () => {
+      packet.alloc();
+      packet.data = Buffer.from([1, 2, 3, 4]);
+      const a = packet.data;
+      assert.ok(a);
+      packet.data = Buffer.from([9, 9]);
+      const b = packet.data;
+      assert.ok(b);
+      assert.notStrictEqual(b, a, 'new payload produces a new buffer');
+      assert.equal(b.length, 2);
+      assert.equal(b[0], 9);
+    });
+
+    it('invalidates on unref and on clearing via data = null', () => {
+      packet.alloc();
+      packet.data = Buffer.from([1, 2, 3, 4]);
+      assert.ok(packet.data);
+      packet.unref();
+      assert.equal(packet.data, null, 'no data after unref');
+      assert.equal(packet.reportedExternalMemory, 0, 'unref reconciles the report');
+
+      packet.data = Buffer.from([5, 6, 7]);
+      assert.ok(packet.data);
+      packet.data = null;
+      assert.equal(packet.data, null, 'no data after clearing');
+      assert.equal(packet.reportedExternalMemory, 0, 'clearing reconciles the report');
+    });
+
+    it('invalidates when ref() points at another payload', () => {
+      packet.alloc();
+      packet.data = Buffer.from([1, 2, 3, 4]);
+      const a = packet.data;
+      assert.ok(a);
+
+      const other = new Packet();
+      other.alloc();
+      other.data = Buffer.from([7, 7, 7, 7]);
+      try {
+        packet.unref();
+        assert.equal(packet.ref(other), 0, 'Should ref the other packet');
+        const b = packet.data;
+        assert.ok(b);
+        assert.notStrictEqual(b, a, 'ref() drops the cached copy');
+        assert.equal(b[0], 7);
+      } finally {
+        other.free();
+      }
     });
   });
 });

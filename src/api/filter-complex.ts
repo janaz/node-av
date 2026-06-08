@@ -19,6 +19,7 @@ import type { AVBufferSrcFlag, AVMediaType, AVSampleFormat, EOFSignal } from '..
 import type { FilterContext } from '../lib/filter-context.js';
 import type { IRational } from '../lib/types.js';
 import type { FilterOptions } from './filter.js';
+import type { FilterComplexGraph } from './filter-presets.js';
 
 /**
  * Frame properties for change detection.
@@ -210,7 +211,10 @@ export class FilterComplexAPI implements Disposable {
    * @see {@link process} For sending frames to inputs
    * @see {@link receive} For getting frames from outputs
    */
-  static create(description: string, options: FilterComplexOptions): FilterComplexAPI {
+  static create(description: string | FilterComplexGraph, options: FilterComplexOptions): FilterComplexAPI {
+    // Accept a type-safe FilterComplexGraph builder or a raw description string.
+    const descriptionString = typeof description === 'string' ? description : description.build();
+
     // Validate inputs and outputs
     if (!options.inputs || options.inputs.length === 0) {
       throw new Error('At least one input is required');
@@ -247,7 +251,7 @@ export class FilterComplexAPI implements Disposable {
       graph.nbThreads = options.threads;
     }
 
-    const instance = new FilterComplexAPI(graph, description, options);
+    const instance = new FilterComplexAPI(graph, descriptionString, options);
 
     // Initialize input states
     for (const input of options.inputs) {
@@ -1640,6 +1644,9 @@ export class FilterComplexAPI implements Disposable {
       throw new Error('Failed to parse filter segment');
     }
 
+    let inputs: FilterInOut | undefined;
+    let outputs: FilterInOut | undefined;
+
     try {
       // Step 2: Create filter instances (but don't initialize yet)
       let ret = segment.createFilters();
@@ -1666,8 +1673,8 @@ export class FilterComplexAPI implements Disposable {
       FFmpegError.throwIfError(ret, 'Failed to apply options to segment');
 
       // Step 5: Initialize and link filters in the segment
-      const inputs = new FilterInOut();
-      const outputs = new FilterInOut();
+      inputs = new FilterInOut();
+      outputs = new FilterInOut();
 
       ret = segment.apply(inputs, outputs);
       FFmpegError.throwIfError(ret, 'Failed to apply segment');
@@ -1677,12 +1684,11 @@ export class FilterComplexAPI implements Disposable {
 
       // Step 7: Link segment outputs to buffersink filters
       this.linkBufferSinks(outputs);
-
-      // Clean up FilterInOut structures
-      inputs.free();
-      outputs.free();
     } finally {
-      // Always free the segment
+      // Always free the FilterInOut structures and the segment, including on the
+      // error paths above (apply/link failures) where they would otherwise leak.
+      inputs?.free();
+      outputs?.free();
       segment.free();
     }
   }

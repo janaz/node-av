@@ -18,6 +18,8 @@ public:
 
   AVPacket* Get() { return packet_; }
 
+  void SyncExternalMemory(napi_env env);
+
 private:
   friend class Stream;
   friend class SyncQueue;
@@ -25,6 +27,21 @@ private:
   static Napi::FunctionReference constructor;
 
   AVPacket* packet_ = nullptr;
+
+  // Bytes of native payload currently reported to V8 via
+  // napi_adjust_external_memory. Kept in sync by SyncExternalMemory().
+  int64_t reported_memory_ = 0;
+
+  // Cached copy of the payload handed out by the data getter - building it copies
+  // the full payload on every access otherwise. Dropped whenever the packet's
+  // buffers may have changed (every SyncExternalMemory() call site).
+  Napi::Reference<Napi::Buffer<uint8_t>> cached_data_;
+
+  void InvalidateDataCache();
+
+  // @internal test hook: exposes reported_memory_ so the accounting can be
+  // asserted deterministically (the value is not observable via V8 heap stats).
+  Napi::Value GetReportedMemory(const Napi::CallbackInfo& info);
 
   Napi::Value Alloc(const Napi::CallbackInfo& info);
   Napi::Value Free(const Napi::CallbackInfo& info);

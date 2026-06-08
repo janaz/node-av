@@ -3,6 +3,7 @@ import { closeSync, openSync, readSync } from 'fs';
 import { open } from 'fs/promises';
 import { Readable } from 'node:stream';
 import { resolve } from 'path';
+
 import {
   AV_NOPTS_VALUE,
   AV_PIX_FMT_NONE,
@@ -32,7 +33,7 @@ import { DELTA_THRESHOLD, DTS_ERROR_THRESHOLD, IO_BUFFER_SIZE, MAX_INPUT_QUEUE_S
 import { IOStream } from './io-stream.js';
 import { StreamingUtils } from './utilities/streaming.js';
 
-import type { AVMediaType, AVPixelFormat, AVSampleFormat, AVSeekFlag, AVSeekWhence } from '../constants/index.js';
+import type { AVMediaType, AVPixelFormat, AVSampleFormat, AVSeekFlag, AVSeekWhence, DemuxerFormat, DemuxerOptionsFor } from '../constants/index.js';
 import type { Stream } from '../lib/stream.js';
 import type { IRational } from '../lib/types.js';
 import type { IOInputCallbacks } from './io-stream.js';
@@ -40,6 +41,8 @@ import type { IOInputCallbacks } from './io-stream.js';
 /**
  * Per-stream timestamp processing state.
  * Tracks timestamp correction and prediction for each stream.
+ *
+ * @internal
  */
 interface StreamState {
   // PTS wrap-around correction
@@ -142,7 +145,7 @@ export interface AudioRawData {
 /**
  * Options for Demuxer opening.
  */
-export interface DemuxerOptions {
+export interface DemuxerOptions<F extends DemuxerFormat | (string & {}) = DemuxerFormat | (string & {})> {
   /**
    * Buffer size for reading/writing operations.
    *
@@ -159,8 +162,10 @@ export interface DemuxerOptions {
    * Use this to specify the input format explicitly instead of auto-detection.
    * Useful for raw formats like 'rawvideo', 'rawaudio', etc.
    *
+   * When given as a literal (e.g. `'mov'`), `options` is strongly typed to that
+   * demuxer's known options plus the generic AVFormatContext options.
    */
-  format?: string;
+  format?: F;
 
   /**
    * Skip reading stream information on open.
@@ -222,10 +227,13 @@ export interface DemuxerOptions {
   /**
    * FFmpeg format options passed directly to the input.
    *
-   * Key-value pairs of FFmpeg AVFormatContext options.
-   * These are passed directly to avformat_open_input().
+   * Key-value pairs of FFmpeg AVFormatContext / demuxer-private / protocol
+   * options, passed to avformat_open_input(). When `format` is a known literal,
+   * these are typed to that demuxer's options (autocomplete + value typing);
+   * arbitrary keys remain allowed so protocol options (e.g. `rtsp_transport`)
+   * still pass.
    */
-  options?: Record<string, string | number | boolean | undefined | null>;
+  options?: DemuxerOptionsFor<F>;
 
   /**
    * AbortSignal for cancellation.
@@ -604,14 +612,18 @@ export class Demuxer implements AsyncDisposable, Disposable {
    * ```
    *
    * @see {@link DemuxerOptions} For configuration options
-   * @see {@link RawData} For raw data input
+   * @see {@link VideoRawData} For raw video data input
+   * @see {@link AudioRawData} For raw audio data input
    * @see {@link IOInputCallbacks} For custom I/O interface
    */
-  static async open(input: string | Buffer, options?: DemuxerOptions): Promise<Demuxer>;
-  static async open(input: IOInputCallbacks, options: (DemuxerOptions | undefined) & { format: string }): Promise<Demuxer>;
-  static async open(input: IOContext, options: (DemuxerOptions | undefined) & { format: string }): Promise<Demuxer>;
-  static async open(input: Readable, options: (DemuxerOptions | undefined) & { format: string }): Promise<Demuxer>;
-  static async open(rawData: VideoRawData | AudioRawData, options?: DemuxerOptions): Promise<Demuxer>;
+  static async open<const F extends DemuxerFormat | (string & {}) = DemuxerFormat | (string & {})>(input: string | Buffer, options?: DemuxerOptions<F>): Promise<Demuxer>;
+  static async open<const F extends DemuxerFormat | (string & {})>(input: IOInputCallbacks, options: DemuxerOptions<F> & { format: F }): Promise<Demuxer>;
+  static async open<const F extends DemuxerFormat | (string & {})>(input: IOContext, options: DemuxerOptions<F> & { format: F }): Promise<Demuxer>;
+  static async open<const F extends DemuxerFormat | (string & {})>(input: Readable, options: DemuxerOptions<F> & { format: F }): Promise<Demuxer>;
+  static async open<const F extends DemuxerFormat | (string & {}) = DemuxerFormat | (string & {})>(
+    rawData: VideoRawData | AudioRawData,
+    options?: DemuxerOptions<F>,
+  ): Promise<Demuxer>;
   static async open(input: string | Buffer | VideoRawData | AudioRawData | IOInputCallbacks | IOContext | Readable, options: DemuxerOptions = {}): Promise<Demuxer> {
     // Check if input is raw data
     if (typeof input === 'object' && 'type' in input && ('width' in input || 'sampleRate' in input)) {
@@ -868,11 +880,14 @@ export class Demuxer implements AsyncDisposable, Disposable {
    * @see {@link open} For async version
    * @see {@link IOInputCallbacks} For custom I/O interface
    */
-  static openSync(input: string | Buffer, options?: DemuxerOptions): Demuxer;
-  static openSync(input: IOInputCallbacks, options: (DemuxerOptions | undefined) & { format: string }): Demuxer;
-  static openSync(input: IOContext, options: (DemuxerOptions | undefined) & { format: string }): Demuxer;
-  static openSync(input: Readable, options: (DemuxerOptions | undefined) & { format: string }): Demuxer;
-  static openSync(rawData: VideoRawData | AudioRawData, options?: DemuxerOptions): Demuxer;
+  static openSync<const F extends DemuxerFormat | (string & {}) = DemuxerFormat | (string & {})>(input: string | Buffer, options?: DemuxerOptions<F>): Demuxer;
+  static openSync<const F extends DemuxerFormat | (string & {})>(input: IOInputCallbacks, options: DemuxerOptions<F> & { format: F }): Demuxer;
+  static openSync<const F extends DemuxerFormat | (string & {})>(input: IOContext, options: DemuxerOptions<F> & { format: F }): Demuxer;
+  static openSync<const F extends DemuxerFormat | (string & {})>(input: Readable, options: DemuxerOptions<F> & { format: F }): Demuxer;
+  static openSync<const F extends DemuxerFormat | (string & {}) = DemuxerFormat | (string & {})>(
+    rawData: VideoRawData | AudioRawData,
+    options?: DemuxerOptions<F>,
+  ): Demuxer;
   static openSync(input: string | Buffer | VideoRawData | AudioRawData | IOInputCallbacks | IOContext | Readable, options: DemuxerOptions = {}): Demuxer {
     // Check if input is raw data
     if (typeof input === 'object' && 'type' in input && ('width' in input || 'sampleRate' in input)) {
@@ -2303,13 +2318,13 @@ export class Demuxer implements AsyncDisposable, Disposable {
     let disableDiscontinuityCorrection = this.options.copyTs;
 
     // Rescale packet DTS to AV_TIME_BASE for comparison
-    const pktDts = avRescaleQRnd(packet.dts, packet.timeBase, AV_TIME_BASE_Q, (AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX) as any);
+    const pktDts = avRescaleQRnd(packet.dts, packet.timeBase, AV_TIME_BASE_Q, AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
 
     // PTS wrap-around detection
     // Only applies when copyTs is enabled and stream has limited timestamp bits
     if (this.options.copyTs && state.nextDts !== AV_NOPTS_VALUE && fmtIsDiscont && stream.ptsWrapBits < 60) {
       // Calculate wrapped DTS by adding 2^pts_wrap_bits to packet DTS
-      const wrapDts = avRescaleQRnd(packet.dts + (1n << BigInt(stream.ptsWrapBits)), packet.timeBase, AV_TIME_BASE_Q, (AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX) as any);
+      const wrapDts = avRescaleQRnd(packet.dts + (1n << BigInt(stream.ptsWrapBits)), packet.timeBase, AV_TIME_BASE_Q, AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
 
       // If wrapped DTS is closer to predicted nextDts, enable correction
       const wrapDelta = wrapDts > state.nextDts ? wrapDts - state.nextDts : state.nextDts - wrapDts;

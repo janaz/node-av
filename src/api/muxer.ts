@@ -32,15 +32,25 @@ import { Encoder } from './encoder.js';
 import { IOStream } from './io-stream.js';
 import { AsyncQueue } from './utilities/async-queue.js';
 
+import type { MuxerFormat, MuxerOptionsFor } from '../constants/index.js';
 import type { IRational, OutputFormat, Stream } from '../lib/index.js';
+import type { BitStreamFilterAPI } from './bitstream-filter.js';
 import type { Demuxer, RTPDemuxer } from './demuxer.js';
 import type { IOOutputCallbacks } from './io-stream.js';
 
+/**
+ * Per-stream muxing state: output stream, encoder/bitstream filter, and the
+ * timestamp/pre-mux bookkeeping used while writing.
+ *
+ * @internal
+ */
 interface StreamDescription {
   initialized: boolean;
   inputStream?: Stream; // Source stream for metadata/properties (optional in encoder-only mode)
   outputStream: Stream;
   encoder?: Encoder;
+  bsf?: BitStreamFilterAPI; // Trailing bitstream filter whose output parameters override the encoder's
+
   timeBase?: IRational;
   sourceTimeBase?: IRational;
   isStreamCopy: boolean;
@@ -51,8 +61,14 @@ interface StreamDescription {
   lastMuxDts: bigint;
   tsRescaleDeltaLast: { value: bigint }; // For av_rescale_delta (audio streamcopy)
   streamcopyStarted: boolean; // Track if streamcopy has started for this stream
+  startTimeOffset?: bigint; // Effective per-stream startTime offset (decided on the first packet)
 }
 
+/**
+ * A queued packet write: the packet, its stream state, and stream index.
+ *
+ * @internal
+ */
 interface WriteJob {
   pkt: Packet;
   streamInfo: StreamDescription;
@@ -62,7 +78,7 @@ interface WriteJob {
 /**
  * Options for Muxer creation.
  */
-export interface MuxerOptions {
+export interface MuxerOptions<F extends MuxerFormat | (string & {}) = MuxerFormat | (string & {})> {
   /**
    * Input media for automatic metadata and property copying.
    *
@@ -83,8 +99,11 @@ export interface MuxerOptions {
    * Use this to override automatic format detection.
    *
    * Matches FFmpeg CLI's -f option.
+   *
+   * When given as a literal (e.g. `'mp4'`), `options` is strongly typed to that
+   * muxer's known options plus the generic AVFormatContext options.
    */
-  format?: string;
+  format?: F;
 
   /**
    * Buffer size for I/O operations.
@@ -230,10 +249,12 @@ export interface MuxerOptions {
   /**
    * FFmpeg format options passed directly to the output.
    *
-   * Key-value pairs of FFmpeg AVFormatContext options.
-   * These are passed directly to avformat_write_header().
+   * Key-value pairs of FFmpeg AVFormatContext / muxer-private options, applied
+   * before avformat_write_header(). When `format` is a known literal, these are
+   * typed to that muxer's options (autocomplete + value typing); arbitrary keys
+   * remain allowed so protocol/other options still pass.
    */
-  options?: Record<string, string | number | boolean | bigint | undefined | null>;
+  options?: MuxerOptionsFor<F>;
 
   /**
    * AbortSignal for cancellation.
@@ -390,9 +411,9 @@ export class Muxer implements AsyncDisposable, Disposable {
    * @see {@link MuxerOptions} For configuration options
    * @see {@link IOOutputCallbacks} For custom I/O interface
    */
-  static async open(target: string, options?: MuxerOptions): Promise<Muxer>;
-  static async open(target: IOOutputCallbacks, options: MuxerOptions & { format: string }): Promise<Muxer>;
-  static async open(target: Writable, options: MuxerOptions & { format: string }): Promise<Muxer>;
+  static async open<const F extends MuxerFormat | (string & {}) = MuxerFormat | (string & {})>(target: string, options?: MuxerOptions<F>): Promise<Muxer>;
+  static async open<const F extends MuxerFormat | (string & {})>(target: IOOutputCallbacks, options: MuxerOptions<F> & { format: F }): Promise<Muxer>;
+  static async open<const F extends MuxerFormat | (string & {})>(target: Writable, options: MuxerOptions<F> & { format: F }): Promise<Muxer>;
   static async open(target: string | IOOutputCallbacks | Writable, options?: MuxerOptions): Promise<Muxer> {
     const output = new Muxer(options);
 
@@ -543,9 +564,9 @@ export class Muxer implements AsyncDisposable, Disposable {
    *
    * @see {@link open} For async version
    */
-  static openSync(target: string, options?: MuxerOptions): Muxer;
-  static openSync(target: IOOutputCallbacks, options: MuxerOptions & { format: string }): Muxer;
-  static openSync(target: Writable, options: MuxerOptions & { format: string }): Muxer;
+  static openSync<const F extends MuxerFormat | (string & {}) = MuxerFormat | (string & {})>(target: string, options?: MuxerOptions<F>): Muxer;
+  static openSync<const F extends MuxerFormat | (string & {})>(target: IOOutputCallbacks, options: MuxerOptions<F> & { format: F }): Muxer;
+  static openSync<const F extends MuxerFormat | (string & {})>(target: Writable, options: MuxerOptions<F> & { format: F }): Muxer;
   static openSync(target: string | IOOutputCallbacks | Writable, options?: MuxerOptions): Muxer {
     const output = new Muxer(options);
 
@@ -799,7 +820,7 @@ export class Muxer implements AsyncDisposable, Disposable {
    * });
    * ```
    */
-  addStream(encoder: Encoder, options?: { inputStream?: Stream }): number;
+  addStream(encoder: Encoder, options?: { inputStream?: Stream; bsf?: BitStreamFilterAPI }): number;
 
   /**
    * Add a stream to the output (stream copy or transcoding mode).
@@ -851,8 +872,8 @@ export class Muxer implements AsyncDisposable, Disposable {
    * @see {@link writePacket} For writing packets to streams
    * @see {@link Encoder} For transcoding source
    */
-  addStream(stream: Stream, options?: { encoder?: Encoder }): number;
-  addStream(streamOrEncoder: Stream | Encoder, options?: { encoder?: Encoder; inputStream?: Stream }): number {
+  addStream(stream: Stream, options?: { encoder?: Encoder; bsf?: BitStreamFilterAPI }): number;
+  addStream(streamOrEncoder: Stream | Encoder, options?: { encoder?: Encoder; inputStream?: Stream; bsf?: BitStreamFilterAPI }): number {
     if (this.isClosed) {
       throw new Error('Muxer is closed');
     }
@@ -958,6 +979,7 @@ export class Muxer implements AsyncDisposable, Disposable {
         outputStream: outStream,
         inputStream: stream,
         encoder,
+        bsf: options?.bsf,
         sourceTimeBase: undefined, // Will be set on initialization
         isStreamCopy: false,
         sqIdxMux: -1, // Will be set if sync queue is needed
@@ -1174,6 +1196,12 @@ export class Muxer implements AsyncDisposable, Disposable {
           continue;
         }
 
+        // If a trailing bitstream filter is present, wait until it is initialized
+        // so its output parameters (e.g. modified extradata) are available.
+        if (streamInfo.bsf && !streamInfo.bsf.isInitialized) {
+          continue;
+        }
+
         // This encoder is ready, initialize it now
         // Read codecType from codecContext, not from stream (which is still uninitialized)
         // const codecType = codecContext.codecType;
@@ -1192,6 +1220,15 @@ export class Muxer implements AsyncDisposable, Disposable {
         // 3. Copy codec parameters from encoder context
         const ret = streamInfo.outputStream.codecpar.fromContext(codecContext);
         FFmpegError.throwIfError(ret, 'Failed to copy codec parameters from encoder');
+
+        // 3b. Overlay the trailing bitstream filter's output parameters, so
+        // container-level fields (e.g. extradata/level rewritten by h264_metadata)
+        // reflect the filter's output rather than the raw encoder output.
+        const bsfParams = streamInfo.bsf?.outputCodecParameters;
+        if (bsfParams) {
+          const bsfRet = bsfParams.copy(streamInfo.outputStream.codecpar);
+          FFmpegError.throwIfError(bsfRet, 'Failed to copy codec parameters from bitstream filter');
+        }
 
         // 4. Copy metadata from input stream
         if (streamInfo.inputStream) {
@@ -1297,19 +1334,8 @@ export class Muxer implements AsyncDisposable, Disposable {
         return;
       }
     } else if (this.options.startTime !== undefined) {
-      // For encoded (non-streamcopy) streams, apply startTime offset.
-      // Streamcopy handles this in ofStreamcopy; for encoding, the encoder preserves
-      // decoded frame timestamps which may include a device-based offset (e.g., system
-      // uptime from avfoundation). Subtract startTime to normalize timestamps to zero.
-      const startTimeUs = BigInt(Math.floor(this.options.startTime * 1000000));
-      const tsOffset = avRescaleQ(startTimeUs, AV_TIME_BASE_Q, clonedPacket.timeBase);
-
-      if (clonedPacket.pts !== AV_NOPTS_VALUE) {
-        clonedPacket.pts -= tsOffset;
-      }
-      if (clonedPacket.dts !== AV_NOPTS_VALUE) {
-        clonedPacket.dts -= tsOffset;
-      }
+      // For encoded (non-streamcopy) streams, strip the device's startTime base.
+      this.applyStartTimeOffset(clonedPacket, streamInfo);
     }
 
     // Check if any streams are still uninitialized or header is being written
@@ -1503,6 +1529,12 @@ export class Muxer implements AsyncDisposable, Disposable {
           continue;
         }
 
+        // If a trailing bitstream filter is present, wait until it is initialized
+        // so its output parameters (e.g. modified extradata) are available.
+        if (streamInfo.bsf && !streamInfo.bsf.isInitialized) {
+          continue;
+        }
+
         // This encoder is ready, initialize it now
         // Read codecType from codecContext, not from stream (which is still uninitialized)
         const codecType = codecContext.codecType;
@@ -1529,6 +1561,15 @@ export class Muxer implements AsyncDisposable, Disposable {
         // 3. Copy codec parameters from encoder context
         const ret = streamInfo.outputStream.codecpar.fromContext(codecContext);
         FFmpegError.throwIfError(ret, 'Failed to copy codec parameters from encoder');
+
+        // 3b. Overlay the trailing bitstream filter's output parameters, so
+        // container-level fields (e.g. extradata/level rewritten by h264_metadata)
+        // reflect the filter's output rather than the raw encoder output.
+        const bsfParams = streamInfo.bsf?.outputCodecParameters;
+        if (bsfParams) {
+          const bsfRet = bsfParams.copy(streamInfo.outputStream.codecpar);
+          FFmpegError.throwIfError(bsfRet, 'Failed to copy codec parameters from bitstream filter');
+        }
 
         // 4. Copy metadata from input stream
         if (streamInfo.inputStream) {
@@ -1634,19 +1675,8 @@ export class Muxer implements AsyncDisposable, Disposable {
         return;
       }
     } else if (this.options.startTime !== undefined) {
-      // For encoded (non-streamcopy) streams, apply startTime offset.
-      // Streamcopy handles this in ofStreamcopy; for encoding, the encoder preserves
-      // decoded frame timestamps which may include a device-based offset (e.g., system
-      // uptime from avfoundation). Subtract startTime to normalize timestamps to zero.
-      const startTimeUs = BigInt(Math.floor(this.options.startTime * 1000000));
-      const tsOffset = avRescaleQ(startTimeUs, AV_TIME_BASE_Q, clonedPacket.timeBase);
-
-      if (clonedPacket.pts !== AV_NOPTS_VALUE) {
-        clonedPacket.pts -= tsOffset;
-      }
-      if (clonedPacket.dts !== AV_NOPTS_VALUE) {
-        clonedPacket.dts -= tsOffset;
-      }
+      // For encoded (non-streamcopy) streams, strip the device's startTime base.
+      this.applyStartTimeOffset(clonedPacket, streamInfo);
     }
 
     // Check if any streams are still uninitialized
@@ -2354,6 +2384,50 @@ export class Muxer implements AsyncDisposable, Disposable {
    *
    * @internal
    */
+
+  /**
+   * Apply the configured `startTime` offset to an encoded packet, per stream.
+   *
+   * `startTime` exists to strip a device's boot-relative timestamp base (e.g. the
+   * mach uptime avfoundation reports). But audio encoders re-stamp their output to
+   * a ~0 baseline, so subtracting a large device startTime from them would push the
+   * timestamps hugely negative and produce a broken/overflowed edit list that strict
+   * players (QuickTime) reject. The effective offset is therefore decided once on the
+   * stream's first packet and clamped to what the stream actually carries —
+   * `min(startTime, max(0, firstPts))`: boot-relative streams normalize to zero,
+   * already-zero-based streams are left untouched.
+   *
+   * @param packet - Cloned packet to adjust in place
+   *
+   * @param streamInfo - Per-stream muxing state
+   *
+   * @internal
+   */
+  private applyStartTimeOffset(packet: Packet, streamInfo: StreamDescription): void {
+    if (this.options.startTime === undefined) {
+      return;
+    }
+
+    if (streamInfo.startTimeOffset === undefined) {
+      const startTimeUs = BigInt(Math.floor(this.options.startTime * 1000000));
+      const requested = avRescaleQ(startTimeUs, AV_TIME_BASE_Q, packet.timeBase);
+      const firstTs = packet.pts !== AV_NOPTS_VALUE ? packet.pts : packet.dts;
+      const carried = firstTs !== AV_NOPTS_VALUE && firstTs > 0n ? firstTs : 0n;
+      streamInfo.startTimeOffset = requested < carried ? requested : carried;
+    }
+
+    const offset = streamInfo.startTimeOffset;
+    if (offset === 0n) {
+      return;
+    }
+    if (packet.pts !== AV_NOPTS_VALUE) {
+      packet.pts -= offset;
+    }
+    if (packet.dts !== AV_NOPTS_VALUE) {
+      packet.dts -= offset;
+    }
+  }
+
   private ofStreamcopy(pkt: Packet, streamInfo: StreamDescription, streamIndex: number): boolean {
     const outputStream = this.formatContext.streams[streamIndex];
     if (!outputStream) {
@@ -2546,9 +2620,13 @@ export class Muxer implements AsyncDisposable, Disposable {
       // Create new dictionary with filtered entries
       const metadata = Dictionary.fromObject(filteredEntries);
 
-      // Set metadata to format context
-      // This will copy the dictionary content via av_dict_copy
-      this.formatContext.metadata = metadata;
+      // Set metadata to format context. The setter copies the content via
+      // av_dict_copy, so the local dictionary must be freed afterwards.
+      try {
+        this.formatContext.metadata = metadata;
+      } finally {
+        metadata.free();
+      }
     }
 
     this.containerMetadataCopied = true;

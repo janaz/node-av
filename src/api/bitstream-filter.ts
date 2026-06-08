@@ -3,26 +3,32 @@ import { BitStreamFilterContext } from '../lib/bitstream-filter-context.js';
 import { BitStreamFilter } from '../lib/bitstream-filter.js';
 import { FFmpegError } from '../lib/error.js';
 import { Packet } from '../lib/packet.js';
+import { Stream } from '../lib/stream.js';
 import { PACKET_THREAD_QUEUE_SIZE } from './constants.js';
+import { Encoder } from './encoder.js';
 import { Muxer } from './muxer.js';
 import { AsyncQueue } from './utilities/async-queue.js';
 import { Scheduler, SchedulerControl } from './utilities/scheduler.js';
 
-import type { Stream } from '../lib/stream.js';
+import type { BsfName, BsfOptionsFor } from '../constants/index.js';
 import type { SchedulableComponent } from './utilities/scheduler.js';
 
 /**
  * Options for bitstream filter creation.
+ *
+ * @template N - The bitstream filter name; when a literal name is given,
+ * `options` is strongly typed to that filter's known options.
  */
-export interface BitstreamFilterOptions {
+export interface BitstreamFilterOptions<N extends string = string> {
   /**
    * Filter-specific options.
    *
-   * Key-value pairs of FFmpeg bitstream filter options.
-   * These are passed directly to the filter via av_opt_set().
-   * Available options depend on the specific filter being used.
+   * Key-value pairs of FFmpeg bitstream filter options, passed directly to the
+   * filter via av_opt_set(). When created from a known filter name, these are
+   * strongly typed to that filter's options (autocomplete + validation);
+   * otherwise any string/number/boolean values are accepted.
    */
-  options?: Record<string, string | number | boolean | bigint | undefined | null>;
+  options?: BsfOptionsFor<N>;
 
   /**
    * AbortSignal for cancellation.
@@ -74,7 +80,8 @@ export interface BitstreamFilterOptions {
 export class BitStreamFilterAPI implements Disposable {
   private ctx: BitStreamFilterContext;
   private bsf: BitStreamFilter;
-  private stream: Stream;
+  private source: Stream | Encoder | BitStreamFilterAPI;
+  private initialized = false;
   private packet: Packet;
   private isClosed = false;
 
@@ -91,76 +98,73 @@ export class BitStreamFilterAPI implements Disposable {
    *
    * @param ctx - Filter context
    *
-   * @param stream - Associated stream
+   * @param source - Input source for lazy parameter resolution
    *
    * @internal
    */
-  private constructor(bsf: BitStreamFilter, ctx: BitStreamFilterContext, stream: Stream) {
+  private constructor(bsf: BitStreamFilter, ctx: BitStreamFilterContext, source: Stream | Encoder | BitStreamFilterAPI) {
     this.bsf = bsf;
     this.ctx = ctx;
-    this.stream = stream;
+    this.source = source;
 
     this.packet = new Packet();
     this.packet.alloc();
 
-    this.inputQueue = new AsyncQueue<Packet>(PACKET_THREAD_QUEUE_SIZE);
-    this.outputQueue = new AsyncQueue<Packet>(PACKET_THREAD_QUEUE_SIZE);
+    this.inputQueue = new AsyncQueue<Packet>(PACKET_THREAD_QUEUE_SIZE, (p) => p.free());
+    this.outputQueue = new AsyncQueue<Packet>(PACKET_THREAD_QUEUE_SIZE, (p) => p.free());
   }
 
   /**
-   * Create a bitstream filter for a stream.
+   * Create a bitstream filter.
    *
-   * Initializes filter with stream codec parameters.
-   * Configures time base and prepares for packet processing.
+   * The input source provides the codec parameters the filter is configured with.
+   * Pass a {@link Stream} to filter its packets directly (stream copy), or an
+   * {@link Encoder} to filter that encoder's output (transcode) - parameters are
+   * derived from the encoder once it is open. Another {@link BitStreamFilterAPI}
+   * may be passed to chain filters.
+   *
+   * Initialization is lazy: filter options are validated immediately, but the
+   * input parameters are bound and the filter is initialized on the first packet,
+   * so an `Encoder` source (opened lazily on its first frame) is ready in time.
    *
    * Direct mapping to av_bsf_get_by_name() and av_bsf_alloc().
    *
    * @param filterName - Name of the bitstream filter
    *
-   * @param stream - Stream to apply filter to
+   * @param source - Input source: a `Stream` (copy), `Encoder` (transcode), or upstream filter (chain)
    *
    * @param filterOptions - Optional filter-specific options
    *
    * @returns Configured bitstream filter
    *
-   * @throws {Error} If initialization fails
-   *
-   * @throws {FFmpegError} If allocation or initialization fails
+   * @throws {FFmpegError} If the filter is not found, allocation fails, or an option is invalid
    *
    * @example
    * ```typescript
-   * // H.264 MP4 to Annex B conversion
+   * // Stream copy: H.264 MP4 to Annex B conversion
    * const filter = BitStreamFilterAPI.create('h264_mp4toannexb', videoStream);
    * ```
    *
    * @example
    * ```typescript
-   * // AAC ADTS to ASC conversion
-   * const filter = BitStreamFilterAPI.create('aac_adtstoasc', audioStream);
-   * ```
-   *
-   * @example
-   * ```typescript
-   * // Remove AUDs from H.264 stream
-   * const filter = BitStreamFilterAPI.create('h264_metadata', stream, {
-   *   options: { aud: 'remove' }
+   * // Transcode: derive parameters from the encoder's output
+   * const filter = BitStreamFilterAPI.create('h264_metadata', encoder, {
+   *   options: { aud: 'remove', level: '4.1' },
    * });
-   * ```
-   *
-   * @example
-   * ```typescript
-   * // Set H.264 level
-   * const filter = BitStreamFilterAPI.create('h264_metadata', stream, {
-   *   options: { level: 51 }
-   * });
+   * pipeline(input, decoder, encoder, filter, output);
    * ```
    *
    * @see {@link BitStreamFilter.getByName} For filter discovery
    * @see {@link BitstreamFilterOptions} For available options
    */
-  static create(filterName: string, stream: Stream, filterOptions?: BitstreamFilterOptions): BitStreamFilterAPI {
-    if (!stream) {
-      throw new Error('Stream is required');
+  // eslint-disable-next-line space-before-function-paren
+  static create<const N extends BsfName | (string & {}) = BsfName | (string & {})>(
+    filterName: N,
+    source: Stream | Encoder | BitStreamFilterAPI,
+    filterOptions?: BitstreamFilterOptions<N>,
+  ): BitStreamFilterAPI {
+    if (!source) {
+      throw new Error('A source (Stream, Encoder, or BitStreamFilterAPI) is required');
     }
 
     // Find the bitstream filter
@@ -175,28 +179,16 @@ export class BitStreamFilterAPI implements Disposable {
     FFmpegError.throwIfError(allocRet, 'Failed to allocate bitstream filter context');
 
     try {
-      // Copy codec parameters from stream
-      if (!ctx.inputCodecParameters) {
-        throw new Error('Failed to get input codec parameters from filter context');
-      }
-      stream.codecpar.copy(ctx.inputCodecParameters);
-
-      // Set time base
-      ctx.inputTimeBase = stream.timeBase;
-
-      // Apply filter-specific options before init
+      // Apply (and validate) filter-specific options now; input parameters and
+      // init() are deferred to ensureInitialized() on the first packet.
       if (filterOptions?.options) {
-        for (const [key, value] of Object.entries(filterOptions.options)) {
+        for (const [key, value] of Object.entries(filterOptions.options as Record<string, string | number | boolean | bigint | undefined | null>)) {
           const ret = ctx.setOption(key, value);
           FFmpegError.throwIfError(ret, `Failed to set bitstream filter option '${key}'`);
         }
       }
 
-      // Initialize the filter
-      const initRet = ctx.init();
-      FFmpegError.throwIfError(initRet, 'Failed to initialize bitstream filter');
-
-      const bsfApi = new BitStreamFilterAPI(filter, ctx, stream);
+      const bsfApi = new BitStreamFilterAPI(filter, ctx, source);
 
       if (filterOptions?.signal) {
         filterOptions.signal.throwIfAborted();
@@ -269,6 +261,47 @@ export class BitStreamFilterAPI implements Disposable {
   }
 
   /**
+   * Check if the filter has been initialized.
+   *
+   * Initialization is lazy and happens on the first processed packet, after
+   * which {@link outputCodecParameters} reflect the filter's output.
+   *
+   * @example
+   * ```typescript
+   * if (filter.isInitialized) {
+   *   const params = filter.outputCodecParameters;
+   * }
+   * ```
+   */
+  get isInitialized(): boolean {
+    return this.initialized;
+  }
+
+  /**
+   * Get associated stream.
+   *
+   * Returns the stream this filter was created for. Only available when the
+   * filter was created from a {@link Stream}; filters created from an `Encoder`
+   * derive their parameters from the encoder's output instead.
+   *
+   * @returns Associated stream
+   *
+   * @throws {Error} If the filter was not created from a stream
+   *
+   * @example
+   * ```typescript
+   * const stream = filter.getStream();
+   * console.log(`Filtering stream ${stream.index}`);
+   * ```
+   */
+  getStream(): Stream {
+    if (!(this.source instanceof Stream)) {
+      throw new Error('No associated stream: this bitstream filter derives its parameters from an upstream component');
+    }
+    return this.source;
+  }
+
+  /**
    * Send a packet to the filter.
    *
    * Sends a packet to the filter for processing.
@@ -326,6 +359,8 @@ export class BitStreamFilterAPI implements Disposable {
     if (this.isClosed) {
       return;
     }
+
+    this.ensureInitialized();
 
     // Send packet to filter (null signals EOF/flush)
     const sendRet = await this.ctx.sendPacket(packet);
@@ -392,6 +427,8 @@ export class BitStreamFilterAPI implements Disposable {
     if (this.isClosed) {
       return;
     }
+
+    this.ensureInitialized();
 
     // Send packet to filter (null signals EOF/flush)
     const sendRet = this.ctx.sendPacketSync(packet);
@@ -744,7 +781,7 @@ export class BitStreamFilterAPI implements Disposable {
   async flush(): Promise<void> {
     this.signal?.throwIfAborted();
 
-    if (this.isClosed) {
+    if (this.isClosed || !this.initialized) {
       return;
     }
 
@@ -790,7 +827,7 @@ export class BitStreamFilterAPI implements Disposable {
    * @see {@link flush} For async version
    */
   flushSync(): void {
-    if (this.isClosed) {
+    if (this.isClosed || !this.initialized) {
       return;
     }
 
@@ -846,7 +883,7 @@ export class BitStreamFilterAPI implements Disposable {
    * @see {@link receiveSync} For synchronous version
    */
   async receive(): Promise<Packet | null> {
-    if (this.isClosed) {
+    if (this.isClosed || !this.initialized) {
       return null;
     }
 
@@ -915,7 +952,7 @@ export class BitStreamFilterAPI implements Disposable {
    * @see {@link receive} For async version
    */
   receiveSync(): Packet | null {
-    if (this.isClosed) {
+    if (this.isClosed || !this.initialized) {
       return null;
     }
 
@@ -938,276 +975,6 @@ export class BitStreamFilterAPI implements Disposable {
       // Error
       FFmpegError.throwIfError(recvRet, 'Failed to receive packet from bitstream filter');
       return null;
-    }
-  }
-
-  /**
-   * Flush all buffered packets as async generator.
-   *
-   * Convenient async iteration over remaining packets.
-   * Automatically sends flush signal and retrieves buffered packets.
-   * Useful for end-of-stream processing.
-   *
-   * @yields {Packet} Buffered packets
-   *
-   * @example
-   * ```typescript
-   * // Flush at end of filtering
-   * for await (const packet of filter.flushPackets()) {
-   *   console.log('Processing buffered packet');
-   *   await output.writePacket(packet);
-   *   packet.free();
-   * }
-   * ```
-   *
-   * @see {@link filter} For filtering packets
-   * @see {@link flush} For signaling end-of-stream
-   * @see {@link flushPacketsSync} For synchronous version
-   */
-  async *flushPackets(): AsyncGenerator<Packet> {
-    while (true) {
-      const packet = await this.receive();
-      if (!packet) break;
-      yield packet;
-    }
-  }
-
-  /**
-   * Flush all buffered packets as generator synchronously.
-   * Synchronous version of flushPackets.
-   *
-   * Convenient sync iteration over remaining packets.
-   * Automatically retrieves buffered packets after flush.
-   * Useful for end-of-stream processing.
-   *
-   * @yields {Packet} Buffered packets
-   *
-   * @example
-   * ```typescript
-   * // Flush at end of filtering
-   * for (const packet of filter.flushPacketsSync()) {
-   *   console.log('Processing buffered packet');
-   *   output.writePacketSync(packet);
-   *   packet.free();
-   * }
-   * ```
-   *
-   * @see {@link filterSync} For filtering packets
-   * @see {@link flushSync} For signaling end-of-stream
-   * @see {@link flushPackets} For async version
-   */
-  *flushPacketsSync(): Generator<Packet> {
-    while (true) {
-      const packet = this.receiveSync();
-      if (!packet) break;
-      yield packet;
-    }
-  }
-
-  /**
-   * Get associated stream.
-   *
-   * Returns the stream this filter was created for.
-   *
-   * @returns Associated stream
-   *
-   * @example
-   * ```typescript
-   * const stream = filter.getStream();
-   * console.log(`Filtering stream ${stream.index}`);
-   * ```
-   */
-  getStream(): Stream {
-    return this.stream;
-  }
-
-  /**
-   * Reset filter state.
-   *
-   * Clears internal buffers and resets filter.
-   * Does not dispose resources.
-   *
-   * Direct mapping to av_bsf_flush().
-   *
-   * @example
-   * ```typescript
-   * // Reset for new segment
-   * filter.reset();
-   * ```
-   *
-   * @see {@link flush} For reset with packet retrieval
-   */
-  reset(): void {
-    if (this.isClosed) {
-      return;
-    }
-
-    this.ctx.flush();
-  }
-
-  /**
-   * Close filter and free resources.
-   *
-   * Releases filter context and marks as closed.
-   * Safe to call multiple times.
-   *
-   * @example
-   * ```typescript
-   * filter.close();
-   * ```
-   *
-   * @see {@link Symbol.dispose} For automatic cleanup
-   */
-  close(): void {
-    if (this.isClosed) {
-      return;
-    }
-
-    this.isClosed = true;
-
-    // Close queues
-    this.inputQueue.close();
-    this.outputQueue.close();
-
-    this.packet.free();
-    this.ctx.free();
-  }
-
-  /**
-   * Dispose of filter.
-   *
-   * Implements Disposable interface for automatic cleanup.
-   * Equivalent to calling dispose().
-   *
-   * @example
-   * ```typescript
-   * {
-   *   using filter = BitStreamFilterAPI.create('h264_mp4toannexb', stream);
-   *   // Use filter...
-   * } // Automatically disposed
-   * ```
-   *
-   * @see {@link close} For manual cleanup
-   */
-  [Symbol.dispose](): void {
-    this.close();
-  }
-
-  /**
-   * Send packet to input queue or flush the pipeline.
-   *
-   * When packet is provided, queues it for filtering.
-   * When null is provided, triggers flush sequence:
-   * - Closes input queue
-   * - Waits for worker completion
-   * - Closes output queue (no buffering, bitstream filters are stateless)
-   * - Waits for pipeTo task completion
-   * - Propagates flush to next component (if any)
-   *
-   * Used by scheduler system for pipeline control.
-   *
-   * @param packet - Packet to send, or null to flush
-   *
-   * @internal
-   */
-  async sendToQueue(packet: Packet | null): Promise<void> {
-    if (packet) {
-      await this.inputQueue.send(packet);
-    } else {
-      // Close input queue to signal end of stream to worker
-      this.inputQueue.close();
-
-      // Wait for worker to finish processing all packets
-      if (this.workerPromise) {
-        await this.workerPromise;
-      }
-
-      // Close output queue to signal end of stream to pipeTo() task
-      this.outputQueue.close();
-
-      // Wait for pipeTo() task to finish processing all packets (if exists)
-      if (this.pipeToPromise) {
-        await this.pipeToPromise;
-      }
-
-      // Then propagate flush to next component
-      if (this.nextComponent) {
-        await this.nextComponent.sendToQueue(null);
-      }
-    }
-  }
-
-  /**
-   * Receive packet from output queue.
-   *
-   * @returns Packet from queue or null if closed
-   *
-   * @internal
-   */
-  async receiveFromQueue(): Promise<Packet | null> {
-    return await this.outputQueue.receive();
-  }
-
-  /**
-   * Worker loop for push-based processing.
-   *
-   * @internal
-   */
-  private async runWorker(): Promise<void> {
-    try {
-      // Outer loop - receive packets
-      while (!this.inputQueue.isClosed) {
-        using packet = await this.inputQueue.receive();
-        if (!packet) break;
-
-        if (this.isClosed) {
-          break;
-        }
-
-        // Send packet to filter
-        const sendRet = await this.ctx.sendPacket(packet);
-
-        // Handle EAGAIN
-        if (sendRet === AVERROR_EAGAIN) {
-          // Filter buffer full, receive packets first
-          while (!this.outputQueue.isClosed) {
-            const outPacket = await this.receive();
-            if (!outPacket) break;
-            await this.outputQueue.send(outPacket);
-          }
-
-          // Retry sending
-          const retryRet = await this.ctx.sendPacket(packet);
-          if (retryRet < 0 && retryRet !== AVERROR_EOF && retryRet !== AVERROR_EAGAIN) {
-            FFmpegError.throwIfError(retryRet, 'Failed to send packet to bitstream filter');
-          }
-        } else if (sendRet < 0 && sendRet !== AVERROR_EOF) {
-          FFmpegError.throwIfError(sendRet, 'Failed to send packet to bitstream filter');
-        }
-
-        // Receive ALL available packets immediately
-        while (!this.outputQueue.isClosed) {
-          const outPacket = await this.receive();
-          if (!outPacket) break;
-          await this.outputQueue.send(outPacket);
-        }
-      }
-
-      // Flush filter at end
-      await this.flush();
-      while (!this.outputQueue.isClosed) {
-        const outPacket = await this.receive();
-        if (!outPacket) break;
-        await this.outputQueue.send(outPacket);
-      }
-    } catch (error) {
-      // Propagate error to both queues so upstream and downstream know
-      const err = error instanceof Error ? error : new Error(String(error));
-      this.inputQueue?.closeWithError(err);
-      this.outputQueue?.closeWithError(err);
-    } finally {
-      // Close output queue when done (if not already closed with error)
-      this.outputQueue?.close();
     }
   }
 
@@ -1287,6 +1054,309 @@ export class BitStreamFilterAPI implements Disposable {
 
       // Return scheduler for chaining (target is now the last component)
       return new Scheduler<Packet>(this as unknown as SchedulableComponent<Packet>, t);
+    }
+  }
+
+  /**
+   * Flush all buffered packets as async generator.
+   *
+   * Convenient async iteration over remaining packets.
+   * Automatically sends flush signal and retrieves buffered packets.
+   * Useful for end-of-stream processing.
+   *
+   * @yields {Packet} Buffered packets
+   *
+   * @example
+   * ```typescript
+   * // Flush at end of filtering
+   * for await (const packet of filter.flushPackets()) {
+   *   console.log('Processing buffered packet');
+   *   await output.writePacket(packet);
+   *   packet.free();
+   * }
+   * ```
+   *
+   * @see {@link filter} For filtering packets
+   * @see {@link flush} For signaling end-of-stream
+   * @see {@link flushPacketsSync} For synchronous version
+   */
+  async *flushPackets(): AsyncGenerator<Packet> {
+    while (true) {
+      const packet = await this.receive();
+      if (!packet) break;
+      yield packet;
+    }
+  }
+
+  /**
+   * Flush all buffered packets as generator synchronously.
+   * Synchronous version of flushPackets.
+   *
+   * Convenient sync iteration over remaining packets.
+   * Automatically retrieves buffered packets after flush.
+   * Useful for end-of-stream processing.
+   *
+   * @yields {Packet} Buffered packets
+   *
+   * @example
+   * ```typescript
+   * // Flush at end of filtering
+   * for (const packet of filter.flushPacketsSync()) {
+   *   console.log('Processing buffered packet');
+   *   output.writePacketSync(packet);
+   *   packet.free();
+   * }
+   * ```
+   *
+   * @see {@link filterSync} For filtering packets
+   * @see {@link flushSync} For signaling end-of-stream
+   * @see {@link flushPackets} For async version
+   */
+  *flushPacketsSync(): Generator<Packet> {
+    while (true) {
+      const packet = this.receiveSync();
+      if (!packet) break;
+      yield packet;
+    }
+  }
+
+  /**
+   * Reset filter state.
+   *
+   * Clears internal buffers and resets filter.
+   * Does not dispose resources.
+   *
+   * Direct mapping to av_bsf_flush().
+   *
+   * @example
+   * ```typescript
+   * // Reset for new segment
+   * filter.reset();
+   * ```
+   *
+   * @see {@link flush} For reset with packet retrieval
+   */
+  reset(): void {
+    if (this.isClosed) {
+      return;
+    }
+
+    this.ctx.flush();
+  }
+
+  /**
+   * Close filter and free resources.
+   *
+   * Releases filter context and marks as closed.
+   * Safe to call multiple times.
+   *
+   * @example
+   * ```typescript
+   * filter.close();
+   * ```
+   *
+   * @see {@link Symbol.dispose} For automatic cleanup
+   */
+  close(): void {
+    if (this.isClosed) {
+      return;
+    }
+
+    this.isClosed = true;
+
+    this.inputQueue.close();
+    this.outputQueue.close();
+
+    this.inputQueue.clear();
+    this.outputQueue.clear();
+
+    this.packet.free();
+    this.ctx.free();
+  }
+
+  /**
+   * Dispose of filter.
+   *
+   * Implements Disposable interface for automatic cleanup.
+   * Equivalent to calling dispose().
+   *
+   * @example
+   * ```typescript
+   * {
+   *   using filter = BitStreamFilterAPI.create('h264_mp4toannexb', stream);
+   *   // Use filter...
+   * } // Automatically disposed
+   * ```
+   *
+   * @see {@link close} For manual cleanup
+   */
+  [Symbol.dispose](): void {
+    this.close();
+  }
+
+  /**
+   * Bind input parameters from the source and initialize the filter.
+   *
+   * @internal
+   */
+  private ensureInitialized(): void {
+    if (this.initialized) {
+      return;
+    }
+
+    const params = this.ctx.inputCodecParameters;
+    if (!params) {
+      throw new Error('Failed to get input codec parameters from filter context');
+    }
+
+    const source = this.source;
+    if (source instanceof Stream) {
+      source.codecpar.copy(params);
+      this.ctx.inputTimeBase = source.timeBase;
+    } else if (source instanceof Encoder) {
+      const codecContext = source.getCodecContext();
+      if (!codecContext) {
+        throw new Error('Encoder is not initialized yet; cannot derive bitstream filter parameters.');
+      }
+      const ret = params.fromContext(codecContext);
+      FFmpegError.throwIfError(ret, 'Failed to derive bitstream filter parameters from encoder');
+      this.ctx.inputTimeBase = codecContext.timeBase;
+    } else {
+      // Upstream is another bitstream filter: chain from its output.
+      source.ensureInitialized();
+      const upstream = source.outputCodecParameters;
+      if (!upstream) {
+        throw new Error('Upstream bitstream filter has no output parameters.');
+      }
+      upstream.copy(params);
+      const tb = source.outputTimeBase;
+      if (tb) {
+        this.ctx.inputTimeBase = tb;
+      }
+    }
+
+    const initRet = this.ctx.init();
+    FFmpegError.throwIfError(initRet, 'Failed to initialize bitstream filter');
+    this.initialized = true;
+  }
+
+  /**
+   * Send packet to input queue or flush the pipeline.
+   *
+   * When packet is provided, queues it for filtering.
+   * When null is provided, triggers flush sequence:
+   * - Closes input queue
+   * - Waits for worker completion
+   * - Closes output queue (no buffering, bitstream filters are stateless)
+   * - Waits for pipeTo task completion
+   * - Propagates flush to next component (if any)
+   *
+   * Used by scheduler system for pipeline control.
+   *
+   * @param packet - Packet to send, or null to flush
+   *
+   * @internal
+   */
+  private async sendToQueue(packet: Packet | null): Promise<void> {
+    if (packet) {
+      await this.inputQueue.send(packet);
+    } else {
+      // Close input queue to signal end of stream to worker
+      this.inputQueue.close();
+
+      // Wait for worker to finish processing all packets
+      if (this.workerPromise) {
+        await this.workerPromise;
+      }
+
+      // Close output queue to signal end of stream to pipeTo() task
+      this.outputQueue.close();
+
+      // Wait for pipeTo() task to finish processing all packets (if exists)
+      if (this.pipeToPromise) {
+        await this.pipeToPromise;
+      }
+
+      // Then propagate flush to next component
+      if (this.nextComponent) {
+        await this.nextComponent.sendToQueue(null);
+      }
+    }
+  }
+
+  /**
+   * Receive packet from output queue.
+   *
+   * @returns Packet from queue or null if closed
+   *
+   * @internal
+   */
+  private async receiveFromQueue(): Promise<Packet | null> {
+    return await this.outputQueue.receive();
+  }
+
+  /**
+   * Worker loop for push-based processing.
+   *
+   * @internal
+   */
+  private async runWorker(): Promise<void> {
+    try {
+      // Outer loop - receive packets
+      while (!this.inputQueue.isClosed) {
+        using packet = await this.inputQueue.receive();
+        if (!packet) break;
+
+        if (this.isClosed) {
+          break;
+        }
+
+        this.ensureInitialized();
+
+        // Send packet to filter
+        const sendRet = await this.ctx.sendPacket(packet);
+
+        // Handle EAGAIN
+        if (sendRet === AVERROR_EAGAIN) {
+          // Filter buffer full, receive packets first
+          while (!this.outputQueue.isClosed) {
+            const outPacket = await this.receive();
+            if (!outPacket) break;
+            await this.outputQueue.send(outPacket);
+          }
+
+          // Retry sending
+          const retryRet = await this.ctx.sendPacket(packet);
+          if (retryRet < 0 && retryRet !== AVERROR_EOF && retryRet !== AVERROR_EAGAIN) {
+            FFmpegError.throwIfError(retryRet, 'Failed to send packet to bitstream filter');
+          }
+        } else if (sendRet < 0 && sendRet !== AVERROR_EOF) {
+          FFmpegError.throwIfError(sendRet, 'Failed to send packet to bitstream filter');
+        }
+
+        // Receive ALL available packets immediately
+        while (!this.outputQueue.isClosed) {
+          const outPacket = await this.receive();
+          if (!outPacket) break;
+          await this.outputQueue.send(outPacket);
+        }
+      }
+
+      // Flush filter at end
+      await this.flush();
+      while (!this.outputQueue.isClosed) {
+        const outPacket = await this.receive();
+        if (!outPacket) break;
+        await this.outputQueue.send(outPacket);
+      }
+    } catch (error) {
+      // Propagate error to both queues so upstream and downstream know
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.inputQueue?.closeWithError(err);
+      this.outputQueue?.closeWithError(err);
+    } finally {
+      // Close output queue when done (if not already closed with error)
+      this.outputQueue?.close();
     }
   }
 }

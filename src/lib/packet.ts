@@ -158,6 +158,17 @@ export class Packet implements Disposable, NativeWrapper<NativePacket> {
   }
 
   /**
+   * Bytes of native payload this packet currently reports to V8's GC via
+   * `napi_adjust_external_memory`. Exposed only so the accounting can be
+   * asserted in tests; the value is not observable through V8 heap statistics.
+   *
+   * @internal
+   */
+  get reportedExternalMemory(): number {
+    return this.native.reportedExternalMemory;
+  }
+
+  /**
    * Packet flags.
    *
    * Combination of AV_PKT_FLAG values indicating packet properties
@@ -253,6 +264,12 @@ export class Packet implements Disposable, NativeWrapper<NativePacket> {
    *
    * Direct mapping to av_packet_ref().
    *
+   * IMPORTANT: per FFmpeg's contract, this packet (the destination) is completely
+   * overwritten - it MUST be unreferenced or freshly allocated before calling.
+   * Re-using a packet as the destination without {@link unref} first leaks its
+   * previous buffer and side data. When reusing one packet across a loop, call
+   * `packet.unref()` before each `packet.ref(src)`.
+   *
    * @param src - Source packet to reference
    *
    * @returns 0 on success, negative AVERROR on error:
@@ -263,14 +280,14 @@ export class Packet implements Disposable, NativeWrapper<NativePacket> {
    * ```typescript
    * import { FFmpegError } from 'node-av';
    *
-   * const packet2 = new Packet();
-   * packet2.alloc();
+   * // Reusing one packet across a loop: unref before re-referencing.
+   * packet2.unref();
    * const ret = packet2.ref(packet1);
    * FFmpegError.throwIfError(ret, 'ref');
    * // packet2 now references packet1's data
    * ```
    *
-   * @see {@link unref} To remove reference
+   * @see {@link unref} To remove reference (call before re-referencing a reused packet)
    * @see {@link clone} To create independent copy
    */
   ref(src: Packet): number {

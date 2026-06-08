@@ -55,6 +55,12 @@ import type { ChannelLayout, IRational } from './types.js';
 export interface NativePacket extends Disposable {
   readonly __brand: 'NativePacket';
 
+  /**
+   * Test hook: bytes currently reported to V8 via napi_adjust_external_memory.
+   *
+   * @internal
+   */
+  readonly reportedExternalMemory: number;
   readonly size: number;
   streamIndex: number;
   pts: bigint;
@@ -93,6 +99,12 @@ export interface NativePacket extends Disposable {
 export interface NativeFrame extends Disposable {
   readonly __brand: 'NativeFrame';
 
+  /**
+   * Test hook: bytes currently reported to V8 via napi_adjust_external_memory.
+   *
+   * @internal
+   */
+  readonly reportedExternalMemory: number;
   readonly channels: number;
   readonly linesize: number[];
   readonly data: Buffer[] | null;
@@ -146,6 +158,7 @@ export interface NativeFrame extends Disposable {
   getMetadata(): NativeDictionary;
   applyCropping(flags?: number): number;
   importIOSurface(handleData: Buffer, hwFramesCtx: NativeHardwareFramesContext): number;
+  exportIOSurface(): Buffer | null;
   importNSImage(handleData: Buffer): number;
   importD3D11Texture(handleData: Buffer, hwDeviceCtx: NativeHardwareDeviceContext): number;
   importDmaBuf(planes: { fd: number; stride: number; offset: number; size: number }[], width: number, height: number, modifier: bigint, swFormat: AVPixelFormat): number;
@@ -182,6 +195,22 @@ export interface NativeCodec {
   isDecoder(): boolean;
   isExperimental(): boolean;
   getHwConfig(index: number): { pixFmt: AVPixelFormat; methods: number; deviceType: AVHWDeviceType } | null;
+  getOptions(): NativeCodecOption[];
+}
+
+/**
+ * A single private (codec-specific) AVOption entry, as returned by
+ * {@link NativeCodec.getOptions}.
+ */
+export interface NativeCodecOption {
+  name: string;
+  help: string | null;
+  type: AVOptionType;
+  flags: number;
+  unit: string | null;
+  min: number;
+  max: number;
+  default: number | string | { num: number; den: number } | null;
 }
 
 /**
@@ -667,6 +696,34 @@ export interface NativeSoftwareScaleContext extends Disposable {
 export interface NativeFrameUtils extends Disposable {
   readonly __brand: 'NativeFrameUtils';
   process(buffer: Buffer, options: ImageOptions): Buffer;
+  close(): void;
+}
+
+/**
+ * Native Scaler binding interface.
+ *
+ * AVFrame scaler/cropper/converter with pooled SwsContexts.
+ *
+ * @internal
+ */
+export interface NativeScaler {
+  readonly __brand: 'NativeScaler';
+  process(
+    frame: NativeFrame,
+    options: {
+      crop?: { x: number; y: number; width: number; height: number };
+      resize?: { width: number; height: number };
+      format?: string;
+    },
+  ): Promise<Buffer>;
+  processSync(
+    frame: NativeFrame,
+    options: {
+      crop?: { x: number; y: number; width: number; height: number };
+      resize?: { width: number; height: number };
+      format?: string;
+    },
+  ): Buffer;
   close(): void;
 }
 

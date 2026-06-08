@@ -766,6 +766,17 @@ export class Frame implements Disposable, NativeWrapper<NativeFrame> {
   }
 
   /**
+   * Bytes of native buffer memory this frame currently reports to V8's GC via
+   * `napi_adjust_external_memory`. Exposed only so the accounting can be
+   * asserted in tests; the value is not observable through V8 heap statistics.
+   *
+   * @internal
+   */
+  get reportedExternalMemory(): number {
+    return this.native.reportedExternalMemory;
+  }
+
+  /**
    * Hardware frames context.
    *
    * Reference to hardware frames context for GPU frames.
@@ -1079,6 +1090,12 @@ export class Frame implements Disposable, NativeWrapper<NativeFrame> {
    *
    * Direct mapping to av_frame_ref().
    *
+   * IMPORTANT: per FFmpeg's contract, this frame (the destination) MUST be
+   * unreferenced or freshly allocated before calling. Re-using a frame as the
+   * destination without {@link unref} first leaks its previous buffers (the old
+   * references are overwritten, not freed). When reusing one frame across a loop,
+   * call `frame.unref()` before each `frame.ref(src)`.
+   *
    * @param src - Source frame to reference
    *
    * @returns 0 on success, negative AVERROR on error:
@@ -1089,14 +1106,14 @@ export class Frame implements Disposable, NativeWrapper<NativeFrame> {
    * ```typescript
    * import { FFmpegError } from 'node-av';
    *
-   * const frame2 = new Frame();
-   * frame2.alloc();
+   * // Reusing one frame across a loop: unref before re-referencing.
+   * frame2.unref();
    * const ret = frame2.ref(frame1);
    * FFmpegError.throwIfError(ret, 'ref');
    * // frame2 now references frame1's data
    * ```
    *
-   * @see {@link unref} To remove reference
+   * @see {@link unref} To remove reference (call before re-referencing a reused frame)
    * @see {@link clone} To create independent copy
    */
   ref(src: Frame): number {
@@ -1491,6 +1508,38 @@ export class Frame implements Disposable, NativeWrapper<NativeFrame> {
    */
   isSwFrame(): boolean {
     return this.native.isSwFrame();
+  }
+
+  /**
+   * Export the IOSurface backing a decoded VideoToolbox frame (macOS only).
+   *
+   * Returns the `IOSurfaceRef` carried by an `AV_PIX_FMT_VIDEOTOOLBOX` frame as
+   * an 8-byte pointer Buffer — the same handle format accepted by
+   * {@link Frame.fromIOSurface}. This enables zero-copy interop with Metal /
+   * CoreVideo (e.g. feeding a hardware-decoded frame into a GPU compositor)
+   * without a GPU→CPU readback.
+   *
+   * Returns `null` when the frame is not a decoded VideoToolbox hardware frame,
+   * has no backing IOSurface, or on non-macOS platforms.
+   *
+   * **Lifetime:** the IOSurface stays owned by the frame's `CVPixelBuffer`.
+   * Keep this `Frame` alive while using the handle. If the surface must outlive
+   * the frame, retain it separately (e.g. `IOSurfaceIncrementUseCount`).
+   *
+   * @returns IOSurfaceRef pointer as Buffer, or null if not available
+   *
+   * @example
+   * ```typescript
+   * const handle = frame.exportIOSurface();
+   * if (handle) {
+   *   // Pass to a Metal-based compositor; keep `frame` alive while in use.
+   * }
+   * ```
+   *
+   * @see {@link fromIOSurface} For the inverse (import) direction
+   */
+  exportIOSurface(): Buffer | null {
+    return this.native.exportIOSurface();
   }
 
   /**

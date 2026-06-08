@@ -1257,6 +1257,57 @@ export function avChannelLayoutDescribe(channelLayout: Partial<ChannelLayout>): 
 }
 
 /**
+ * Get the default channel layout for a given number of channels.
+ *
+ * Returns the canonical native layout FFmpeg uses for that channel count
+ * (e.g. 1 → mono, 2 → stereo, 6 → 5.1). Useful to turn an unspecified layout
+ * (order `AV_CHANNEL_ORDER_UNSPEC`, common for PCM) into a concrete one.
+ *
+ * Direct mapping to av_channel_layout_default().
+ *
+ * @param nbChannels - Number of channels
+ *
+ * @returns The default channel layout for that channel count
+ *
+ * @example
+ * ```typescript
+ * const stereo = avChannelLayoutDefault(2); // { order: 1, nbChannels: 2, mask: 3n }
+ * ```
+ *
+ * @see [av_channel_layout_default](https://ffmpeg.org/doxygen/7.1/group__lavu__audio__channels.html) - FFmpeg Doxygen
+ */
+export function avChannelLayoutDefault(nbChannels: number): ChannelLayout {
+  return bindings.avChannelLayoutDefault(nbChannels);
+}
+
+/**
+ * Pick the best-matching pixel format from a list for a given source format.
+ *
+ * Chooses the format from `pixFmtList` that converting `srcPixFmt` to incurs the
+ * least loss (color depth, chroma subsampling, alpha). Useful to select a
+ * codec-supported target pixel format that preserves as much of the source as
+ * possible (e.g. yuv422p over yuv420p when the input is yuv444p).
+ *
+ * Direct mapping to avcodec_find_best_pix_fmt_of_list().
+ *
+ * @param pixFmtList - Candidate pixel formats (e.g. a codec's supported formats)
+ *
+ * @param srcPixFmt - Source pixel format to convert from
+ *
+ * @returns The least-loss pixel format from the list
+ *
+ * @example
+ * ```typescript
+ * const target = avcodecFindBestPixFmtOfList(codec.pixelFormats, frame.format);
+ * ```
+ *
+ * @see [avcodec_find_best_pix_fmt_of_list](https://ffmpeg.org/doxygen/7.1/group__lavc__misc__pixfmt.html) - FFmpeg Doxygen
+ */
+export function avcodecFindBestPixFmtOfList(pixFmtList: AVPixelFormat[], srcPixFmt: AVPixelFormat): AVPixelFormat {
+  return bindings.avcodecFindBestPixFmtOfList(pixFmtList, srcPixFmt);
+}
+
+/**
  * Create SDP from format contexts.
  *
  * Creates an SDP (Session Description Protocol) string from format contexts.
