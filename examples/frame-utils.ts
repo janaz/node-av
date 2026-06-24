@@ -20,8 +20,9 @@ import { fileURLToPath } from 'url';
 
 import { FrameUtils } from '../src/lib/frame-utils.js';
 
-import type { Channels } from 'sharp';
 import type { ImageOptions } from '../src/lib/frame-utils.js';
+
+type Channels = 1 | 2 | 3 | 4;
 
 async function benchmark() {
   const __filename = fileURLToPath(import.meta.url);

@@ -236,6 +236,27 @@ export interface DemuxerOptions<F extends DemuxerFormat | (string & {}) = Demuxe
   options?: DemuxerOptionsFor<F>;
 
   /**
+   * Configure the underlying format context just after the input is opened.
+   *
+   * Called with the input {@link FormatContext} after `avformat_open_input` and
+   * `avformat_find_stream_info` (so the streams are available) and before any
+   * packets are read. Use it to inspect or tweak the open input context or its
+   * streams directly. Most input-side tuning (probesize, analyzeduration,
+   * protocol options, …) is better passed via {@link DemuxerOptions.options},
+   * which is applied at open time.
+   *
+   * @example
+   * ```typescript
+   * await Demuxer.open('input.mp4', {
+   *   configure: (fmt) => {
+   *     console.log(`Opened ${fmt.streams.length} streams`);
+   *   },
+   * });
+   * ```
+   */
+  configure?: (context: FormatContext) => void;
+
+  /**
    * AbortSignal for cancellation.
    *
    * When aborted, async generators stop yielding and async methods throw AbortError.
@@ -323,7 +344,7 @@ export class Demuxer implements AsyncDisposable, Disposable {
   private _streams: Stream[] = [];
   private ioContext?: IOContext;
   private isClosed = false;
-  private options: Required<Omit<DemuxerOptions, 'signal'>>;
+  private options: Required<Omit<DemuxerOptions, 'signal' | 'configure'>>;
 
   // Timestamp processing state (per-stream)
   private streamStates = new Map<number, StreamState>();
@@ -351,7 +372,7 @@ export class Demuxer implements AsyncDisposable, Disposable {
    *
    * @internal
    */
-  private constructor(formatContext: FormatContext, options: Required<Omit<DemuxerOptions, 'signal'>>, ioContext?: IOContext) {
+  private constructor(formatContext: FormatContext, options: Required<Omit<DemuxerOptions, 'signal' | 'configure'>>, ioContext?: IOContext) {
     this.formatContext = formatContext;
     this.ioContext = ioContext;
     this._streams = formatContext.streams ?? [];
@@ -763,6 +784,8 @@ export class Demuxer implements AsyncDisposable, Disposable {
         }
       }
 
+      options.configure?.(formatContext);
+
       // Determine buffer size
       let bufferSize = options.bufferSize ?? IO_BUFFER_SIZE;
       if (!ioContext && formatContext.iformat && formatContext.pb) {
@@ -774,7 +797,7 @@ export class Demuxer implements AsyncDisposable, Disposable {
       }
 
       // Apply defaults to options
-      const fullOptions: Required<Omit<DemuxerOptions, 'signal'>> = {
+      const fullOptions: Required<Omit<DemuxerOptions, 'signal' | 'configure'>> = {
         bufferSize,
         format: options.format ?? '',
         skipStreamInfo: options.skipStreamInfo ?? false,
@@ -1013,6 +1036,8 @@ export class Demuxer implements AsyncDisposable, Disposable {
         FFmpegError.throwIfError(ret, 'Failed to find stream info');
       }
 
+      options.configure?.(formatContext);
+
       // Determine buffer size
       let bufferSize = options.bufferSize ?? IO_BUFFER_SIZE;
       if (!ioContext && formatContext.iformat && formatContext.pb) {
@@ -1024,7 +1049,7 @@ export class Demuxer implements AsyncDisposable, Disposable {
       }
 
       // Apply defaults to options
-      const fullOptions: Required<Omit<DemuxerOptions, 'signal'>> = {
+      const fullOptions: Required<Omit<DemuxerOptions, 'signal' | 'configure'>> = {
         bufferSize,
         format: options.format ?? '',
         skipStreamInfo: options.skipStreamInfo ?? false,
@@ -2017,20 +2042,6 @@ export class Demuxer implements AsyncDisposable, Disposable {
       packet.alloc();
 
       while (this.demuxThreadActive && !this.isClosed) {
-        // Check if all queues are full - if so, wait a bit
-        let allQueuesFull = true;
-        for (const queue of this.packetQueues.values()) {
-          if (queue.length < MAX_INPUT_QUEUE_SIZE) {
-            allQueuesFull = false;
-            break;
-          }
-        }
-
-        if (allQueuesFull) {
-          await new Promise(setImmediate);
-          continue;
-        }
-
         // Read next packet
         const ret = await this.formatContext.readFrame(packet);
 
@@ -2067,25 +2078,53 @@ export class Demuxer implements AsyncDisposable, Disposable {
           this.dtsPredict(packet, stream);
         }
 
-        // Find which queues need this packet
+        // Find which queues need this packet. Select by existence, not by
+        // fullness: each consumer registers a queue for its stream and needs
+        // EVERY packet of that stream. Only streams with no registered consumer
+        // (e.g. a subtitle track absent from the pipeline) are skipped here.
         const allQueue = this.packetQueues.get('all');
         const streamQueue = this.packetQueues.get(packet.streamIndex);
 
         const targetQueues: { queue: Packet[]; event: string }[] = [];
 
-        if (allQueue && allQueue.length < MAX_INPUT_QUEUE_SIZE) {
+        if (allQueue) {
           targetQueues.push({ queue: allQueue, event: 'packet-all' });
         }
 
         // Only add stream queue if it's different from 'all' queue
-        if (streamQueue && streamQueue !== allQueue && streamQueue.length < MAX_INPUT_QUEUE_SIZE) {
+        if (streamQueue && streamQueue !== allQueue) {
           targetQueues.push({ queue: streamQueue, event: `packet-${packet.streamIndex}` });
         }
 
         if (targetQueues.length === 0) {
-          // No queue needs this packet, skip it
+          // No consumer for this stream, skip it
           packet.unref();
           continue;
+        }
+
+        // Backpressure: if a target queue is full, wait until the consumer drains
+        // it instead of dropping the packet. Dropping loses reference frames and
+        // corrupts decoding (e.g. H.264 "missing reference picture") - the bug
+        // that surfaced with multi-stream pipelines where one stream (video)
+        // decodes slower than the other (audio). The read loop is paced by the
+        // slowest consumer; faster consumers simply idle on an empty queue.
+        while (this.demuxThreadActive && !this.isClosed) {
+          let queueFull = false;
+          for (const target of targetQueues) {
+            if (target.queue.length >= MAX_INPUT_QUEUE_SIZE) {
+              queueFull = true;
+              break;
+            }
+          }
+          if (!queueFull) {
+            break;
+          }
+          await new Promise(setImmediate);
+        }
+
+        if (!this.demuxThreadActive || this.isClosed) {
+          packet.unref();
+          break;
         }
 
         // Clone once, then share reference for additional queues
