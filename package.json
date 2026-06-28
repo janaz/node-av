@@ -1,6 +1,6 @@
 {
   "name": "@revizly/node-av",
-  "version": "6.1.0-beta.2-revizly1",
+  "version": "6.1.1-beta.1-revizly1",
   "description": "FFmpeg bindings for Node.js",
   "author": "seydx (https://github.com/seydx/node-av)",
   "type": "module",
@@ -76,12 +76,12 @@
   },
   "dependencies": {},
   "optionalDependencies": {
-    "@revizly/node-av-linux-arm64": "^6.1.0-beta.2-revizly1",
-    "@revizly/node-av-linux-x64": "^6.1.0-beta.2-revizly1"
+    "@revizly/node-av-linux-arm64": "^6.1.1-beta.1-revizly1",
+    "@revizly/node-av-linux-x64": "^6.1.1-beta.1-revizly1"
   },
   "devDependencies": {
     "@stylistic/eslint-plugin": "^5.10.0",
-    "@types/node": "^26.0.0",
+    "@types/node": "^26.0.1",
     "@types/node-abi": "^3.0.3",
     "@types/semver": "^7.7.1",
     "@types/ws": "^8.18.1",
@@ -90,11 +90,11 @@
     "cpy-cli": "^7.0.0",
     "cross-env": "^10.1.0",
     "eslint": "9.39.2",
-    "eslint-plugin-jsdoc": "^63.0.7",
+    "eslint-plugin-jsdoc": "^63.0.10",
     "globals": "^17.7.0",
-    "node-addon-api": "^8.8.0",
+    "node-addon-api": "^8.9.0",
     "node-gyp": "^13.0.0",
-    "prettier": "^3.8.4",
+    "prettier": "^3.8.5",
     "rimraf": "^6.1.3",
     "sharp": "^0.35.2",
     "tsx": "^4.22.4",

@@ -4,7 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [6.1.0-beta.2] - 2026-06-23
+## [6.1.1-beta.1] - 2026-06-28
+
+### Added
+
+- **`Demuxer.interrupt()`** aborts an in-progress blocking read (e.g. `av_read_frame` on a quiet RTSP/network source) without freeing the demuxer, so an active pipeline can drain and shut down before `close()`. `PipelineControl.stop()` now calls it on the source demuxer(s) automatically.
+
+### Fixed
+
+- **`RTPStream` / `FMP4Stream` / `pipeline().stop()` could hang on teardown of a live source.** `stop()` awaited the pipeline's completion before closing the input, but a blocking read on a quiet RTSP/network source only unblocks when the input is interrupted — so completion waited for the read while the read waited to be unblocked (deadlock). `PipelineControl.stop()` now interrupts the source demuxer's read (via the new `Demuxer.interrupt()`), so the pipeline drains and completion resolves before close. A related teardown deadlock in the per-stream backpressure loop (a full queue whose consumer had already stopped starved the other streams) is fixed too.
+- **Aborting a `Demuxer`'s `signal` now cancels an in-progress blocking read.** The abort handler previously only flagged the read loop to stop, leaving the demux thread parked in `av_read_frame()` until data happened to arrive; it now interrupts the read so cancellation takes effect immediately.
+
+## [6.1.0] - 2026-06-27
 
 ### Added
 
@@ -17,6 +28,7 @@ All notable changes to this project will be documented in this file.
     configure: (ctx) => { ctx.codecTag = 'hvc1'; }, // imperative escape (-tag:v hvc1)
   });
   ```
+- **`HardwareContext.auto()` accepts a `prefer` option** to prioritise specific hardware type(s) over the platform default order, e.g. `auto({ prefer: AV_HWDEVICE_TYPE_VAAPI })` to pick VAAPI ahead of QSV on Intel. Preferred types are tested first (and kept only if available), then the usual platform fallback applies.
 - **Bitstream filter extradata is now reflected in the output parameters.** Filters that adapt container framing (`aac_adtstoasc`, `extract_extradata`, `dump_extra`, `*_mp4toannexb`) emit the resulting global headers as packet side data rather than on `par_out`. `BitStreamFilterAPI.outputCodecParameters` now folds that side data in, so a stream copy that relies on it (including `Muxer`'s `bsf` option) writes a header with the correct codec configuration.
 
 ### Changed
