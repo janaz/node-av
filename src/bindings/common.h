@@ -3,6 +3,7 @@
 
 #include <napi.h>
 #include <memory>
+#include <string>
 
 // Fix for glibc > 2.31 compatibility
 // These _finite functions were removed but FFmpeg might still reference them
@@ -71,20 +72,39 @@ inline Napi::Object RationalToJS(const Napi::Env& env, const AVRational& r) {
   return obj;
 }
 
+// True while the env can still execute JS. After worker.terminate() the worker's
+// loop drains pending async completions, but every JS-entering napi call fails
+// and node-addon-api escalates that failure to a process-fatal abort - completion
+// handlers (OnOK/OnError) must bail out instead of touching their promises.
+// napi_get_named_property carries the can_call_into_js guard; napi_get_global
+// does not, so the combination probes the state without side effects.
+inline bool CanCallIntoJs(Napi::Env env) {
+  napi_value global;
+  if (napi_get_global(env, &global) != napi_ok) {
+    return false;
+  }
+  napi_value probe;
+  return napi_get_named_property(env, global, "undefined", &probe) == napi_ok;
+}
+
 template<typename T>
 T* UnwrapNativeObject(const Napi::Env& env, const Napi::Value& value, const char* typeName) {
   if (!value.IsObject()) {
     return nullptr;
   }
-  
+
   Napi::Object obj = value.As<Napi::Object>();
-  
-  // Try to unwrap directly - if it fails, it's not the right type
-  try {
-    return Napi::ObjectWrap<T>::Unwrap(obj);
-  } catch (...) {
+
+  // napi_unwrap returns the wrapped pointer for ANY ObjectWrap instance regardless
+  // of its class, so an instanceof check is required before reinterpreting it as T.
+  // Deliberately does not throw: callers throw their own TypeError on nullptr, and a
+  // second ThrowAsJavaScriptException while one is pending is fatal with
+  // NAPI_DISABLE_CPP_EXCEPTIONS.
+  if (T::constructor.IsEmpty() || !obj.InstanceOf(T::constructor.Value())) {
     return nullptr;
   }
+
+  return Napi::ObjectWrap<T>::Unwrap(obj);
 }
 
 } // namespace ffmpeg

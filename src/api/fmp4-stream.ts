@@ -6,12 +6,13 @@ import {
   AV_CODEC_ID_HEVC,
   AV_CODEC_ID_OPUS,
   AV_HWDEVICE_TYPE_NONE,
+  AV_PIX_FMT_YUV420P,
   AV_SAMPLE_FMT_FLTP,
 } from '../constants/constants.js';
 import { FF_ENCODER_AAC, FF_ENCODER_LIBX264 } from '../constants/encoders.js';
 import { Codec } from '../lib/codec.js';
 import { Rational } from '../lib/rational.js';
-import { avGetCodecString } from '../lib/utilities.js';
+import { avGetCodecString, avGetPixFmtName } from '../lib/utilities.js';
 import { Decoder } from './decoder.js';
 import { Demuxer } from './demuxer.js';
 import { Encoder } from './encoder.js';
@@ -20,8 +21,10 @@ import { FilterAPI } from './filter.js';
 import { HardwareContext } from './hardware.js';
 import { Muxer } from './muxer.js';
 import { consumeStreamInParallel, pipeline, PipelineControlImpl } from './pipeline.js';
+import { pickSupportedPixelFormat } from './utilities/codec-format.js';
 
-import type { AVCodecID, AVHWDeviceType, FFHWDeviceType } from '../constants/index.js';
+import type { CodecContext } from '../lib/codec-context.js';
+import type { AVCodecID, AVHWDeviceType, AVPixelFormat, FFHWDeviceType } from '../constants/index.js';
 import type { DemuxerOptions } from './demuxer.js';
 import type { EncoderOptions } from './encoder.js';
 import type { IOOutputCallbacks } from './io-stream.js';
@@ -77,10 +80,10 @@ export interface MP4Box {
   /** Four-character code identifying the box type (e.g., 'ftyp', 'moov', 'moof') */
   type: MP4BoxType;
 
-  /** Total size of the box in bytes (including 8-byte header) */
+  /** Total size of the box in bytes (including the 8-byte header, or 16-byte for 64-bit boxes) */
   size: number;
 
-  /** Box payload data (excluding the 8-byte header) */
+  /** Box payload data (excluding the 8-byte header, or 16-byte for 64-bit boxes) */
   data: Buffer;
 
   /** Offset of this box in the original buffer */
@@ -142,12 +145,54 @@ export interface FMP4StreamOptions {
 
   /**
    * Fragment duration in microseconds.
+   *
+   * Passed to the mp4 muxer as `frag_duration`, which creates a new fragment
+   * whenever the current one exceeds this duration (in addition to any cuts
+   * requested via movFlags such as `frag_keyframe`).
    * Smaller values reduce latency but increase overhead.
    * Set to 1 to send data as soon as possible.
    *
    * @default 1
+   *
+   * @example
+   * ```typescript
+   * const stream = FMP4Stream.create('rtsp://camera.local/stream', {
+   *   supportedCodecs: 'avc1.640029,mp4a.40.2',
+   *   fragDuration: 2_000_000, // 2 seconds in microseconds
+   * });
+   * ```
    */
   fragDuration?: number;
+
+  /**
+   * Maximum number of media fragments buffered for a {@link FMP4Stream.fragments}
+   * consumer before the oldest are dropped.
+   *
+   * Live sources (RTSP cameras) produce fragments at a fixed rate regardless of
+   * consumer speed. Without a bound, a slow or stalled consumer would grow the
+   * queue until the process runs out of memory. When the backlog exceeds this
+   * limit, the oldest media fragments are dropped (never the init segment,
+   * which is kept separately via {@link FMP4Stream.initSegment}) and
+   * {@link FMP4Stream.droppedFragments} is incremented.
+   *
+   * @default 16
+   *
+   * @example
+   * ```typescript
+   * const stream = FMP4Stream.create('rtsp://camera.local/stream', {
+   *   supportedCodecs: 'avc1.640029,mp4a.40.2',
+   *   boxMode: true,
+   *   maxQueuedFragments: 8,
+   * });
+   *
+   * await stream.start();
+   * for await (const fragment of stream.fragments()) {
+   *   await sendToClient(fragment.data); // Slow consumer - oldest fragments dropped
+   * }
+   * console.log(`Dropped ${stream.droppedFragments} fragments`);
+   * ```
+   */
+  maxQueuedFragments?: number;
 
   /**
    * Hardware acceleration configuration for video transcoding.
@@ -171,6 +216,7 @@ export interface FMP4StreamOptions {
     fps?: number;
     width?: number;
     height?: number;
+    bitrate?: number;
     encoderOptions?: EncoderOptions['options'];
   };
 
@@ -286,14 +332,17 @@ export class FMP4Stream {
   private signal?: AbortSignal;
   private supportedCodecs: Set<string>;
   private incompleteBoxBuffer: Buffer | null = null;
+  private abortHandler?: () => void;
   private fragmentQueue: {
     queue: FMP4Fragment[];
     resolve: ((value: IteratorResult<FMP4Fragment>) => void) | null;
     done: boolean;
   } | null = null;
 
+  private _droppedFragments = 0;
   private _initSegment: Buffer | null = null;
   private _initSegmentResolve: ((value: Buffer) => void) | null = null;
+  private _initSegmentReject: ((error: Error) => void) | null = null;
   private _initSegmentPromise: Promise<Buffer> | null = null;
   private _ftypData: Buffer | null = null;
   private _moovData: Buffer | null = null;
@@ -319,13 +368,11 @@ export class FMP4Stream {
     }
 
     const inputUrl = this.inputUrl ?? '';
+    const isLiveInput = /^(rtsp|rtmp|rtp|udp|srt|tcp|sctp):/i.test(inputUrl);
     this.inputOptions = {
       ...options.inputOptions,
       options: {
-        flags: 'low_delay',
-        fflags: 'nobuffer',
-        // analyzeduration: 0,
-        // probesize: 32,
+        ...(isLiveInput ? { flags: 'low_delay', fflags: 'nobuffer' } : {}),
         timeout: 10000000,
         rtsp_transport: inputUrl.toLowerCase().startsWith('rtsp') ? 'tcp' : undefined,
         ...options.inputOptions?.options,
@@ -343,6 +390,7 @@ export class FMP4Stream {
         fps: options.video?.fps,
         width: options.video?.width,
         height: options.video?.height,
+        bitrate: options.video?.bitrate,
         encoderOptions: options.video?.encoderOptions ?? {},
       },
       audio: {
@@ -350,6 +398,7 @@ export class FMP4Stream {
       },
       bufferSize: options.bufferSize ?? 2 * 1024 * 1024,
       boxMode: options.boxMode ?? false,
+      maxQueuedFragments: options.maxQueuedFragments ?? 16,
       movFlags: options.movFlags ?? '+frag_keyframe+separate_moof+default_base_moof+empty_moov',
     };
 
@@ -404,6 +453,8 @@ export class FMP4Stream {
    *
    * Only available when boxMode is enabled.
    * Resolves once the first ftyp and moov boxes have been received.
+   * Rejects if the stream fails or is stopped before the init segment
+   * was produced, so awaiting it never hangs.
    *
    * @throws {Error} If boxMode is not enabled
    */
@@ -411,14 +462,38 @@ export class FMP4Stream {
     if (!this.options.boxMode) {
       throw new Error('initSegment is only available in box mode');
     }
-    this._initSegmentPromise ??= new Promise<Buffer>((resolve) => {
+    this._initSegmentPromise ??= new Promise<Buffer>((resolve, reject) => {
       if (this._initSegment) {
         resolve(this._initSegment);
       } else {
         this._initSegmentResolve = resolve;
+        this._initSegmentReject = reject;
       }
     });
     return this._initSegmentPromise;
+  }
+
+  /**
+   * Number of media fragments dropped due to consumer backpressure.
+   *
+   * Incremented whenever the {@link fragments} backlog exceeds
+   * `maxQueuedFragments` and the oldest fragment is discarded.
+   * Reset to 0 when the stream is (re)started.
+   *
+   * @returns Total dropped fragments for the current run
+   *
+   * @example
+   * ```typescript
+   * for await (const fragment of stream.fragments()) {
+   *   await sendToClient(fragment.data);
+   *   if (stream.droppedFragments > 0) {
+   *     console.warn(`Consumer too slow: ${stream.droppedFragments} fragments dropped`);
+   *   }
+   * }
+   * ```
+   */
+  get droppedFragments(): number {
+    return this._droppedFragments;
   }
 
   /**
@@ -569,6 +644,8 @@ export class FMP4Stream {
   async start(): Promise<void> {
     this.startPromise ??= this.doStart().catch((error: unknown) => {
       this.startPromise = undefined;
+      // A pending initSegment consumer must not hang when startup fails.
+      this.rejectInitSegment(error instanceof Error ? error : new Error(String(error)));
       throw error;
     });
     await this.startPromise;
@@ -585,7 +662,16 @@ export class FMP4Stream {
     }
 
     this.signal?.throwIfAborted();
-    this.signal?.addEventListener('abort', () => this.stop(), { once: true });
+
+    // Store the handler so stop() can remove it - otherwise listeners would
+    // accumulate across restarts. Teardown errors are swallowed here: they are
+    // already surfaced via onClose(error) by the completion handler.
+    this.abortHandler = () => {
+      this.stop().catch(() => {});
+    };
+    this.signal?.addEventListener('abort', this.abortHandler, { once: true });
+
+    this._droppedFragments = 0;
 
     // Frame-source path: encode pre-composited frames directly (no demuxer/decoder).
     if (this.source) {
@@ -632,6 +718,8 @@ export class FMP4Stream {
 
       const needsFps = this.options.video.fps !== undefined && isFinite(currentFps) && this.options.video.fps !== currentFps;
 
+      const encoderCodec = this.hardwareContext?.getEncoderCodec('h264') ?? Codec.findEncoderByName(FF_ENCODER_LIBX264)!;
+
       // Create filter chain only if needed
       if (needsScale || needsFps) {
         const filterChain = FilterPreset.chain(this.hardwareContext);
@@ -648,15 +736,31 @@ export class FMP4Stream {
           filterChain.filter('fps', { fps: this.options.video.fps! });
         }
 
+        // Software scaling leaves the graph output format unconstrained, so swscale keeps the
+        // source format on both sides of the scale. Packed formats like yuyv422 can't be scaled
+        // in place (yuyv422 -> yuyv422 fails with ENOSYS), and the encoder wouldn't accept them
+        // anyway. Pin the output to yuv420p so the graph negotiates a real conversion: it is the
+        // one format every browser/player can decode via MSE (unlike e.g. the 4:2:2 High profile
+        // that a least-loss pick would choose for a yuyv422 source). Fall back to a codec-supported
+        // format only if the encoder genuinely can't take yuv420p. Hardware chains negotiate their
+        // format through the frames context instead.
+        if (needsScale && !this.hardwareContext) {
+          const formats = encoderCodec.pixelFormats;
+          const targetFmt =
+            !formats || formats.includes(AV_PIX_FMT_YUV420P) ? AV_PIX_FMT_YUV420P : pickSupportedPixelFormat(videoStream.codecpar.format as AVPixelFormat, formats);
+          const targetFmtName = avGetPixFmtName(targetFmt);
+          if (targetFmtName) {
+            filterChain.filter('format', { pix_fmts: targetFmtName });
+          }
+        }
+
         this.videoFilter = FilterAPI.create(filterChain.build(), {
           hardware: this.hardwareContext,
         });
       }
 
-      const encoderCodec = this.hardwareContext?.getEncoderCodec('h264') ?? Codec.findEncoderByName(FF_ENCODER_LIBX264)!;
-
       let encoderOptions: EncoderOptions['options'] = {};
-      if (encoderCodec.name === FF_ENCODER_LIBX264 || encoderCodec.name === FF_ENCODER_LIBX264) {
+      if (encoderCodec.name === FF_ENCODER_LIBX264) {
         encoderOptions.preset = 'ultrafast';
         encoderOptions.tune = 'zerolatency';
       }
@@ -666,9 +770,18 @@ export class FMP4Stream {
         ...this.options.video.encoderOptions,
       };
 
+      const effectiveFps = this.options.video.fps ?? currentFps;
+      const fpsForGop = isFinite(effectiveFps) && effectiveFps > 0 ? effectiveFps : 30;
+      const fragSeconds = this.options.fragDuration && this.options.fragDuration > 0 ? this.options.fragDuration / 1_000_000 : 2;
+      const bitrate = this.options.video.bitrate;
+
       this.videoEncoder = await Encoder.create(encoderCodec, {
         decoder: this.videoDecoder,
         options: encoderOptions,
+        configure: (ctx) => {
+          ctx.gopSize = Math.max(1, Math.round(fpsForGop * fragSeconds));
+          this.applyBitrate(ctx, bitrate);
+        },
       });
     }
 
@@ -696,6 +809,32 @@ export class FMP4Stream {
     this.output = await this.createOutput();
 
     this.attachCompletion(this.runPipeline());
+  }
+
+  /**
+   * Cap the video bitrate on the encoder context.
+   *
+   * Applies a VBV rate cap (maxrate + a 1s buffer) WITHOUT setting a target
+   * bitrate, so the encoder keeps its default constant-quality mode but can
+   * never exceed the negotiated ceiling. Setting the bitrate as an ABR target
+   * instead would push a normally-lighter stream UP to fill it, overshooting on
+   * bursts - the opposite of what strict consumers (HomeKit Secure Video) want.
+   * No-op when no bitrate was requested.
+   *
+   * @param ctx - Encoder codec context
+   *
+   * @param bitrate - Maximum bitrate in bits per second, or undefined
+   *
+   * @internal
+   */
+  private applyBitrate(ctx: CodecContext, bitrate: number | undefined): void {
+    if (!bitrate || bitrate <= 0) {
+      return;
+    }
+    ctx.rcMaxRate = BigInt(Math.round(bitrate));
+    // 1s buffer keeps per-fragment size close to the cap instead of allowing
+    // multi-second bursts over it.
+    ctx.rcBufferSize = Math.round(bitrate);
   }
 
   /**
@@ -750,10 +889,16 @@ export class FMP4Stream {
     completion
       .then(() => {
         this.endFragments();
+        // No-op in the normal case (init segment resolved long ago) - only
+        // fires if the stream ended without ever emitting ftyp+moov.
+        this.rejectInitSegment(new Error('FMP4Stream ended before init segment was produced'));
         this.options.onClose?.();
       })
       .catch(async (error) => {
         this.endFragments();
+        // Reject with the pipeline error so an initSegment consumer sees the
+        // actual failure instead of the generic "stopped" error from stop().
+        this.rejectInitSegment(error instanceof Error ? error : new Error(String(error)));
         await this.stop();
         this.options.onClose?.(error);
       });
@@ -801,13 +946,19 @@ export class FMP4Stream {
       }
 
       // Set the framerate explicitly - without a decoder the encoder would infer
-      // it from the frame timebase and pick an absurd level. Bound the GOP so
-      // fragments get keyframes at a sensible cadence.
+      // it from the frame timebase and pick an absurd level. Bound the GOP to the
+      // fragment duration (2s default) so every fMP4 fragment starts with a
+      // keyframe; otherwise frag_duration flushes fragments mid-GOP on a P-frame
+      // and strict consumers (HomeKit Secure Video) reject them.
+      const fragSeconds = this.options.fragDuration && this.options.fragDuration > 0 ? this.options.fragDuration / 1_000_000 : 2;
+      const bitrate = this.options.video.bitrate;
+
       this.videoEncoder = await Encoder.create(encoderCodec, {
         options: encoderOptions,
         configure: (ctx) => {
           ctx.framerate = new Rational(Math.round(fps), 1);
-          ctx.gopSize = Math.max(1, Math.round(fps * 2));
+          ctx.gopSize = Math.max(1, Math.round(fps * fragSeconds));
+          this.applyBitrate(ctx, bitrate);
         },
       });
     }
@@ -871,6 +1022,15 @@ export class FMP4Stream {
   async stop(): Promise<void> {
     this.endFragments();
 
+    // A consumer awaiting the init segment must not hang forever.
+    this.rejectInitSegment(new Error('FMP4Stream stopped before init segment was produced'));
+
+    // Remove the abort listener so it does not accumulate across restarts.
+    if (this.abortHandler) {
+      this.signal?.removeEventListener('abort', this.abortHandler);
+      this.abortHandler = undefined;
+    }
+
     // Allow a fresh start() after stopping.
     this.startPromise = undefined;
 
@@ -912,8 +1072,11 @@ export class FMP4Stream {
     await this.output?.close();
     this.output = undefined;
 
+    // Reset parser and init segment state so a restart parses a clean stream.
+    this.incompleteBoxBuffer = null;
     this._initSegment = null;
     this._initSegmentResolve = null;
+    this._initSegmentReject = null;
     this._initSegmentPromise = null;
     this._ftypData = null;
     this._moovData = null;
@@ -930,7 +1093,15 @@ export class FMP4Stream {
    *
    * The generator completes when the stream stops or the pipeline ends.
    *
+   * Only a single consumer is supported: a second concurrent fragments() call
+   * would silently strand the first consumer, so it throws instead. The
+   * backlog is bounded by `maxQueuedFragments` - if the consumer falls behind
+   * a live source, the oldest fragments are dropped (see
+   * {@link droppedFragments}).
+   *
    * @yields {FMP4Fragment} Media fragment with data buffer and box info
+   *
+   * @throws {Error} If another fragments() iterator is already active
    *
    * @example
    * ```typescript
@@ -948,6 +1119,9 @@ export class FMP4Stream {
    * ```
    */
   async *fragments(): AsyncGenerator<FMP4Fragment, void> {
+    if (this.fragmentQueue) {
+      throw new Error('fragments() supports only a single consumer; the previous iterator is still active');
+    }
     this.fragmentQueue = { queue: [], resolve: null, done: false };
 
     try {
@@ -1075,6 +1249,11 @@ export class FMP4Stream {
   /**
    * Process buffer in box mode - buffers until complete boxes are available.
    *
+   * The muxer splits writes at arbitrary positions, so a chunk may end
+   * anywhere - including inside a box header. Any trailing partial box
+   * (header or body) is buffered for the next chunk; the parser never
+   * loses bytes regardless of where the split falls.
+   *
    * @param chunk - Incoming data chunk from FFmpeg
    *
    * @internal
@@ -1089,34 +1268,58 @@ export class FMP4Stream {
     let offset = 0;
     const boxes: MP4Box[] = [];
 
-    while (offset + 8 <= chunk.length) {
+    while (offset < chunk.length) {
+      const remaining = chunk.length - offset;
+
+      // Partial 32-bit header - buffer the tail for the next chunk. Dropping
+      // it would desynchronize the parser for the rest of the stream.
+      if (remaining < 8) {
+        this.incompleteBoxBuffer = chunk.subarray(offset);
+        break;
+      }
+
       // Read box header
-      const boxSize = chunk.readUInt32BE(offset);
-      const boxType = chunk.toString('ascii', offset + 4, offset + 8);
+      const size32 = chunk.readUInt32BE(offset);
+      let headerSize = 8;
+      let boxSize = size32;
+
+      if (size32 === 1) {
+        // 64-bit box: the actual size follows the type field as a 64-bit
+        // largesize (16-byte header total). movenc emits this for mdat > 4 GB.
+        if (remaining < 16) {
+          this.incompleteBoxBuffer = chunk.subarray(offset);
+          break;
+        }
+        headerSize = 16;
+        boxSize = Number(chunk.readBigUInt64BE(offset + 8));
+      }
+
+      // Safety check: invalid box size. size==0 ("box extends to end of file")
+      // cannot be framed in a live stream and any size below the header size
+      // is corrupt - recovery is impossible, so drop the rest of this chunk
+      // rather than emit garbage framing downstream.
+      if (boxSize < headerSize) {
+        break;
+      }
 
       // Check if we have the complete box
       if (offset + boxSize > chunk.length) {
-        // Box is incomplete - save for next chunk
+        // Box body is incomplete - save the whole box for the next chunk
         this.incompleteBoxBuffer = chunk.subarray(offset);
         break;
       }
 
       // We have the complete box - parse it
-      const box: MP4Box = {
+      const boxType = chunk.toString('ascii', offset + 4, offset + 8);
+      boxes.push({
         type: boxType,
         size: boxSize,
-        data: chunk.subarray(offset + 8, offset + boxSize),
+        data: chunk.subarray(offset + headerSize, offset + boxSize),
         offset: offset,
-      };
-      boxes.push(box);
+      });
 
       // Move to next box
       offset += boxSize;
-
-      // Safety check: invalid box size
-      if (boxSize < 8) {
-        break;
-      }
     }
 
     // If we have complete boxes, send them to the callback
@@ -1141,6 +1344,7 @@ export class FMP4Stream {
           this._initSegment = Buffer.concat([this._ftypData, this._moovData]);
           this._initSegmentResolve?.(this._initSegment);
           this._initSegmentResolve = null;
+          this._initSegmentReject = null;
         }
       }
 
@@ -1169,7 +1373,33 @@ export class FMP4Stream {
       this.fragmentQueue.resolve = null;
     } else {
       this.fragmentQueue.queue.push(fragment);
+      // Live sources keep producing regardless of consumer speed - bound the
+      // backlog by dropping the oldest media fragments. The init segment never
+      // enters this queue in box mode (kept separately via initSegment).
+      while (this.fragmentQueue.queue.length > this.options.maxQueuedFragments) {
+        this.fragmentQueue.queue.shift();
+        this._droppedFragments++;
+      }
     }
+  }
+
+  /**
+   * Reject a pending initSegment promise so consumers never hang.
+   *
+   * No-op when the promise was never requested or has already settled. The
+   * promise is marked as handled to avoid an unhandled rejection when no
+   * consumer is currently awaiting it.
+   *
+   * @param error - Rejection reason (pipeline error or stop-before-init)
+   *
+   * @internal
+   */
+  private rejectInitSegment(error: Error): void {
+    if (!this._initSegmentReject) return;
+    this._initSegmentPromise?.catch(() => {});
+    this._initSegmentReject(error);
+    this._initSegmentReject = null;
+    this._initSegmentResolve = null;
   }
 
   /**
