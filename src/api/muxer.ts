@@ -364,6 +364,7 @@ export class Muxer implements AsyncDisposable, Disposable {
   private options: MuxerOptions;
   private _streams = new Map<number, StreamDescription>();
   private ioContext?: IOContext;
+  private customIO = false; // ioContext is callback-backed (Writable/IOOutputCallbacks) - freed, never closed
   private headerWritten = false;
   private headerWritePromise?: Promise<void>;
   private trailerWritten = false;
@@ -517,6 +518,7 @@ export class Muxer implements AsyncDisposable, Disposable {
         }
 
         output.ioContext = IOStream.createOutput(target, options);
+        output.customIO = true;
         output.formatContext.pb = output.ioContext;
         output.formatContext.setFlags(AVFMT_FLAG_CUSTOM_IO);
       } else {
@@ -537,6 +539,7 @@ export class Muxer implements AsyncDisposable, Disposable {
         }
 
         output.ioContext = IOStream.createOutput(target, options);
+        output.customIO = true;
         output.formatContext.pb = output.ioContext;
         output.formatContext.setFlags(AVFMT_FLAG_CUSTOM_IO);
       }
@@ -551,10 +554,10 @@ export class Muxer implements AsyncDisposable, Disposable {
       // Cleanup on error
       if (output.ioContext) {
         try {
-          const isCustomIO = output.formatContext.hasFlags(AVFMT_FLAG_CUSTOM_IO);
-          if (isCustomIO) {
-            // Clear the pb reference first
-            output.formatContext.pb = null;
+          // Clear the pb reference first - freeContext() below closes a pb that
+          // is still set, which would double-free the context released here
+          output.formatContext.pb = null;
+          if (output.customIO) {
             // For custom IO with callbacks, free the context
             output.ioContext.freeContext();
           } else {
@@ -670,6 +673,7 @@ export class Muxer implements AsyncDisposable, Disposable {
         }
 
         output.ioContext = IOStream.createOutput(target, options);
+        output.customIO = true;
         output.formatContext.pb = output.ioContext;
         output.formatContext.setFlags(AVFMT_FLAG_CUSTOM_IO);
       } else {
@@ -690,6 +694,7 @@ export class Muxer implements AsyncDisposable, Disposable {
         }
 
         output.ioContext = IOStream.createOutput(target, options);
+        output.customIO = true;
         output.formatContext.pb = output.ioContext;
         output.formatContext.setFlags(AVFMT_FLAG_CUSTOM_IO);
       }
@@ -704,10 +709,10 @@ export class Muxer implements AsyncDisposable, Disposable {
       // Cleanup on error
       if (output.ioContext) {
         try {
-          const isCustomIO = output.formatContext.hasFlags(AVFMT_FLAG_CUSTOM_IO);
-          if (isCustomIO) {
-            // Clear the pb reference first
-            output.formatContext.pb = null;
+          // Clear the pb reference first - freeContext() below closes a pb that
+          // is still set, which would double-free the context released here
+          output.formatContext.pb = null;
+          if (output.customIO) {
             // For custom IO with callbacks, free the context
             output.ioContext.freeContext();
           } else {
@@ -1880,6 +1885,19 @@ export class Muxer implements AsyncDisposable, Disposable {
 
     this.isClosed = true;
 
+    // A header write launched by a concurrent writePacket() must settle before
+    // teardown: nulling pb / freeing the format context under a running
+    // avformat_write_header() crashes on the worker thread. This happens when a
+    // pipeline is stopped mid-startup - the reader task rejects the shared
+    // completion while the writer task is still inside its first writePacket().
+    if (this.headerWritePromise) {
+      try {
+        await this.headerWritePromise;
+      } catch {
+        // Ignore errors - teardown proceeds either way
+      }
+    }
+
     // Close write queue and wait for worker to finish.
     // The worker catches its own errors, but guard the await anyway so a
     // failed worker can never abort cleanup - resources below must always
@@ -1928,12 +1946,11 @@ export class Muxer implements AsyncDisposable, Disposable {
       this.formatContext.pb = null;
     }
 
-    // Determine if this is custom IO before freeing format context
-    const isCustomIO = this.formatContext.hasFlags(AVFMT_FLAG_CUSTOM_IO);
-
-    // For file-based IO, close the file handle via closep
+    // For file-based IO, close the file handle via closep - freeContext() alone
+    // would release the AVIOContext but leak the underlying protocol handle,
+    // leaving the file locked (EBUSY on Windows) until the process exits.
     // For custom IO, the context will be freed below
-    if (this.ioContext && !isCustomIO) {
+    if (this.ioContext && !this.customIO) {
       try {
         await this.ioContext.closep();
       } catch {
@@ -1951,7 +1968,7 @@ export class Muxer implements AsyncDisposable, Disposable {
     }
 
     // Now free custom IO context if present
-    if (this.ioContext && isCustomIO) {
+    if (this.ioContext && this.customIO) {
       try {
         this.ioContext.freeContext();
       } catch {
@@ -2028,12 +2045,9 @@ export class Muxer implements AsyncDisposable, Disposable {
       this.formatContext.pb = null;
     }
 
-    // Determine if this is custom IO before freeing format context
-    const isCustomIO = this.formatContext.hasFlags(AVFMT_FLAG_CUSTOM_IO);
-
     // For file-based IO, close the file handle via closep
     // For custom IO, the context will be freed below
-    if (this.ioContext && !isCustomIO) {
+    if (this.ioContext && !this.customIO) {
       try {
         this.ioContext.closepSync();
       } catch {
@@ -2051,7 +2065,7 @@ export class Muxer implements AsyncDisposable, Disposable {
     }
 
     // Now free custom IO context if present
-    if (this.ioContext && isCustomIO) {
+    if (this.ioContext && this.customIO) {
       try {
         this.ioContext.freeContext();
       } catch {

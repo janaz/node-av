@@ -279,6 +279,24 @@ export interface EncoderOptions<C = unknown> {
   autoFormat?: boolean;
 
   /**
+   * Keep each frame's `pictType` instead of clearing it before encoding.
+   *
+   * By default the encoder resets `frame.pictType` to `AV_PICTURE_TYPE_NONE`,
+   * since decoded input frames carry frame-type hints that should not drive the
+   * output GOP structure when re-encoding. That clearing also discards a
+   * deliberately requested keyframe: setting `frame.pictType = AV_PICTURE_TYPE_I`
+   * (with `forced-idr` on encoders that support it) is the standard FFmpeg way
+   * to force an IDR for a specific frame.
+   *
+   * Set to `true` to pass `pictType` through — needed for on-demand keyframes in
+   * live streaming (packet-loss recovery, a late-joining viewer). Leave `false`
+   * for transcoding, where the input's frame types should be ignored.
+   *
+   * @default false
+   */
+  preserveFramePictType?: boolean;
+
+  /**
    * Additional codec-specific options.
    *
    * Key-value pairs of FFmpeg private codec options, passed directly to the encoder.
@@ -2659,9 +2677,12 @@ export class Encoder implements Disposable {
    * @internal
    */
   private prepareFrameForEncoding(frame: Frame): void {
-    // Clear pict_type - encoder will determine frame types based on its own settings
-    // Input stream's frame type hints are irrelevant when re-encoding
-    frame.pictType = AV_PICTURE_TYPE_NONE;
+    // Clear pict_type - encoder will determine frame types based on its own settings.
+    // Input stream's frame type hints are irrelevant when re-encoding. Opt out with
+    // { preserveFramePictType: true } to force keyframes via frame.pictType = I.
+    if (!this.options.preserveFramePictType) {
+      frame.pictType = AV_PICTURE_TYPE_NONE;
+    }
 
     // Adjust frame PTS and timebase to encoder timebase
     // This matches FFmpeg's adjust_frame_pts_to_encoder_tb() behavior which:

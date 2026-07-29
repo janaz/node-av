@@ -266,7 +266,9 @@ export interface DemuxerOptions<F extends DemuxerFormat | (string & {}) = Demuxe
    * AbortSignal for cancellation.
    *
    * When aborted, async generators stop yielding and async methods throw AbortError.
-   * The demux thread is stopped automatically.
+   * The demux thread is stopped automatically. Aborting also fires the native
+   * interrupt callback, unblocking a blocking open (e.g. an unresponsive RTSP
+   * source) or a stalled av_read_frame().
    */
   signal?: AbortSignal;
 }
@@ -349,6 +351,7 @@ export class Demuxer implements AsyncDisposable, Disposable {
   private formatContext: FormatContext;
   private _streams: Stream[] = [];
   private ioContext?: IOContext;
+  private externalIO = false; // ioContext was supplied by the caller - may own a protocol handle from open2()
   private isClosed = false;
   private options: Required<Omit<DemuxerOptions, 'signal' | 'configure'>>;
 
@@ -378,11 +381,14 @@ export class Demuxer implements AsyncDisposable, Disposable {
    *
    * @param ioContext - Optional IO context for custom I/O (e.g., from Buffer)
    *
+   * @param externalIO - Whether ioContext was supplied by the caller instead of built here
+   *
    * @internal
    */
-  private constructor(formatContext: FormatContext, options: Required<Omit<DemuxerOptions, 'signal' | 'configure'>>, ioContext?: IOContext) {
+  private constructor(formatContext: FormatContext, options: Required<Omit<DemuxerOptions, 'signal' | 'configure'>>, ioContext?: IOContext, externalIO = false) {
     this.formatContext = formatContext;
     this.ioContext = ioContext;
+    this.externalIO = externalIO;
     this._streams = formatContext.streams ?? [];
     this.options = options;
   }
@@ -570,6 +576,7 @@ export class Demuxer implements AsyncDisposable, Disposable {
    * Automatically detects format and extracts stream information.
    * Supports various input sources with flexible configuration.
    * Creates demuxer ready for packet extraction.
+   * A supplied IOContext is taken over by the demuxer and released on close.
    *
    * Direct mapping to avformat_open_input() and avformat_find_stream_info().
    *
@@ -688,8 +695,18 @@ export class Demuxer implements AsyncDisposable, Disposable {
     // Original implementation for non-raw data
     const formatContext = new FormatContext();
     let ioContext: IOContext | undefined;
+    let externalIO = false; // caller-supplied context - released via dispose, not freeContext
     let optionsDict: Dictionary | null = null;
     let inputFormat: InputFormat | null = null;
+
+    // Abort during the open phase: avformat_open_input()/find_stream_info()
+    // block for seconds on an unresponsive network source, so the signal must
+    // fire the native interrupt callback to unblock them.
+    const onOpenAbort = () => formatContext.interrupt();
+    if (options.signal) {
+      options.signal.throwIfAborted();
+      options.signal.addEventListener('abort', onOpenAbort, { once: true });
+    }
 
     try {
       // Create options dictionary if options are provided
@@ -733,6 +750,7 @@ export class Demuxer implements AsyncDisposable, Disposable {
 
         formatContext.allocContext();
         ioContext = input;
+        externalIO = true;
         formatContext.pb = ioContext;
         formatContext.setFlags(AVFMT_FLAG_CUSTOM_IO);
 
@@ -816,21 +834,45 @@ export class Demuxer implements AsyncDisposable, Disposable {
         options: options.options ?? {},
       };
 
-      const demuxer = new Demuxer(formatContext, fullOptions, ioContext);
+      const demuxer = new Demuxer(formatContext, fullOptions, ioContext, externalIO);
 
       if (options.signal) {
-        options.signal.throwIfAborted();
-        demuxer.signal = options.signal;
+        const signal = options.signal;
+        signal.removeEventListener('abort', onOpenAbort);
+        demuxer.signal = signal;
+
+        // An abort that raced the successful open must not hand out a usable
+        // demuxer - tear it down and surface the abort instead.
+        if (signal.aborted) {
+          await demuxer.close();
+          signal.throwIfAborted();
+        }
+
+        // Keep abort -> interrupt wired for the demuxer's lifetime so a
+        // blocked av_read_frame() unwinds too; close() removes the listener.
+        const onAbort = () => {
+          demuxer.demuxThreadActive = false;
+          demuxer.interrupt();
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        demuxer.signalCleanup = () => signal.removeEventListener('abort', onAbort);
       }
 
       return demuxer;
     } catch (error) {
+      options.signal?.removeEventListener('abort', onOpenAbort);
       // Clean up only on error
       if (ioContext) {
         // Clear the pb reference first
         formatContext.pb = null;
-        // Free the IOContext (for both custom I/O and buffer-based I/O)
-        ioContext.freeContext();
+        // Release the IOContext (for both custom I/O and buffer-based I/O).
+        // A caller-supplied context may own a protocol handle from open2(),
+        // which only dispose closes - see close().
+        if (externalIO) {
+          await ioContext[Symbol.asyncDispose]();
+        } else {
+          ioContext.freeContext();
+        }
       }
       // Clean up FormatContext
       await formatContext.closeInput();
@@ -850,6 +892,7 @@ export class Demuxer implements AsyncDisposable, Disposable {
    * Automatically detects format and extracts stream information.
    * Supports various input sources with flexible configuration.
    * Creates demuxer ready for packet extraction.
+   * A supplied IOContext is taken over by the demuxer and released on close.
    *
    * Direct mapping to avformat_open_input() and avformat_find_stream_info().
    *
@@ -954,6 +997,7 @@ export class Demuxer implements AsyncDisposable, Disposable {
     // Original implementation for non-raw data
     const formatContext = new FormatContext();
     let ioContext: IOContext | undefined;
+    let externalIO = false; // caller-supplied context - released via dispose, not freeContext
     let optionsDict: Dictionary | null = null;
     let inputFormat: InputFormat | null = null;
 
@@ -999,6 +1043,7 @@ export class Demuxer implements AsyncDisposable, Disposable {
 
         formatContext.allocContext();
         ioContext = input;
+        externalIO = true;
         formatContext.pb = ioContext;
         formatContext.setFlags(AVFMT_FLAG_CUSTOM_IO);
 
@@ -1068,7 +1113,7 @@ export class Demuxer implements AsyncDisposable, Disposable {
         options: options.options ?? {},
       };
 
-      const demuxer = new Demuxer(formatContext, fullOptions, ioContext);
+      const demuxer = new Demuxer(formatContext, fullOptions, ioContext, externalIO);
 
       if (options.signal) {
         options.signal.throwIfAborted();
@@ -1081,8 +1126,12 @@ export class Demuxer implements AsyncDisposable, Disposable {
       if (ioContext) {
         // Clear the pb reference first
         formatContext.pb = null;
-        // Free the IOContext (for both custom I/O and buffer-based I/O)
-        ioContext.freeContext();
+        // Release the IOContext (see open() for why dispose)
+        if (externalIO) {
+          ioContext[Symbol.dispose]();
+        } else {
+          ioContext.freeContext();
+        }
       }
       // Clean up FormatContext
       formatContext.closeInputSync();
@@ -2667,9 +2716,17 @@ export class Demuxer implements AsyncDisposable, Disposable {
     this.packetQueues.clear();
     this.packetQueueConsumers.clear();
 
-    // NOW we can safely free the IOContext
+    // NOW we can safely release the IOContext. Contexts we built ourselves are
+    // callback-backed and go through freeContext(), which IOStream hooks to
+    // detach its stream listeners. A caller-supplied context may instead own a
+    // protocol handle from open2(); dispose picks avio_closep() for those, as
+    // freeing them alone leaks the handle and keeps the file locked on Windows.
     if (this.ioContext) {
-      this.ioContext.freeContext();
+      if (this.externalIO) {
+        await this.ioContext[Symbol.asyncDispose]();
+      } else {
+        this.ioContext.freeContext();
+      }
       this.ioContext = undefined;
     }
   }
@@ -2727,9 +2784,13 @@ export class Demuxer implements AsyncDisposable, Disposable {
     this.queueResolvers.clear();
     this.demuxEof = false;
 
-    // NOW we can safely free the IOContext
+    // NOW we can safely release the IOContext (see close() for why dispose)
     if (this.ioContext) {
-      this.ioContext.freeContext();
+      if (this.externalIO) {
+        this.ioContext[Symbol.dispose]();
+      } else {
+        this.ioContext.freeContext();
+      }
       this.ioContext = undefined;
     }
   }
