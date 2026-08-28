@@ -357,6 +357,22 @@ jobs:
             fi
           done
 
+          # Pin the main package's platform optionalDependencies to the EXACT
+          # published version. Exact (not caret) is required because the
+          # <base>-revizlyN prerelease scheme does not sort correctly under semver,
+          # so a caret range would resolve the native binary to the wrong version.
+          VERSION="$VERSION" node -e '
+            const fs = require("fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            if (pkg.optionalDependencies) {
+              for (const dep of Object.keys(pkg.optionalDependencies)) {
+                pkg.optionalDependencies[dep] = process.env.VERSION;
+              }
+              fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+              console.log("Pinned optionalDependencies to " + process.env.VERSION);
+            }
+          '
+
       - name: Create npm tarballs
         run: |
           mkdir -p npm-packages
