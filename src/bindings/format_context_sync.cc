@@ -1,4 +1,5 @@
 #include "format_context.h"
+#include "input_reader.h"
 #include "packet.h"
 #include "input_format.h"
 #include "dictionary.h"
@@ -11,6 +12,10 @@ namespace ffmpeg {
 
 Napi::Value FormatContext::ReadFrameSync(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (reader_) {
+    Napi::Error::New(env, "FormatContext has an active async reader - use the async API").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   // Serializes FFmpeg calls on this context and pins it against close/free
   // - AVFormatContext is not safe for concurrent use (see ctx_mutex_)
   std::unique_lock<std::shared_timed_mutex> lifecycle(ctx_mutex_, std::defer_lock);
@@ -205,6 +210,10 @@ Napi::Value FormatContext::OpenInputSync(const Napi::CallbackInfo& info) {
 
 Napi::Value FormatContext::FindStreamInfoSync(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (reader_) {
+    Napi::Error::New(env, "FormatContext has an active async reader - use the async API").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   // Serializes FFmpeg calls on this context and pins it against close/free
   // - AVFormatContext is not safe for concurrent use (see ctx_mutex_)
   std::unique_lock<std::shared_timed_mutex> lifecycle(ctx_mutex_, std::defer_lock);
@@ -235,6 +244,10 @@ Napi::Value FormatContext::FindStreamInfoSync(const Napi::CallbackInfo& info) {
 
 Napi::Value FormatContext::SeekFrameSync(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (reader_) {
+    Napi::Error::New(env, "FormatContext has an active async reader - use the async API").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   // Serializes FFmpeg calls on this context and pins it against close/free
   // - AVFormatContext is not safe for concurrent use (see ctx_mutex_)
   std::unique_lock<std::shared_timed_mutex> lifecycle(ctx_mutex_, std::defer_lock);
@@ -266,6 +279,10 @@ Napi::Value FormatContext::SeekFrameSync(const Napi::CallbackInfo& info) {
 
 Napi::Value FormatContext::SeekFileSync(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (reader_) {
+    Napi::Error::New(env, "FormatContext has an active async reader - use the async API").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   // Serializes FFmpeg calls on this context and pins it against close/free
   // - AVFormatContext is not safe for concurrent use (see ctx_mutex_)
   std::unique_lock<std::shared_timed_mutex> lifecycle(ctx_mutex_, std::defer_lock);
@@ -376,6 +393,13 @@ Napi::Value FormatContext::CloseInputSync(const Napi::CallbackInfo& info) {
   if (is_output_) {
     Napi::Error::New(env, "Cannot close output context as input").ThrowAsJavaScriptException();
     return env.Undefined();
+  }
+
+  if (!StopReaderSync(env)) {
+    return env.Undefined();
+  }
+  if (info.Length() > 0 && info[0].ToBoolean().Value() && ctx_) {
+    ctx_->pb = nullptr;
   }
 
   // Request interrupt to cancel any pending av_read_frame()
@@ -531,6 +555,10 @@ Napi::Value FormatContext::CloseOutputSync(const Napi::CallbackInfo& info) {
 
 Napi::Value FormatContext::FlushSync(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (reader_) {
+    Napi::Error::New(env, "FormatContext has an active async reader - use the async API").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   // Serializes FFmpeg calls on this context and pins it against close/free
   // - AVFormatContext is not safe for concurrent use (see ctx_mutex_)
   std::unique_lock<std::shared_timed_mutex> lifecycle(ctx_mutex_, std::defer_lock);
@@ -553,6 +581,10 @@ Napi::Value FormatContext::FlushSync(const Napi::CallbackInfo& info) {
 
 Napi::Value FormatContext::SendRTSPPacketSync(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (reader_) {
+    Napi::Error::New(env, "FormatContext has an active async reader - use the async API").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   // Serializes FFmpeg calls on this context and pins it against close/free
   // - AVFormatContext is not safe for concurrent use (see ctx_mutex_)
   std::unique_lock<std::shared_timed_mutex> lifecycle(ctx_mutex_, std::defer_lock);
