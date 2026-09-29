@@ -1737,10 +1737,17 @@ export class Encoder implements Disposable {
     // Clear previous packet data
     this.packet.unref();
 
-    if (this.audioFrameBuffer?.hasFrame()) {
+    // Skip frames the codec rejects (e.g. aac "Input contains (near) NaN/+-Inf"). Pulling a single
+    // frame per call would leave the rest in the FIFO while every encode() adds more.
+    while (this.audioFrameBuffer?.hasFrame()) {
       using bufferedFrame = await this.audioFrameBuffer.pull();
-      if (bufferedFrame) {
-        await this.codecContext.sendFrame(bufferedFrame);
+      if (!bufferedFrame) {
+        break;
+      }
+
+      const sendRet = await this.codecContext.sendFrame(bufferedFrame);
+      if (sendRet >= 0 || sendRet === AVERROR_EAGAIN) {
+        break;
       }
     }
 
@@ -1837,10 +1844,16 @@ export class Encoder implements Disposable {
     // Clear previous packet data
     this.packet.unref();
 
-    if (this.audioFrameBuffer?.hasFrame()) {
+    // Skip frames the codec rejects, see receive()
+    while (this.audioFrameBuffer?.hasFrame()) {
       using bufferedFrame = this.audioFrameBuffer.pullSync();
-      if (bufferedFrame) {
-        this.codecContext.sendFrameSync(bufferedFrame);
+      if (!bufferedFrame) {
+        break;
+      }
+
+      const sendRet = this.codecContext.sendFrameSync(bufferedFrame);
+      if (sendRet >= 0 || sendRet === AVERROR_EAGAIN) {
+        break;
       }
     }
 

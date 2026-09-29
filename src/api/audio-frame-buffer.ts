@@ -1,5 +1,6 @@
 import { AV_SAMPLE_FMT_U8, AV_SAMPLE_FMT_U8P } from '../constants/constants.js';
 import { AudioFifo } from '../lib/audio-fifo.js';
+import { FFmpegError } from '../lib/error.js';
 import { Frame } from '../lib/frame.js';
 import { Rational } from '../lib/rational.js';
 import { avGetBytesPerSample, avSampleFmtIsPlanar } from '../lib/utilities.js';
@@ -54,6 +55,8 @@ export class AudioFrameBuffer implements Disposable {
   private frameSize: number;
   private sampleFormat: AVSampleFormat;
   private channels: number;
+  private staging: Buffer;
+  private stagingPlanes: Buffer[];
   private nextPts = 0n;
   private firstFramePts: bigint | null = null;
 
@@ -85,6 +88,14 @@ export class AudioFrameBuffer implements Disposable {
     // 1/sample_rate; pulled frames go to the codec without further rescaling.
     this.frame.timeBase = new Rational(1, sampleRate);
     this.frame.getBuffer(0); // Allocate buffer once
+
+    // Frame.data is a copy instead of a view where external buffers are not allowed (Electron),
+    // so samples are staged in JS memory and copied into the frame with fromBuffer()
+    const planar = avSampleFmtIsPlanar(sampleFormat);
+    const planeCount = planar ? this.channels : 1;
+    const planeSize = frameSize * avGetBytesPerSample(sampleFormat) * (planar ? 1 : this.channels);
+    this.staging = Buffer.alloc(planeSize * planeCount);
+    this.stagingPlanes = Array.from({ length: planeCount }, (_, i) => this.staging.subarray(i * planeSize, (i + 1) * planeSize));
   }
 
   /**
@@ -241,8 +252,9 @@ export class AudioFrameBuffer implements Disposable {
     // Update PTS
     this.frame.pts = this.nextPts;
 
-    // Read samples from FIFO into reusable frame
-    await this.fifo.read(this.frame.data as Buffer | Buffer[], this.frameSize);
+    // Read samples from FIFO and copy them into the reusable frame
+    await this.fifo.read(this.stagingPlanes, this.frameSize);
+    this.commitStaging();
 
     // Update PTS for next frame
     this.nextPts += BigInt(this.frameSize);
@@ -285,8 +297,9 @@ export class AudioFrameBuffer implements Disposable {
     // Update PTS
     this.frame.pts = this.nextPts;
 
-    // Read samples from FIFO into reusable frame
-    this.fifo.readSync(this.frame.data as Buffer | Buffer[], this.frameSize);
+    // Read samples from FIFO and copy them into the reusable frame
+    this.fifo.readSync(this.stagingPlanes, this.frameSize);
+    this.commitStaging();
 
     // Update PTS for next frame
     this.nextPts += BigInt(this.frameSize);
@@ -334,11 +347,12 @@ export class AudioFrameBuffer implements Disposable {
     // Update PTS
     this.frame.pts = this.nextPts;
 
-    // Read the remaining samples into the head of the reusable frame
-    await this.fifo.read(this.frame.data as Buffer | Buffer[], remaining);
+    // Read the remaining samples into the head of the staging buffer
+    await this.fifo.read(this.stagingPlanes, remaining);
 
     // Pad the tail with silence up to frameSize
     this.padWithSilence(remaining);
+    this.commitStaging();
 
     // Update PTS for next frame
     this.nextPts += BigInt(this.frameSize);
@@ -385,11 +399,12 @@ export class AudioFrameBuffer implements Disposable {
     // Update PTS
     this.frame.pts = this.nextPts;
 
-    // Read the remaining samples into the head of the reusable frame
-    this.fifo.readSync(this.frame.data as Buffer | Buffer[], remaining);
+    // Read the remaining samples into the head of the staging buffer
+    this.fifo.readSync(this.stagingPlanes, remaining);
 
     // Pad the tail with silence up to frameSize
     this.padWithSilence(remaining);
+    this.commitStaging();
 
     // Update PTS for next frame
     this.nextPts += BigInt(this.frameSize);
@@ -403,7 +418,7 @@ export class AudioFrameBuffer implements Disposable {
   }
 
   /**
-   * Fill the reusable frame's sample range [fromSample, frameSize) with silence.
+   * Fill the staged sample range [fromSample, frameSize) with silence.
    *
    * Follows av_samples_set_silence() semantics: unsigned 8-bit formats use 0x80
    * as the silence value, every other format uses 0. Planar frames carry one
@@ -417,10 +432,24 @@ export class AudioFrameBuffer implements Disposable {
     const silence = this.sampleFormat === AV_SAMPLE_FMT_U8 || this.sampleFormat === AV_SAMPLE_FMT_U8P ? 0x80 : 0;
     const bytesPerSample = avGetBytesPerSample(this.sampleFormat);
     const stride = avSampleFmtIsPlanar(this.sampleFormat) ? bytesPerSample : bytesPerSample * this.channels;
-    const planes = this.frame.data ?? [];
-    for (const plane of planes) {
+    for (const plane of this.stagingPlanes) {
       plane.fill(silence, fromSample * stride, this.frameSize * stride);
     }
+  }
+
+  /**
+   * Copy the staged samples into the reusable frame.
+   *
+   * A frame pulled earlier may still share the frame's buffer, so the buffer is
+   * made writable first instead of overwriting the samples under that frame.
+   *
+   * @throws {FFmpegError} If the frame buffer cannot be made writable or filled
+   *
+   * @internal
+   */
+  private commitStaging(): void {
+    FFmpegError.throwIfError(this.frame.makeWritable(), 'Failed to make frame writable');
+    FFmpegError.throwIfError(this.frame.fromBuffer(this.staging), 'Failed to copy samples into frame');
   }
 
   /**
