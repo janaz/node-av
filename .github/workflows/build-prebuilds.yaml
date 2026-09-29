@@ -525,21 +525,16 @@ jobs:
         shell: powershell
         run: |
           Write-Host "=== Checking node-av.node dependencies ==="
-          $dumpbin = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\*\bin\Host*\${{ matrix.os.arch }}\dumpbin.exe" | Select-Object -First 1
-          if ($dumpbin) {
-            & $dumpbin /DEPENDENTS "build\Release\node-av.node"
-          } else {
-            Write-Host "dumpbin not found, trying alternative path"
-            & "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\${{ matrix.os.arch }}\dumpbin.exe" /DEPENDENTS "build\Release\node-av.node"
+          $dumpbin = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Host*\${{ matrix.os.arch }}\dumpbin.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dumpbin) {
+            Write-Host "dumpbin not found, skipping the dependency check"
+            exit 0
           }
+          & $dumpbin.FullName /DEPENDENTS "build\Release\node-av.node"
 
           Write-Host "`n=== Checking FFmpeg binary dependencies ==="
           if (Test-Path "ffmpeg-msvc\bin\ffmpeg.exe") {
-            if ($dumpbin) {
-              & $dumpbin /DEPENDENTS "ffmpeg-msvc\bin\ffmpeg.exe"
-            } else {
-              & "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\${{ matrix.os.arch }}\dumpbin.exe" /DEPENDENTS "ffmpeg-msvc\bin\ffmpeg.exe"
-            }
+            & $dumpbin.FullName /DEPENDENTS "ffmpeg-msvc\bin\ffmpeg.exe"
           }
 
       - name: Package FFmpeg binary
