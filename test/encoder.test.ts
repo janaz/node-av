@@ -504,6 +504,123 @@ describe('Encoder', () => {
       }
     });
 
+    it('autoResample rate conversion keeps the input start time', { timeout: 30000 }, () => {
+      // The resampled frames used to be stamped from 0, so a stream starting at 1 s
+      // lost its offset against the other streams of the output.
+      const encoder = Encoder.createSync(FF_ENCODER_LIBMP3LAME, { bitrate: '128k', autoResample: true });
+      try {
+        const starts: number[] = [];
+        for (let i = 0; i < 20; i++) {
+          using frame = makeAudioFrame(96000, BigInt(96000 + i * 1152));
+          for (const p of encoder.encodeAllSync(frame)) {
+            starts.push((Number(p.pts) * p.timeBase.num) / p.timeBase.den);
+            p.free();
+          }
+        }
+        for (const p of encoder.encodeAllSync(null)) {
+          starts.push((Number(p.pts) * p.timeBase.num) / p.timeBase.den);
+          p.free();
+        }
+
+        // Encoder delay shifts the first packet back by less than a frame
+        const frameSeconds = 1152 / 48000;
+        assert.ok(starts.length > 0, 'should produce packets');
+        assert.ok(Math.abs(starts[0] - 1) <= frameSeconds, `first packet at ${starts[0]}s should start near the input start of 1s`);
+      } finally {
+        encoder.close();
+      }
+    });
+
+    it('fixed-frame-size audio keeps the input timing across offsets and gaps', async () => {
+      // AAC needs 1024-sample frames, so the input runs through the frame buffer.
+      // Before, its output was re-stamped from 0 by sample count: the 2 s start
+      // offset and the 3 s gap were lost and audio ran ahead of the other streams.
+      const rate = 44100;
+      const encoder = await Encoder.create(FF_ENCODER_AAC, { bitrate: '128k' });
+      try {
+        const makeFrame = (pts: number): Frame => {
+          const frame = new Frame();
+          frame.alloc();
+          frame.nbSamples = 1000;
+          frame.sampleRate = rate;
+          frame.format = AV_SAMPLE_FMT_FLTP;
+          frame.channelLayout = AV_CHANNEL_LAYOUT_STEREO;
+          frame.pts = BigInt(pts);
+          frame.timeBase = new Rational(1, rate);
+          assert.equal(frame.getBuffer(), 0, 'Should allocate frame buffer');
+          for (const plane of frame.data ?? []) {
+            plane.fill(0);
+          }
+          return frame;
+        };
+
+        const first = 2 * rate;
+        const resume = first + 20000 + 3 * rate;
+        const starts = [...Array.from({ length: 20 }, (_, i) => first + i * 1000), ...Array.from({ length: 20 }, (_, i) => resume + i * 1000)];
+
+        const pts: bigint[] = [];
+        for (const start of starts) {
+          using frame = makeFrame(start);
+          for (const p of await encoder.encodeAll(frame)) {
+            pts.push(p.pts);
+            p.free();
+          }
+        }
+        for (const p of await encoder.encodeAll(null)) {
+          pts.push(p.pts);
+          p.free();
+        }
+
+        // A priming packet (1024 samples for AAC) precedes the packet of the first input sample
+        assert.equal(pts[0], BigInt(first - 1024), `first packet at ${pts[0]} should start at the input start ${first} minus the AAC priming`);
+        assert.equal(pts[1], BigInt(first));
+
+        // The gap counts once it persisted over 0.2 s of resumed input (9 frames here): the frames
+        // before the confirming one continue the old timeline, then the partial output frame is
+        // padded with silence and output restarts at the input timestamp of the confirming frame
+        const early = (Math.ceil((0.2 * rate) / 1000) - 1) * 1000;
+        const restartIndex = Math.ceil((20000 + early) / 1024) * 1024;
+        const steps = pts.slice(1).map((p, i) => p - pts[i]);
+        const jumps = steps.map((step, i) => ({ step, i })).filter(({ step }) => step !== 1024n);
+        assert.equal(jumps.length, 1, `only the gap should break the 1024-sample cadence, got ${jumps.map((j) => j.step).join(', ')}`);
+        assert.equal(jumps[0].step, BigInt(resume + early - (first + restartIndex - 1024)), 'the gap is kept in the packet timestamps');
+        assert.equal(pts[jumps[0].i + 1], BigInt(resume + early), 'output restarts at the input timestamp');
+      } finally {
+        encoder.close();
+      }
+    });
+
+    it('passes audioFrameBuffer options to the frame buffer', async () => {
+      await assert.rejects(Encoder.create(FF_ENCODER_AAC, { audioFrameBuffer: { maxGapFill: -1 } }), RangeError);
+      assert.throws(() => Encoder.createSync(FF_ENCODER_AAC, { audioFrameBuffer: { maxGapFill: Number.NaN } }), RangeError);
+
+      // timestamps: 'samples' ignores the 2 s input offset and counts from 0
+      const rate = 44100;
+      const encoder = await Encoder.create(FF_ENCODER_AAC, { bitrate: '128k', audioFrameBuffer: { timestamps: 'samples' } });
+      try {
+        const pts: bigint[] = [];
+        for (let i = 0; i < 10; i++) {
+          using frame = new Frame();
+          frame.alloc();
+          frame.nbSamples = 1000;
+          frame.sampleRate = rate;
+          frame.format = AV_SAMPLE_FMT_FLTP;
+          frame.channelLayout = AV_CHANNEL_LAYOUT_STEREO;
+          frame.pts = BigInt(2 * rate + i * 1000);
+          frame.timeBase = new Rational(1, rate);
+          assert.equal(frame.getBuffer(), 0, 'Should allocate frame buffer');
+          for (const p of await encoder.encodeAll(frame)) {
+            pts.push(p.pts);
+            p.free();
+          }
+        }
+        assert.equal(pts[0], -1024n, 'priming packet before the first frame at 0');
+        assert.equal(pts[1], 0n);
+      } finally {
+        encoder.close();
+      }
+    });
+
     it('throws a descriptive error for an unsupported input rate when autoResample is off (default)', () => {
       const encoder = Encoder.createSync(FF_ENCODER_LIBMP3LAME, { bitrate: '128k' });
       try {

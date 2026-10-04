@@ -11,6 +11,7 @@ import {
   AV_PICTURE_TYPE_NONE,
   AV_PIX_FMT_NONE,
   AV_PKT_FLAG_TRUSTED,
+  AV_ROUND_NEAR_INF,
   AVCHROMA_LOC_UNSPECIFIED,
   AVERROR_EAGAIN,
   AVERROR_ENCODER_NOT_FOUND,
@@ -29,8 +30,8 @@ import { Packet } from '../lib/packet.js';
 import { Rational } from '../lib/rational.js';
 import { SoftwareResampleContext } from '../lib/software-resample-context.js';
 import { SoftwareScaleContext } from '../lib/software-scale-context.js';
-import { avChannelLayoutDefault, avGetPixFmtName, avGetSampleFmtName, avRescaleQ } from '../lib/utilities.js';
-import { AudioFrameBuffer } from './audio-frame-buffer.js';
+import { avChannelLayoutDefault, avGetPixFmtName, avGetSampleFmtName, avRescaleQ, avRescaleRnd } from '../lib/utilities.js';
+import { assertAudioFrameBufferOptions, AudioFrameBuffer } from './audio-frame-buffer.js';
 import { FRAME_THREAD_QUEUE_SIZE, PACKET_THREAD_QUEUE_SIZE } from './constants.js';
 import { AsyncQueue } from './utilities/async-queue.js';
 import { pickSupportedLayout, pickSupportedPixelFormat, pickSupportedRate, pickSupportedSampleFormat } from './utilities/codec-format.js';
@@ -40,6 +41,7 @@ import { parseBitrate } from './utils.js';
 
 import type { AVCodecFlag, AVCodecID, AVPixelFormat, AVSampleFormat, AVThreadType, EncoderOptionsFor, EOFSignal, FFEncoderCodec } from '../constants/index.js';
 import type { ChannelLayout } from '../lib/types.js';
+import type { AudioFrameBufferOptions } from './audio-frame-buffer.js';
 import type { Decoder } from './decoder.js';
 import type { FilterComplexAPI } from './filter-complex.js';
 import type { FilterAPI } from './filter.js';
@@ -261,6 +263,21 @@ export interface EncoderOptions<C = unknown> {
   autoResample?: boolean;
 
   /**
+   * Timing of audio for codecs with a fixed frame size (AAC, Opus, MP3, …).
+   *
+   * Such codecs take their input through an {@link AudioFrameBuffer}, which keeps the
+   * timestamps of the input frames, fills small gaps with silence and drops small
+   * overlaps. Set `maxGapFill: 0` for real-time outputs such as RTP, so that input gaps
+   * become timestamp jumps instead of a burst of late silence, or `timestamps: 'samples'`
+   * to count the output from 0 by its samples regardless of the input timestamps. Has
+   * no effect on video or on codecs that take any frame size; `autoResample` keeps the
+   * input timing for those either way.
+   *
+   * @default {}
+   */
+  audioFrameBuffer?: AudioFrameBufferOptions;
+
+  /**
    * Automatically convert incoming video to a pixel format the codec supports.
    *
    * Video encoders only accept specific pixel formats (e.g. libx264 wants planar
@@ -386,7 +403,7 @@ export class Encoder implements Disposable {
   private audioResampler?: SoftwareResampleContext;
   private resampledFrame?: Frame;
   private resampleChangesRate = false;
-  private resampledPts = 0n;
+  private resampleInputRate = 0;
   private audioInputLayout?: ChannelLayout;
   private autoFormat: boolean;
   private videoScaler?: SoftwareScaleContext;
@@ -444,6 +461,8 @@ export class Encoder implements Disposable {
    *
    * @throws {Error} If encoder not found
    *
+   * @throws {RangeError} If an audioFrameBuffer option is out of range
+   *
    * @example
    * ```typescript
    * // From decoder stream info
@@ -494,6 +513,10 @@ export class Encoder implements Disposable {
 
     if (!codec) {
       throw new FFmpegError(AVERROR_ENCODER_NOT_FOUND);
+    }
+
+    if (options.audioFrameBuffer) {
+      assertAudioFrameBufferOptions(options.audioFrameBuffer);
     }
 
     // Allocate codec context
@@ -575,6 +598,8 @@ export class Encoder implements Disposable {
    *
    * @throws {FFmpegError} If codec allocation fails
    *
+   * @throws {RangeError} If an audioFrameBuffer option is out of range
+   *
    * @example
    * ```typescript
    * // From decoder stream info
@@ -625,6 +650,10 @@ export class Encoder implements Disposable {
 
     if (!codec) {
       throw new FFmpegError(AVERROR_ENCODER_NOT_FOUND);
+    }
+
+    if (options.audioFrameBuffer) {
+      assertAudioFrameBufferOptions(options.audioFrameBuffer);
     }
 
     // Allocate codec context
@@ -2235,6 +2264,7 @@ export class Encoder implements Disposable {
         this.codecContext.sampleRate,
         this.codecContext.channelLayout,
         this.codecContext.channels,
+        this.options.audioFrameBuffer,
       );
     }
 
@@ -2344,6 +2374,7 @@ export class Encoder implements Disposable {
         this.codecContext.sampleRate,
         this.codecContext.channelLayout,
         this.codecContext.channels,
+        this.options.audioFrameBuffer,
       );
     }
 
@@ -2456,13 +2487,11 @@ export class Encoder implements Disposable {
     const targetFmt = pickSupportedSampleFormat(inFmt, this.codec.sampleFormats);
     const targetLayout = pickSupportedLayout(inLayout, this.codec.channelLayouts);
 
-    // When the codec forces a different sample rate, the frames that reach it
-    // carry PTS as a running sample counter at that rate (resampler and FIFO
-    // paths), so the codec timebase must be 1/target_rate - the input timebase
-    // would misread those counts (e.g. 44.1 kHz in -> Opus-forced 48 kHz would
-    // play ~8.8% slow). Without rate conversion, keep the frame timebase
-    // (typically 1/sample_rate).
+    // When the codec forces a different sample rate, the resampler stamps its
+    // output in 1/target_rate, so that is the codec timebase. Without rate
+    // conversion, keep the frame timebase (typically 1/sample_rate).
     this.resampleChangesRate = targetRate !== inRate;
+    this.resampleInputRate = inRate;
     this.codecContext.timeBase = this.resampleChangesRate ? new Rational(1, targetRate) : frame.timeBase;
 
     const needsResample = targetRate !== inRate || targetFmt !== inFmt || targetLayout.nbChannels !== inLayout.nbChannels;
@@ -2520,12 +2549,15 @@ export class Encoder implements Disposable {
    * Resample an incoming audio frame to the codec's target format.
    *
    * Reuses a single output frame; `swr_convert_frame` allocates/sizes its buffer.
-   * The (fixed-frame-size) audio FIFO copies the samples and re-stamps PTS, so the
-   * reused frame and its carried timing are only relevant on the non-FIFO path.
+   * The output keeps the input timing: with rate conversion it is stamped with the
+   * time of its first output sample in 1/target_rate, otherwise it carries the input
+   * frame's PTS and timebase.
    *
    * @param frame - Source audio frame
    *
    * @returns The resampled frame (owned by the encoder, reused across calls)
+   *
+   * @throws {FFmpegError} If resampling fails
    *
    * @internal
    */
@@ -2535,15 +2567,14 @@ export class Encoder implements Disposable {
     out.format = this.codecContext.sampleFormat;
     out.sampleRate = this.codecContext.sampleRate;
     out.channelLayout = this.codecContext.channelLayout;
+    // Rate conversion holds samples back inside swr, so this call's first output
+    // sample is older than the input frame's first sample. swr_next_pts() accounts
+    // for that delay (as the aresample filter does) and must run before converting.
+    const pts = this.resampleChangesRate ? this.nextResampledPts(frame) : AV_NOPTS_VALUE;
     FFmpegError.throwIfError(this.audioResampler!.convertFrame(out, frame), 'Failed to resample audio frame');
     if (this.resampleChangesRate) {
-      // Rate conversion changes the sample count, so the input PTS no longer
-      // matches the output. Stamp from a running output-sample counter in
-      // 1/out_rate (the codec timebase) - the same scheme the FIFO path uses
-      // when re-stamping - instead of replicating swr_next_pts() delay tracking.
       out.timeBase = this.codecContext.timeBase;
-      out.pts = this.resampledPts;
-      this.resampledPts += BigInt(out.nbSamples);
+      out.pts = pts;
     } else {
       out.timeBase = frame.timeBase;
       out.pts = frame.pts;
@@ -2568,17 +2599,48 @@ export class Encoder implements Disposable {
     out.format = this.codecContext.sampleFormat;
     out.sampleRate = this.codecContext.sampleRate;
     out.channelLayout = this.codecContext.channelLayout;
+    const pts = this.resampleChangesRate ? this.nextResampledPts(null) : AV_NOPTS_VALUE;
     const ret = this.audioResampler.convertFrame(out, null);
     if (ret < 0 || out.nbSamples <= 0) {
       return null;
     }
     if (this.resampleChangesRate) {
-      // Continue the running output-sample counter (see resampleAudio)
       out.timeBase = this.codecContext.timeBase;
-      out.pts = this.resampledPts;
-      this.resampledPts += BigInt(out.nbSamples);
+      out.pts = pts;
     }
     return out;
+  }
+
+  /**
+   * Timestamp of the resampler's next output sample in 1/target_rate.
+   *
+   * Mirrors the aresample filter: the input PTS goes to swr_next_pts() in
+   * 1/(in_rate * out_rate), which subtracts the samples still buffered in the
+   * resampler. Without an input PTS (or when draining) swr continues from the
+   * samples it has output so far.
+   *
+   * @param frame - Input frame about to be converted, or null when draining
+   *
+   * @returns Output timestamp in 1/target_rate
+   *
+   * @internal
+   */
+  private nextResampledPts(frame: Frame | null): bigint {
+    const inRate = BigInt(this.resampleInputRate);
+    const outRate = BigInt(this.codecContext.sampleRate);
+
+    let inPts = AV_NOPTS_VALUE;
+    if (frame && frame.pts !== AV_NOPTS_VALUE) {
+      const tb = frame.timeBase;
+      if (tb.num > 0 && tb.den > 0) {
+        inPts = avRescaleRnd(frame.pts, BigInt(tb.num) * inRate * outRate, BigInt(tb.den), AV_ROUND_NEAR_INF);
+      }
+    }
+
+    // Rounded division back to 1/out_rate (ROUNDED_DIV in af_aresample)
+    const outPts = this.audioResampler!.nextPts(inPts);
+    const half = inRate / 2n;
+    return (outPts >= 0n ? outPts + half : outPts - half) / inRate;
   }
 
   /**
