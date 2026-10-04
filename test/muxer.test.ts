@@ -395,8 +395,8 @@ describe('Muxer', () => {
 
   describe('startTime offset', () => {
     it('clamps a startTime that a zero-based audio stream does not carry', async () => {
-      // audio.aac decodes to zero-based timestamps; the AAC encoder re-stamps to a 0
-      // baseline too. A huge device-style startTime must therefore NOT be subtracted
+      // audio.aac decodes to zero-based timestamps and the AAC encoder keeps them.
+      // A huge device-style startTime must therefore NOT be subtracted
       // (that would push pts ~ -999999*48000 and overflow the MP4 edit list, which
       // QuickTime rejects as 0:00). The muxer should clamp it to 0 for this stream.
       const outputFile = getTempFile('m4a');
@@ -1757,6 +1757,66 @@ describe('Muxer', () => {
 
       // Second close is a no-op and must not throw
       await output.close();
+    });
+  });
+
+  describe('pre-mux queue', () => {
+    it('writes a packet queued while the header write is finishing', async () => {
+      await using input = await Demuxer.open(getInputFile('video.mp4'));
+      const videoStream = input.video();
+      const audioStream = input.audio();
+      assert(videoStream);
+      assert(audioStream);
+
+      const packets: Packet[] = [];
+      for await (using packet of input.packets()) {
+        if (!packet) break;
+        packets.push(packet.clone()!);
+      }
+
+      const outputFile = getTempFile('mp4');
+      const output = await Muxer.open(outputFile);
+      const videoIdx = output.addStream(videoStream);
+      const audioIdx = output.addStream(audioStream);
+      const indexOf = (packet: Packet): number => (packet.streamIndex === videoStream.index ? videoIdx : audioIdx);
+      const audioTotal = packets.filter((p) => p.streamIndex === audioStream.index).length;
+
+      // A concurrent writer reaching writePacket() right after the pre-mux
+      // queues were drained, while the header write has not settled yet.
+      const internals = output as unknown as { flushPreMuxQueues(): Promise<void> };
+      const flush = internals.flushPreMuxQueues.bind(output);
+      const late = packets.find((p) => p.streamIndex === audioStream.index)!;
+      const concurrent: Promise<void>[] = [];
+      internals.flushPreMuxQueues = async () => {
+        await flush();
+        if (concurrent.length === 0) {
+          concurrent.push(output.writePacket(late, audioIdx));
+        }
+      };
+
+      try {
+        const first = packets.find((p) => p.streamIndex === videoStream.index)!;
+        await output.writePacket(first, videoIdx);
+        await Promise.all(concurrent);
+        for (const packet of packets) {
+          if (packet !== first && packet !== late) {
+            await output.writePacket(packet, indexOf(packet));
+          }
+        }
+        await output.close();
+      } finally {
+        for (const packet of packets) packet.free();
+      }
+
+      await using result = await Demuxer.open(outputFile);
+      let audioPackets = 0;
+      for await (using packet of result.packets()) {
+        if (!packet) break;
+        if (packet.streamIndex === result.audio()?.index) audioPackets++;
+      }
+      assert.equal(audioPackets, audioTotal, 'the late packet must not be stranded in the pre-mux queue');
+
+      await cleanup();
     });
   });
 });

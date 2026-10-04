@@ -2,10 +2,11 @@ import assert from 'node:assert';
 import { existsSync, unlinkSync, writeFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
 
-import { Demuxer, FMP4Stream } from '../src/index.js';
-import { getInputFile, getOutputFile, prepareTestEnvironment, stallingFrameSource } from './index.js';
+import { PacketAgeWatchdog } from '../src/api/utilities/packet-age-watchdog.js';
+import { AV_NOPTS_VALUE, Demuxer, FMP4Stream, FormatContext } from '../src/index.js';
+import { getInputFile, getOutputFile, prepareTestEnvironment, stallingFrameSource, syntheticVideoFrame } from './index.js';
 
-import type { FMP4Data, MP4Box } from '../src/index.js';
+import type { Encoder, FMP4Data, FMP4StreamOptions, Frame, MediaFrameSource, MP4Box, Packet } from '../src/index.js';
 
 prepareTestEnvironment();
 
@@ -44,6 +45,135 @@ async function withTimeout<T>(promise: Promise<T>, ms = 5000): Promise<T> {
 
 const settle = async (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
+/**
+ * Open a test file whose video packets jump by `shiftSeconds` after the first
+ * `after` video packets, as if the source restarted its clock mid-stream. With
+ * `count`, only that many packets jump and the timeline then returns, like
+ * packets mapped with a stale clock reference.
+ */
+async function openShiftedInput(file: string, shiftSeconds: number, after = 10, count = Infinity): Promise<Demuxer> {
+  const input = await Demuxer.open(getInputFile(file));
+  const video = input.video()!;
+  const shift = BigInt(Math.round((shiftSeconds * video.timeBase.den) / video.timeBase.num));
+  const packets = input.packets.bind(input) as (index?: number) => AsyncGenerator<Packet | null>;
+  let seen = 0;
+  const shifted = async function* (index?: number): AsyncGenerator<Packet | null> {
+    for await (const packet of packets(index)) {
+      if (packet?.streamIndex === video.index && seen++ >= after && seen <= after + count) {
+        if (packet.dts !== AV_NOPTS_VALUE) packet.dts += shift;
+        if (packet.pts !== AV_NOPTS_VALUE) packet.pts += shift;
+      }
+      yield packet;
+    }
+  };
+  (input as unknown as { packets: typeof shifted }).packets = shifted;
+  return input;
+}
+
+/** How a paced test input changes from a media position on. */
+interface StallShape {
+  /** Media time in seconds from which the shape applies. */
+  from: number;
+  /** Rewrite the timestamps of every video packet from `from` on. */
+  video?: (packet: Packet, index: number) => void;
+  /** Rewrite the timestamps of every audio packet from `from` on. */
+  audio?: (packet: Packet) => void;
+  /** Drop every audio packet from `from` on, as if the stream went silent. */
+  silenceAudio?: boolean;
+  /** Deliver nothing for this many ms of wall-clock time at `from`, then go on at the same pace. */
+  pause?: number;
+}
+
+/**
+ * Open a test file whose packets are delivered at `speed` times real time, so
+ * wall-clock time passes like on a live source, and whose timeline takes the
+ * given shape from `shape.from` seconds on.
+ */
+async function openPacedInput(file: string, shape: StallShape, speed = 4): Promise<Demuxer> {
+  const input = await Demuxer.open(getInputFile(file));
+  const video = input.video()!;
+  const audio = input.audio();
+  const packets = input.packets.bind(input) as (index?: number) => AsyncGenerator<Packet | null>;
+  let start = Date.now();
+  let videoIndex = 0;
+  let paused = false;
+  const paced = async function* (index?: number): AsyncGenerator<Packet | null> {
+    for await (const packet of packets(index)) {
+      if (packet) {
+        const stream = packet.streamIndex === video.index ? video : audio;
+        const ts = packet.dts !== AV_NOPTS_VALUE ? packet.dts : packet.pts;
+        const seconds = stream && ts !== AV_NOPTS_VALUE ? (Number(ts) * stream.timeBase.num) / stream.timeBase.den : 0;
+        if (shape.pause && !paused && seconds >= shape.from) {
+          paused = true;
+          await new Promise((resolve) => setTimeout(resolve, shape.pause));
+          start += shape.pause;
+        }
+        const wait = start + (seconds * 1000) / speed - Date.now();
+        if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+        if (seconds >= shape.from) {
+          if (packet.streamIndex === video.index) {
+            shape.video?.(packet, videoIndex++);
+          } else if (shape.silenceAudio) {
+            packet.free();
+            continue;
+          } else {
+            shape.audio?.(packet);
+          }
+        }
+      }
+      yield packet;
+    }
+  };
+  (input as unknown as { packets: typeof paced }).packets = paced;
+  return input;
+}
+
+interface SessionResult {
+  stream: FMP4Stream;
+  closeCalls: (Error | undefined)[];
+  fragments: number;
+}
+
+/** Run a stream-copy FMP4Stream until its first onClose, then give a second onClose time to show up. */
+async function runSession(input: string | Demuxer, options: FMP4StreamOptions = {}): Promise<SessionResult> {
+  const closeCalls: (Error | undefined)[] = [];
+  const closed = Promise.withResolvers<void>();
+  let fragments = 0;
+  const stream = FMP4Stream.create(input, {
+    supportedCodecs: 'avc1,mp4a.40.2',
+    boxMode: true,
+    fragDuration: 500_000,
+    onData: (_data: Buffer, info: FMP4Data) => {
+      if (info.boxes.some((b) => b.type === 'moof')) fragments++;
+    },
+    onClose: (error) => {
+      closeCalls.push(error);
+      closed.resolve();
+    },
+    ...options,
+  });
+  await stream.start();
+  await withTimeout(closed.promise, 15000);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  return { stream, closeCalls, fragments };
+}
+
+/** Collect unhandled rejections raised while `fn` runs (plus one macrotask). */
+async function withUnhandledRejections<T>(fn: () => Promise<T>): Promise<{ result: T; rejections: unknown[] }> {
+  const rejections: unknown[] = [];
+  const onRejection = (reason: unknown): void => {
+    rejections.push(reason);
+  };
+  process.on('unhandledRejection', onRejection);
+  try {
+    const result = await fn();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    return { result, rejections };
+  } finally {
+    process.off('unhandledRejection', onRejection);
+  }
+}
+
 function box(type: string, payload: Buffer | number): Buffer {
   const body = typeof payload === 'number' ? Buffer.alloc(payload, 0xab) : payload;
   const buf = Buffer.alloc(8 + body.length);
@@ -65,6 +195,58 @@ function box64(type: string, payload: Buffer | number): Buffer {
 
 function mediaFragment(marker: number): Buffer {
   return Buffer.concat([box('moof', Buffer.from([marker, 0, 0, 0])), box('mdat', Buffer.from([marker, 1, 2, 3, 4, 5]))]);
+}
+
+/** Start and duration in seconds of every video sample in an fMP4 byte stream, from its moov and moof boxes. */
+function videoSamples(output: Buffer): { start: number; duration: number }[] {
+  const children = (buf: Buffer): { type: string; body: Buffer }[] => {
+    const list: { type: string; body: Buffer }[] = [];
+    for (let offset = 0; offset + 8 <= buf.length;) {
+      const size = buf.readUInt32BE(offset);
+      if (size < 8 || offset + size > buf.length) break;
+      list.push({ type: buf.toString('latin1', offset + 4, offset + 8), body: buf.subarray(offset + 8, offset + size) });
+      offset += size;
+    }
+    return list;
+  };
+  const all = (buf: Buffer, type: string): Buffer[] => children(buf).flatMap((b) => (b.type === type ? [b.body] : []));
+  const one = (buf: Buffer, type: string): Buffer => all(buf, type)[0];
+
+  let trackId = 0;
+  let timescale = 1;
+  const samples: { start: number; duration: number }[] = [];
+  for (const top of children(output)) {
+    if (top.type === 'moov') {
+      for (const trak of all(top.body, 'trak')) {
+        const mdia = one(trak, 'mdia');
+        if (one(mdia, 'hdlr').toString('latin1', 8, 12) !== 'vide') continue;
+        const tkhd = one(trak, 'tkhd');
+        const mdhd = one(mdia, 'mdhd');
+        trackId = tkhd.readUInt32BE(tkhd[0] === 1 ? 20 : 12);
+        timescale = mdhd.readUInt32BE(mdhd[0] === 1 ? 20 : 12);
+      }
+    }
+    for (const traf of top.type === 'moof' ? all(top.body, 'traf') : []) {
+      const tfhd = one(traf, 'tfhd');
+      if (tfhd.readUInt32BE(4) !== trackId) continue;
+      const tfhdFlags = tfhd.readUInt32BE(0) & 0xffffff;
+      const defaultDuration = tfhdFlags & 0x8 ? tfhd.readUInt32BE(8 + (tfhdFlags & 0x1 ? 8 : 0) + (tfhdFlags & 0x2 ? 4 : 0)) : 0;
+      const tfdt = one(traf, 'tfdt');
+      let dts = Number(tfdt[0] === 1 ? tfdt.readBigUInt64BE(4) : tfdt.readUInt32BE(4));
+      for (const trun of all(traf, 'trun')) {
+        const flags = trun.readUInt32BE(0) & 0xffffff;
+        const fields = [0x100, 0x200, 0x400, 0x800].filter((f) => flags & f).length;
+        let offset = 8 + (flags & 0x1 ? 4 : 0) + (flags & 0x4 ? 4 : 0);
+        for (let i = trun.readUInt32BE(4); i > 0; i--) {
+          const duration = flags & 0x100 ? trun.readUInt32BE(offset) : defaultDuration;
+          samples.push({ start: dts / timescale, duration: duration / timescale });
+          dts += duration;
+          offset += 4 * fields;
+        }
+      }
+    }
+  }
+  return samples;
 }
 
 interface ParseResult {
@@ -671,6 +853,664 @@ describe('FMP4Stream', () => {
         }
       } finally {
         if (existsSync(outputFile)) unlinkSync(outputFile);
+      }
+    });
+
+    it('sets the encoder GOP to the fragment duration, and to 2 s when fragments are shorter than 0.5 s', async () => {
+      const gopOf = async (input: string | MediaFrameSource, options: FMP4StreamOptions): Promise<number | undefined> => {
+        let gop: number | undefined;
+        const closed = Promise.withResolvers<void>();
+        const stream: FMP4Stream = FMP4Stream.create(input, {
+          supportedCodecs: 'avc1.640029',
+          ...options,
+          // The encoder applies its settings on the first frame, before the first output.
+          onData: () => {
+            gop ??= (stream as unknown as { videoEncoder?: Encoder }).videoEncoder?.getCodecContext()?.gopSize;
+          },
+          onClose: (error) => (error ? closed.reject(error) : closed.resolve()),
+        });
+        await stream.start();
+        await withTimeout(closed.promise, 30000);
+        await stream.stop();
+        return gop;
+      };
+      const frames = async function* (): AsyncGenerator<Frame> {
+        for (let i = 0; i < 10; i++) yield syntheticVideoFrame(i);
+      };
+
+      // hevc-short.mp4 runs at 15 fps, a frame source at the 30 fps default. The default
+      // fragDuration of 1 µs flushes after every frame and used to make every frame a keyframe,
+      // and fragments of a few frames made nearly every frame one.
+      for (const [label, options, fileGop, framesGop] of [
+        ['default', {}, 30, 60],
+        ['0', { fragDuration: 0 }, 30, 60],
+        ['0.4 s', { fragDuration: 400_000 }, 30, 60],
+        ['0.5 s', { fragDuration: 500_000 }, 8, 15],
+        ['4 s', { fragDuration: 4_000_000 }, 60, 120],
+      ] as const) {
+        assert.equal(await gopOf(getInputFile('hevc-short.mp4'), options), fileGop, `transcoded input, fragDuration ${label}`);
+        assert.equal(await gopOf({ video: frames() }, options), framesGop, `frame source, fragDuration ${label}`);
+      }
+    });
+  });
+
+  describe('timestamp discontinuities', () => {
+    for (const [label, file] of [
+      ['two streams, background write queue', 'video.mp4'],
+      ['one stream, direct write', 'test.mp4'],
+    ] as const) {
+      it(`ends with exactly one onClose(error) and releases the input on an 11s backward jump (${label})`, async () => {
+        const { result, rejections } = await withUnhandledRejections(async () => {
+          const input = await openShiftedInput(file, -11);
+          const session = await runSession(input);
+          return { ...session, input };
+        });
+        const { stream, closeCalls, input } = result;
+
+        assert.equal(closeCalls.length, 1, 'onClose must fire exactly once');
+        assert.match(closeCalls[0]?.message ?? '', /Timestamp discontinuity on output stream \d+: DTS jumped back 10\.9\d{2}s, more than dtsBackwardThreshold \(10s\)/);
+        assert.equal(input.isInputOpen, false, 'the input must be closed before onClose');
+        const s = stream as unknown as Record<string, unknown>;
+        assert.deepEqual([s.input, s.output, s.pipeline], [undefined, undefined, undefined], 'no resource may outlive the failed session');
+        await withTimeout(stream.stop(), 5000);
+        assert.equal(rejections.length, 0, `unhandled rejections: ${String(rejections[0])}`);
+      });
+    }
+
+    it('skips the trailer when a session fails, and writes it when the session ends cleanly', async () => {
+      const original: (this: FormatContext) => Promise<number> = Reflect.get(FormatContext.prototype, 'writeTrailer');
+      let trailers = 0;
+      FormatContext.prototype.writeTrailer = async function (this: FormatContext): Promise<number> {
+        trailers++;
+        return original.call(this);
+      };
+      try {
+        const failed = await runSession(await openShiftedInput('video.mp4', -11));
+        assert.match(failed.closeCalls[0]?.message ?? '', /DTS jumped back/);
+        await failed.stream.stop();
+        assert.equal(trailers, 0, 'the output of a failed session is discarded, trailer included');
+
+        const clean = await runSession(inputFile);
+        assert.deepEqual(clean.closeCalls, [undefined]);
+        await clean.stream.stop();
+        assert.equal(trailers, 1);
+      } finally {
+        FormatContext.prototype.writeTrailer = original;
+      }
+    });
+
+    it('clamps a 9s backward jump and ends cleanly', async () => {
+      const input = await openShiftedInput('video.mp4', -9);
+      const { stream, closeCalls } = await runSession(input);
+      assert.deepEqual(closeCalls, [undefined]);
+      await stream.stop();
+    });
+
+    it('clamps an 11s backward jump when dtsBackwardThreshold is 0', async () => {
+      const input = await openShiftedInput('video.mp4', -11);
+      const { stream, closeCalls } = await runSession(input, { dtsBackwardThreshold: 0 });
+      assert.deepEqual(closeCalls, [undefined]);
+      await stream.stop();
+    });
+
+    for (const [label, file] of [
+      ['two streams, background write queue', 'video.mp4'],
+      ['one stream, direct write', 'test.mp4'],
+    ] as const) {
+      it(`ends with onClose(error) instead of aborting on a forward step mp4 cannot store (${label})`, async () => {
+        // 200000s is past INT_MAX ticks at the 1/12288 and 1/15360 output time bases
+        const { result, rejections } = await withUnhandledRejections(async () => {
+          const input = await openShiftedInput(file, 200_000);
+          return { ...(await runSession(input)), input };
+        });
+        const { stream, closeCalls, input } = result;
+        assert.equal(closeCalls.length, 1, 'onClose must fire exactly once');
+        assert.match(closeCalls[0]?.message ?? '', /Timestamp discontinuity on output stream \d+: DTS jumped forward \d+ ticks/);
+        assert.equal(input.isInputOpen, false, 'the input must be closed before onClose');
+        await withTimeout(stream.stop(), 5000);
+        assert.equal(rejections.length, 0, `unhandled rejections: ${String(rejections[0])}`);
+      });
+    }
+
+    for (const [label, fragDuration] of [
+      ['fragments cut at keyframes', 0],
+      ['default fragments', 1],
+    ] as const) {
+      for (const boxMode of [true, false]) {
+        it(`emits nothing the muxer still held when a session fails (${label}, ${boxMode ? 'box' : 'chunk'} mode)`, async () => {
+          // Six video packets 1800s ahead, then the timeline returns and the backward check ends the session.
+          const input = await openShiftedInput('video.mp4', 1800, 39, 6);
+          const output: Buffer[] = [];
+          const { stream, closeCalls } = await runSession(input, { boxMode, fragDuration, onData: (data: Buffer) => output.push(Buffer.from(data)) });
+          assert.match(closeCalls[0]?.message ?? '', /DTS jumped back 1799\.9\d+s/);
+
+          const samples = videoSamples(Buffer.concat(output));
+          assert.ok(samples.length > 0, 'the video before the jump must be emitted');
+          assert.deepEqual(
+            samples.filter((s) => s.start >= 10),
+            [],
+            'no sample placed ahead by the jump may reach onData',
+          );
+          // With a fragment duration, the audio closes a fragment while the first packet ahead waits
+          // in the muxer, and movenc takes the last video sample's duration from that packet: the
+          // sample spanning the jump has left before the session fails. Keyframe cuts keep it queued.
+          if (fragDuration === 0) {
+            assert.deepEqual(
+              samples.filter((s) => s.duration >= 10),
+              [],
+              'no sample may span the jump',
+            );
+          }
+          await stream.stop();
+        });
+      }
+    }
+
+    for (const [label, fragDuration] of [
+      ['fragments cut at keyframes', 0],
+      ['default fragments', 1],
+    ] as const) {
+      for (const [jump, both] of [
+        ['a forward jump of the video', false],
+        ['an equal forward jump of both streams', true],
+      ] as const) {
+        it(`leaves no sample spanning ${jump} that the forward check rejects (${label})`, async () => {
+          // Read in real time (4x) so both streams reach the jump together, as from a live source.
+          const shift = (packet: Packet): void => {
+            const tb = input.streams[packet.streamIndex].timeBase;
+            const ticks = BigInt(Math.round((1800 * tb.den) / tb.num));
+            packet.dts += ticks;
+            packet.pts += ticks;
+          };
+          const input = await openPacedInput('video.mp4', { from: 2, video: shift, audio: both ? shift : undefined });
+          const output: Buffer[] = [];
+          const { stream, closeCalls } = await runSession(input, { fragDuration, dtsForwardThreshold: 10, onData: (data: Buffer) => output.push(Buffer.from(data)) });
+          assert.equal(closeCalls.length, 1, 'onClose must fire exactly once');
+          assert.match(closeCalls[0]?.message ?? '', /DTS jumped forward 1800\.\d{3}s while \d+\.\d{3}s passed, more than dtsForwardThreshold \(10s\)/);
+
+          // Unlike the backward check above, the jump never reaches libavformat, so movenc
+          // cannot take it as the duration of the last sample before it.
+          const samples = videoSamples(Buffer.concat(output));
+          assert.ok(samples.length > 0, 'the video before the jump must be emitted');
+          assert.deepEqual(
+            samples.filter((s) => s.start >= 10 || s.duration >= 10),
+            [],
+            'no sample may span or follow the jump',
+          );
+          await stream.stop();
+        });
+      }
+    }
+
+    it('still emits the muxer backlog and trailer on a deliberate stop', async () => {
+      const input = await openPacedInput('video.mp4', { from: Infinity });
+      const afterStop: string[] = [];
+      let stopping = false;
+      const stream = FMP4Stream.create(input, {
+        supportedCodecs: 'avc1,mp4a.40.2',
+        boxMode: true,
+        fragDuration: 0,
+        onData: (_data: Buffer, info: FMP4Data) => {
+          if (stopping) afterStop.push(...info.boxes.map((b) => b.type));
+        },
+      });
+      await stream.start();
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      stopping = true;
+      await withTimeout(stream.stop(), 5000);
+      assert.ok(afterStop.includes('moof'), `the open fragment must be flushed, got [${afterStop.join(', ')}]`);
+      assert.equal(afterStop.at(-1), 'mfra', 'the trailer must be written');
+    });
+
+    it('runs a fresh session normally after a failed one', async () => {
+      const failed = await runSession(await openShiftedInput('video.mp4', -11));
+      assert.ok(failed.closeCalls[0], 'the first session must fail');
+
+      const fresh = await runSession(inputFile);
+      assert.deepEqual(fresh.closeCalls, [undefined]);
+      assert.ok(fresh.fragments > 0, 'the fresh session must produce fragments');
+      await fresh.stream.stop();
+    });
+
+    it('rejects an invalid dtsBackwardThreshold', () => {
+      for (const value of [-1, NaN, Infinity]) {
+        assert.throws(() => FMP4Stream.create(inputFile, { dtsBackwardThreshold: value }), RangeError);
+      }
+    });
+
+    it('checks forward jumps by default only for live inputs', async () => {
+      const thresholdOf = (input: string | Demuxer | MediaFrameSource, options: FMP4StreamOptions = {}): number =>
+        (FMP4Stream.create(input, options) as unknown as { options: { dtsForwardThreshold: number } }).options.dtsForwardThreshold;
+
+      const live = [
+        'rtsp://127.0.0.1/cam',
+        'RTSP://cam/stream?video',
+        'rtmp://host/app',
+        'rtp://127.0.0.1:5004',
+        'udp://0.0.0.0:1234',
+        'srt://host:9000',
+        'tcp://host:1',
+        'sctp://host:1',
+        'rtsps://unifi:7441/stream',
+        'rtmps://host/app',
+        'rtmpt://host/app',
+        'rtmpe://host/app',
+        'rtmpte://host/app',
+        'rtmpts://host/app',
+        'srtp://127.0.0.1:5004',
+        'tls://host:1',
+      ];
+      assert.deepEqual(
+        live.map((url) => thresholdOf(url)),
+        live.map(() => 10),
+      );
+      // Live inputs also get the low-latency input options.
+      const inputOptionsOf = (url: string): Record<string, unknown> =>
+        (FMP4Stream.create(url) as unknown as { inputOptions: { options: Record<string, unknown> } }).inputOptions.options;
+      assert.deepEqual(
+        live.map((url) => inputOptionsOf(url).fflags),
+        live.map(() => 'nobuffer'),
+      );
+      await using demuxer = await Demuxer.open(inputFile);
+      const notLive: (string | Demuxer | MediaFrameSource)[] = [
+        inputFile,
+        'https://host/video.mp4',
+        'http://host/live.m3u8',
+        'rtmpx://host/app',
+        'file:rtsp.mp4',
+        demuxer,
+        { video: stallingFrameSource(0, () => {}) },
+      ];
+      assert.deepEqual(
+        notLive.map((input) => thresholdOf(input)),
+        notLive.map(() => 0),
+      );
+      assert.equal(thresholdOf(inputFile, { dtsForwardThreshold: 5 }), 5);
+      assert.equal(thresholdOf('rtsp://127.0.0.1/cam', { dtsForwardThreshold: 0 }), 0);
+      for (const value of [-1, NaN, Infinity]) {
+        assert.throws(() => FMP4Stream.create('rtsp://127.0.0.1/cam', { dtsForwardThreshold: value }), /^RangeError: dtsForwardThreshold must be/);
+      }
+    });
+
+    for (const [label, file, from] of [
+      ['two streams, background write queue', 'video.mp4', 2],
+      ['one stream, direct write', 'test.mp4', 0.5],
+    ] as const) {
+      for (const boxMode of [true, false]) {
+        it(`ends with exactly one onClose(error) on a forward jump of a source read in real time (${label}, ${boxMode ? 'box' : 'chunk'} mode)`, async () => {
+          // Delivered at 4x real time: every step runs ahead by 3/4 of a frame, a jump by 1800 s.
+          const input = await openPacedInput(file, {
+            from,
+            video: (packet: Packet) => {
+              const shift = 1800n * BigInt(input.video()!.timeBase.den);
+              packet.dts += shift;
+              packet.pts += shift;
+            },
+          });
+          const output: Buffer[] = [];
+          const { result, rejections } = await withUnhandledRejections(async () =>
+            runSession(input, { boxMode, dtsForwardThreshold: 10, onData: (data: Buffer) => output.push(Buffer.from(data)) }),
+          );
+          const { stream, closeCalls } = result;
+
+          assert.equal(closeCalls.length, 1, 'onClose must fire exactly once');
+          assert.match(
+            closeCalls[0]?.message ?? '',
+            /^Timestamp discontinuity on output stream \d: DTS jumped forward 1800\.0\d\ds while \d+\.\d{3}s passed, more than dtsForwardThreshold \(10s\)$/,
+          );
+          assert.equal(input.isInputOpen, false, 'the input must be closed before onClose');
+          if (boxMode) {
+            const samples = videoSamples(Buffer.concat(output));
+            assert.ok(samples.length > 0, 'the video before the jump must be emitted');
+            assert.deepEqual(
+              samples.filter((s) => s.start >= 10 || s.duration >= 10),
+              [],
+              'no sample may span or follow the jump',
+            );
+          }
+          await withTimeout(stream.stop(), 5000);
+          assert.equal(rejections.length, 0, `unhandled rejections: ${String(rejections[0])}`);
+        });
+      }
+    }
+
+    it('runs a session read in real time to the end with the forward check on, also across a pause', async () => {
+      for (const shape of [{ from: Infinity }, { from: 1, pause: 3000 }]) {
+        const input = await openPacedInput('video.mp4', shape);
+        const { stream, closeCalls, fragments } = await runSession(input, { dtsForwardThreshold: 10 });
+        assert.deepEqual(closeCalls, [undefined], `shape ${JSON.stringify(shape)}`);
+        assert.ok(fragments > 0);
+        await stream.stop();
+      }
+    });
+
+    it('leaves a forward jump of a file to the muxer by default', async () => {
+      const input = await openShiftedInput('test.mp4', 1800);
+      const output: Buffer[] = [];
+      const { stream, closeCalls } = await runSession(input, { onData: (data: Buffer) => output.push(Buffer.from(data)) });
+      assert.deepEqual(closeCalls, [undefined]);
+      assert.ok(
+        videoSamples(Buffer.concat(output)).some((s) => s.duration >= 1799),
+        'without the check the step stays in the timeline',
+      );
+      await stream.stop();
+    });
+  });
+
+  describe('teardown after a pipeline error', () => {
+    interface TeardownInternals {
+      attachCompletion(completion: Promise<void>): void;
+      pipeline?: { isStopped(): boolean; stop(): void; completion: Promise<void> };
+      output?: { close(): Promise<void>; discardOnClose(): void };
+      videoDecoder?: { close(): void };
+      input?: { close(): Promise<void> };
+    }
+
+    it('releases every resource and reports the error once when closing the output rethrows it', async () => {
+      const failure = new Error('write worker failed');
+      const closeCalls: (Error | undefined)[] = [];
+      const closed: string[] = [];
+      const stream = FMP4Stream.create('unused', { onClose: (error) => closeCalls.push(error) });
+      const internals = stream as unknown as TeardownInternals;
+
+      const completion = Promise.reject(failure);
+      completion.catch(() => {});
+      internals.pipeline = { isStopped: () => true, stop: () => {}, completion };
+      internals.output = {
+        close: async () => {
+          closed.push('output');
+          throw failure;
+        },
+        discardOnClose: () => closed.push('discard'),
+      };
+      internals.videoDecoder = { close: () => closed.push('decoder') };
+      internals.input = {
+        close: async () => {
+          closed.push('input');
+        },
+      };
+
+      const { rejections } = await withUnhandledRejections(async () => {
+        internals.attachCompletion(completion);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+
+      assert.deepEqual(closed, ['discard', 'output', 'decoder', 'input'], 'a failing output close must not skip the rest of the teardown');
+      assert.deepEqual(closeCalls, [failure]);
+      assert.equal(rejections.length, 0, `unhandled rejections: ${String(rejections[0])}`);
+      await withTimeout(stream.stop(), 1000);
+    });
+
+    it('calls a throwing onClose once, logs its error and leaves no rejected promise', async () => {
+      for (const outcome of ['resolved', 'rejected'] as const) {
+        let calls = 0;
+        const stream = FMP4Stream.create('unused', {
+          onClose: () => {
+            calls++;
+            throw new Error('owner callback failed');
+          },
+        });
+        const internals = stream as unknown as TeardownInternals;
+        const completion = outcome === 'resolved' ? Promise.resolve() : Promise.reject(new Error('pipeline failed'));
+        completion.catch(() => {});
+
+        const logged: unknown[][] = [];
+        const origError = console.error;
+        console.error = (...args: unknown[]) => logged.push(args);
+        let rejections: unknown[];
+        try {
+          ({ rejections } = await withUnhandledRejections(async () => {
+            internals.attachCompletion(completion);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }));
+        } finally {
+          console.error = origError;
+        }
+
+        assert.equal(calls, 1, `onClose must fire exactly once (${outcome})`);
+        assert.equal(rejections.length, 0, `unhandled rejections (${outcome}): ${String(rejections[0])}`);
+        assert.deepEqual(
+          logged.map(([prefix, error]) => [prefix, (error as Error).message]),
+          [['[FMP4Stream] onClose callback threw:', 'owner callback failed']],
+          `the callback error must be logged once (${outcome})`,
+        );
+      }
+    });
+  });
+
+  describe('maxPacketAge', () => {
+    const fullBox = (type: string, version: number, flags: number, body: Buffer): Buffer => {
+      const header = Buffer.alloc(4);
+      header.writeUInt32BE(((version & 0xff) << 24) | (flags & 0xffffff), 0);
+      return box(type, Buffer.concat([header, body]));
+    };
+    const u32 = (...values: number[]): Buffer => {
+      const buf = Buffer.alloc(values.length * 4);
+      values.forEach((v, i) => buf.writeUInt32BE(v, i * 4));
+      return buf;
+    };
+    // trun with data offset and per-sample sizes, like movenc writes it
+    const trun = (count: number): Buffer => fullBox('trun', 0, 0x000201, u32(count, 0, ...new Array<number>(count).fill(100)));
+    const traf = (trackId: number, ...counts: number[]): Buffer =>
+      box('traf', Buffer.concat([fullBox('tfhd', 0, 0x020000, u32(trackId)), fullBox('tfdt', 1, 0, Buffer.alloc(8)), ...counts.map(trun)]));
+    const moof = (...trafs: Buffer[]): Buffer => box('moof', Buffer.concat([fullBox('mfhd', 0, 0, u32(1)), ...trafs]));
+    // moov whose sample tables carry `samples` per track (a first fragment written without empty_moov)
+    const moov = (...tracks: [number, number][]): Buffer => {
+      const traks = tracks.map(([trackId, samples]) => {
+        const tkhd = fullBox('tkhd', 0, 3, Buffer.concat([u32(0, 0, trackId), Buffer.alloc(68)]));
+        const stbl = box('stbl', Buffer.concat([box('stsd', 16), fullBox('stsz', 0, 0, u32(0, samples, ...new Array<number>(samples).fill(100)))]));
+        return box('trak', Buffer.concat([tkhd, box('mdia', Buffer.concat([box('mdhd', 24), box('hdlr', 24), box('minf', stbl)]))]));
+      });
+      return box('moov', Buffer.concat([box('mvhd', 100), ...traks]));
+    };
+    const sleep = async (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+    const pending = (watchdog: PacketAgeWatchdog): number[] => [0, 1].map((i) => watchdog.pendingPackets(i));
+    const announce = (watchdog: PacketAgeWatchdog, video: number, audio: number): void => {
+      for (let i = 0; i < video; i++) watchdog.onPacket(0);
+      for (let i = 0; i < audio; i++) watchdog.onPacket(1);
+    };
+
+    it('drains pending packets by the trun sample counts of each track', () => {
+      const watchdog = new PacketAgeWatchdog(60, () => '');
+      announce(watchdog, 6, 4);
+      // several truns per traf: movenc splits a run when the sample data is not contiguous
+      watchdog.consumeBox(moof(traf(1, 3, 2), traf(2, 4)));
+      assert.deepEqual(pending(watchdog), [1, 0]);
+      // more samples than recorded packets are not credited to later packets
+      watchdog.consumeBox(moof(traf(1, 5)));
+      watchdog.onPacket(0);
+      assert.deepEqual(pending(watchdog), [1, 0]);
+      // tracks movenc adds itself (no stream behind them) are ignored
+      watchdog.consumeBox(moof(traf(7, 3)));
+      assert.deepEqual(pending(watchdog), [1, 0]);
+    });
+
+    it('drains samples a moov carries when the first fragment is written without empty_moov', () => {
+      const watchdog = new PacketAgeWatchdog(60, () => '');
+      announce(watchdog, 5, 3);
+      watchdog.consumeBox(moov([1, 4], [2, 3]));
+      assert.deepEqual(pending(watchdog), [1, 0]);
+    });
+
+    it('frames raw output chunks across any split, including 64-bit boxes', () => {
+      const output = Buffer.concat([
+        box('ftyp', 16),
+        moov([1, 2], [2, 0]),
+        moof(traf(1, 3), traf(2, 2)),
+        box('mdat', 5000),
+        moof(traf(1, 1)),
+        box64('mdat', 700),
+        moof(traf(2, 4)),
+        box('mdat', 10),
+      ]);
+      const chunkings: number[][] = [[output.length], Array.from({ length: output.length }, () => 1), [5, 9, 100, 333, 4096, 7, 11, 2048]];
+      for (const sizes of chunkings) {
+        const watchdog = new PacketAgeWatchdog(60, () => '');
+        announce(watchdog, 7, 7);
+        let offset = 0;
+        for (let i = 0; offset < output.length; i++) {
+          const size = sizes[i % sizes.length];
+          watchdog.consumeChunk(output.subarray(offset, offset + size));
+          offset += size;
+        }
+        assert.deepEqual(pending(watchdog), [1, 1], `chunk sizes ${sizes.slice(0, 8).join(',')}`);
+      }
+    });
+
+    it('fails the next packet once a pending packet is older than the limit', async () => {
+      const watchdog = new PacketAgeWatchdog(0.02, (index) => (index === 0 ? 'video' : 'audio'));
+      watchdog.onPacket(0);
+      watchdog.onPacket(1);
+      watchdog.consumeBox(moof(traf(2, 1)));
+      await sleep(40);
+      // the stalled stream is caught by a packet of the stream that still flows
+      assert.throws(
+        () => watchdog.onPacket(1),
+        /^Error: Muxer stall on output stream 0 \(video\): the oldest of 1 pending packets has waited \d+\.\ds .*maxPacketAge \(0\.02s\)$/,
+      );
+    });
+
+    it('forgets packets libavformat rejected', async () => {
+      const watchdog = new PacketAgeWatchdog(0.02, () => '');
+      watchdog.onPacket(0);
+      watchdog.onPacketRejected(0);
+      await sleep(40);
+      assert.doesNotThrow(() => watchdog.onPacket(0));
+    });
+
+    it('stops judging and recording once the output framing is lost', async () => {
+      const watchdog = new PacketAgeWatchdog(0.02, () => '');
+      announce(watchdog, 3, 2);
+      // a box of size 0 cannot be framed in a stream
+      watchdog.consumeChunk(Buffer.concat([box('ftyp', 8), Buffer.from([0, 0, 0, 0, 0x6d, 0x6f, 0x6f, 0x66])]));
+      assert.deepEqual(pending(watchdog), [0, 0], 'a blind watchdog must drop what it recorded');
+      await sleep(40);
+      assert.doesNotThrow(() => announce(watchdog, 1000, 1000));
+      watchdog.onPacketRejected(0);
+      assert.deepEqual(pending(watchdog), [0, 0], 'a blind watchdog must not grow');
+    });
+
+    it('counts a pause of the whole input as at most 2 s', (t) => {
+      let now = 1000;
+      t.mock.method(performance, 'now', () => now);
+      const watchdog = new PacketAgeWatchdog(5, () => '');
+      watchdog.onPacket(0);
+      watchdog.onPacket(1);
+      watchdog.consumeBox(moof(traf(2, 1)));
+      // an hour without any packet, e.g. a stalled source or a suspended host
+      now += 3_600_000;
+      assert.equal(watchdog.pendingAge(0), 2000);
+      assert.doesNotThrow(() => watchdog.onPacket(1));
+      // while packets flow, the time between them counts in full
+      for (let i = 0; i < 75; i++) {
+        now += 40;
+        watchdog.onPacket(1);
+        watchdog.consumeBox(moof(traf(2, 1)));
+      }
+      assert.equal(watchdog.pendingAge(0), 5000);
+      now += 40;
+      assert.throws(() => watchdog.onPacket(1), /^Error: Muxer stall on output stream 0: the oldest of 1 pending packets has waited 5\.0s /);
+    });
+
+    const constant = (): ((packet: Packet) => void) => {
+      let dts: bigint | undefined;
+      return (packet) => {
+        dts ??= packet.dts;
+        packet.dts = dts;
+        packet.pts = dts;
+      };
+    };
+
+    for (const [label, shape, options] of [
+      ['constant timestamps', (): StallShape => ({ from: 1, video: constant(), silenceAudio: true }), {}],
+      [
+        'missing timestamps',
+        (): StallShape => ({
+          from: 1,
+          video: (packet: Packet) => {
+            packet.dts = AV_NOPTS_VALUE;
+            packet.pts = AV_NOPTS_VALUE;
+          },
+          silenceAudio: true,
+        }),
+        {},
+      ],
+      [
+        // #351: one packet far ahead latches the stream while the other goes silent
+        'a forward spike with dtsBackwardThreshold 0',
+        (): StallShape => ({
+          from: 1,
+          video: (packet: Packet, index: number) => {
+            if (index === 0) {
+              packet.dts += 20000n * 12288n;
+              packet.pts += 20000n * 12288n;
+            }
+          },
+          silenceAudio: true,
+        }),
+        { dtsBackwardThreshold: 0 },
+      ],
+    ] as const) {
+      for (const boxMode of [true, false]) {
+        it(`ends with onClose(error) when packets pile up behind ${label} and a silent stream (${boxMode ? 'box' : 'chunk'} mode)`, async () => {
+          const { result, rejections } = await withUnhandledRejections(async () => {
+            const input = await openPacedInput('video.mp4', shape());
+            return { ...(await runSession(input, { fragDuration: 1, maxPacketAge: 0.25, boxMode, ...options })), input };
+          });
+          const { stream, closeCalls, input } = result;
+          assert.equal(closeCalls.length, 1, 'onClose must fire exactly once');
+          assert.match(closeCalls[0]?.message ?? '', /^Muxer stall on output stream \d \((video|audio)\): .* more than maxPacketAge \(0\.25s\)$/);
+          assert.equal(input.isInputOpen, false, 'the input must be closed before onClose');
+          await withTimeout(stream.stop(), 5000);
+          assert.equal(rejections.length, 0, `unhandled rejections: ${String(rejections[0])}`);
+        });
+      }
+    }
+
+    it('runs a paced healthy session to the end', async () => {
+      // Normal ages here are a few ms; the margin absorbs a slow machine.
+      const input = await openPacedInput('video.mp4', { from: Infinity });
+      const { stream, closeCalls, fragments } = await runSession(input, { fragDuration: 1, maxPacketAge: 1 });
+      assert.deepEqual(closeCalls, [undefined]);
+      assert.ok(fragments > 0);
+      await stream.stop();
+    });
+
+    it('runs to the end when the whole input pauses for longer than maxPacketAge', async () => {
+      // A few packets are always pending; the pause must not age them past the limit.
+      const input = await openPacedInput('video.mp4', { from: 1, pause: 5000 });
+      const { stream, closeCalls, fragments } = await runSession(input, { maxPacketAge: 4 });
+      assert.deepEqual(closeCalls, [undefined]);
+      assert.ok(fragments > 0);
+      await stream.stop();
+    });
+
+    it('lets packets pile up when maxPacketAge is 0', async () => {
+      const input = await openPacedInput('video.mp4', { from: 1, video: constant(), silenceAudio: true });
+      const { stream, closeCalls } = await runSession(input, { fragDuration: 1, maxPacketAge: 0 });
+      assert.deepEqual(closeCalls, [undefined]);
+      await stream.stop();
+    });
+
+    for (const [label, options] of [
+      ['default options, box mode', {}],
+      ['chunk mode, small I/O buffer', { boxMode: false, bufferSize: 4096 }],
+      ['moov carrying the first fragment', { movFlags: '+frag_keyframe' }],
+      ['fragments only at keyframes', { fragDuration: 0 }],
+      ['a fragment per frame', { movFlags: '+frag_every_frame+empty_moov' }],
+    ] as const) {
+      it(`leaves no packet pending after a normal session (${label})`, async () => {
+        const { stream, closeCalls } = await runSession(inputFile, options);
+        assert.deepEqual(closeCalls, [undefined]);
+        const watchdog = (stream as unknown as { packetAgeWatchdog: PacketAgeWatchdog }).packetAgeWatchdog;
+        assert.deepEqual(pending(watchdog), [0, 0]);
+        await stream.stop();
+      });
+    }
+
+    it('rejects an invalid maxPacketAge', () => {
+      for (const value of [-1, NaN, Infinity]) {
+        assert.throws(() => FMP4Stream.create(inputFile, { maxPacketAge: value }), RangeError);
       }
     });
   });

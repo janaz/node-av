@@ -413,4 +413,99 @@ describe('RTPStream', skipWerift, () => {
       assert.equal(internals.pipeline, undefined, 'completed pipeline reference should be cleared');
     });
   });
+
+  describe('teardown after a pipeline error', () => {
+    interface TeardownInternals {
+      attachCompletion(completion: Promise<void>): void;
+      pipeline?: { isStopped(): boolean; stop(): void; completion: Promise<void> };
+      videoOutput?: { close(): Promise<void> };
+      audioOutput?: { close(): Promise<void> };
+      videoDecoder?: { close(): void };
+      input?: { close(): Promise<void> };
+    }
+
+    /** Run `fn` with console.error captured, collecting unhandled rejections (plus one macrotask). */
+    async function quietly(fn: () => Promise<void>): Promise<{ rejections: unknown[]; logged: unknown[][] }> {
+      const rejections: unknown[] = [];
+      const logged: unknown[][] = [];
+      const onRejection = (reason: unknown): void => {
+        rejections.push(reason);
+      };
+      const origError = console.error;
+      console.error = (...args: unknown[]) => logged.push(args);
+      process.on('unhandledRejection', onRejection);
+      try {
+        await fn();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return { rejections, logged };
+      } finally {
+        process.off('unhandledRejection', onRejection);
+        console.error = origError;
+      }
+    }
+
+    it('releases every resource and reports the error once when closing an output rethrows it', async () => {
+      const { RTPStream } = await import('../src/webrtc/index.js');
+      const failure = new Error('write failed');
+      const closeCalls: (Error | undefined)[] = [];
+      const closed: string[] = [];
+      const stream = RTPStream.create(getInputFile('video.mp4'), { onClose: (error) => closeCalls.push(error) });
+      const internals = stream as unknown as TeardownInternals;
+
+      const completion = Promise.reject(failure);
+      completion.catch(() => {});
+      internals.pipeline = { isStopped: () => true, stop: () => {}, completion };
+      internals.videoOutput = {
+        close: async () => {
+          closed.push('video output');
+          throw failure;
+        },
+      };
+      internals.audioOutput = {
+        close: async () => {
+          closed.push('audio output');
+        },
+      };
+      internals.videoDecoder = { close: () => closed.push('decoder') };
+      internals.input = {
+        close: async () => {
+          closed.push('input');
+        },
+      };
+
+      const { rejections } = await quietly(async () => internals.attachCompletion(completion));
+
+      assert.deepEqual(closed, ['video output', 'audio output', 'decoder', 'input'], 'a failing output close must not skip the rest of the teardown');
+      assert.deepEqual(closeCalls, [failure]);
+      assert.strictEqual(rejections.length, 0, `unhandled rejections: ${String(rejections[0])}`);
+      await withTimeout(stream.stop(), 1000);
+    });
+
+    it('calls a throwing onClose once, logs its error and leaves no rejected promise', async () => {
+      const { RTPStream } = await import('../src/webrtc/index.js');
+      for (const outcome of ['resolved', 'rejected'] as const) {
+        let calls = 0;
+        const stream = RTPStream.create(getInputFile('video.mp4'), {
+          onClose: () => {
+            calls++;
+            throw new Error('owner callback failed');
+          },
+        });
+        const internals = stream as unknown as TeardownInternals;
+        const completion = outcome === 'resolved' ? Promise.resolve() : Promise.reject(new Error('pipeline failed'));
+        completion.catch(() => {});
+
+        const { rejections, logged } = await quietly(async () => internals.attachCompletion(completion));
+
+        assert.strictEqual(calls, 1, `onClose must fire exactly once (${outcome})`);
+        assert.strictEqual(rejections.length, 0, `unhandled rejections (${outcome}): ${String(rejections[0])}`);
+        const callbackLogs = logged.filter(([prefix]) => prefix === '[RTPStream] onClose callback threw:');
+        assert.deepEqual(
+          callbackLogs.map(([, error]) => (error as Error).message),
+          ['owner callback failed'],
+          `the callback error must be logged once (${outcome})`,
+        );
+      }
+    });
+  });
 });

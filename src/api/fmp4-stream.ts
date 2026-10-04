@@ -12,7 +12,7 @@ import {
 import { FF_ENCODER_AAC, FF_ENCODER_LIBX264 } from '../constants/encoders.js';
 import { Codec } from '../lib/codec.js';
 import { Rational } from '../lib/rational.js';
-import { avGetCodecString, avGetPixFmtName } from '../lib/utilities.js';
+import { avGetCodecString, avGetMediaTypeString, avGetPixFmtName } from '../lib/utilities.js';
 import { Decoder } from './decoder.js';
 import { Demuxer } from './demuxer.js';
 import { Encoder } from './encoder.js';
@@ -22,6 +22,7 @@ import { HardwareContext } from './hardware.js';
 import { Muxer } from './muxer.js';
 import { consumeStreamInParallel, interruptibleFrameSource, pipeline, PipelineControlImpl } from './pipeline.js';
 import { pickSupportedPixelFormat } from './utilities/codec-format.js';
+import { PacketAgeWatchdog } from './utilities/packet-age-watchdog.js';
 
 import type { AVCodecID, AVHWDeviceType, AVPixelFormat, FFHWDeviceType } from '../constants/index.js';
 import type { CodecContext } from '../lib/codec-context.js';
@@ -143,6 +144,12 @@ export interface FMP4StreamOptions {
   /**
    * Callback invoked when the stream is closed or encounters an error.
    *
+   * Called once per started session. On an error the stream has already been
+   * stopped and its resources (including the input connection) released.
+   * Output the muxer still held at the error is discarded, so no `onData` call
+   * follows the failure. Exceptions thrown by the callback are logged and do
+   * not propagate.
+   *
    * @param error - Optional error if stream closed due to an error
    */
   onClose?: (error?: Error) => void;
@@ -163,6 +170,9 @@ export interface FMP4StreamOptions {
    * requested via movFlags such as `frag_keyframe`).
    * Smaller values reduce latency but increase overhead.
    * Set to 1 to send data as soon as possible.
+   * Transcoded video gets a GOP of the fragment duration from 0.5 s on, so
+   * every fragment starts with a keyframe; below that, and with 0, it gets a
+   * 2 s GOP.
    *
    * @default 1
    *
@@ -270,6 +280,63 @@ export interface FMP4StreamOptions {
   movFlags?: string;
 
   /**
+   * Backward DTS jump in seconds above which the stream ends with an error.
+   *
+   * A live source that restarts its clock (a camera reboot behind a restreamer)
+   * would otherwise leave every following packet clamped to one tick past the
+   * previous one, so fragments carry no media for as long as the jump. The stream
+   * instead stops and reports the error through `onClose(error)`, and the owner
+   * can restart it on a fresh timeline. Smaller jumps are clamped. `0` disables
+   * the check. Same semantics as the `Muxer` option of the same name.
+   *
+   * @default 10
+   */
+  dtsBackwardThreshold?: number;
+
+  /**
+   * Forward DTS jump in seconds, beyond the real time that passed, above which
+   * the stream ends with an error.
+   *
+   * A live source that restarts its clock (a camera reboot behind a
+   * restreamer) can continue with timestamps far ahead of the time that
+   * passed. Muxing that would leave a sample spanning the jump, or, when the
+   * timeline later returns, a stream clamped behind it. The stream instead
+   * stops and reports the error through `onClose(error)`, and the owner can
+   * restart it on a fresh timeline. Gaps in the source come with a matching
+   * wait and pass. Only meaningful for inputs read in real time, so it is off
+   * for files, a pre-opened Demuxer and frame sources unless set; pass it for
+   * live inputs read over HTTP (HLS, HTTP-FLV) as well. Same semantics as the
+   * `Muxer` option of the same name; `0` disables the check.
+   *
+   * @default 10 for rtsp, rtsps, rtmp (and rtmps, rtmpt, rtmpe, rtmpte, rtmpts), rtp, srtp, udp, srt, tcp, tls and sctp URLs, 0 otherwise
+   */
+  dtsForwardThreshold?: number;
+
+  /**
+   * Longest time in seconds a packet may wait inside the muxer before it is
+   * emitted in a fragment.
+   *
+   * The mp4 muxer holds packets back to interleave the streams by timestamp.
+   * When a stream's timestamps stop advancing or run far ahead of a silent
+   * stream (a camera restarting its clock behind a restreamer, missing
+   * timestamps), packets can pile up without ever being emitted while memory
+   * grows. The age is measured per stream in real time while the input
+   * delivers packets and is independent of the timestamps; once the oldest
+   * pending packet of any stream is older than this, the stream stops and
+   * reports the error through `onClose(error)`. A pause of the whole input
+   * counts at most 2 s, so a source that goes quiet and resumes does not end
+   * the session. Healthy sessions stay below the default: up to the fragment
+   * duration (the GOP length with `fragDuration: 0`) plus about 10 s of
+   * interleaving delay while a stream is silent. Inputs read faster than real
+   * time can pile up correspondingly more media before it fires, inputs that
+   * deliver packets more than 2 s apart take correspondingly longer. `0`
+   * disables the check.
+   *
+   * @default 60
+   */
+  maxPacketAge?: number;
+
+  /**
    * AbortSignal for cancellation.
    *
    * When aborted, the stream stops gracefully, equivalent to calling stop().
@@ -303,6 +370,13 @@ export const FMP4_CODECS = {
   FLAC: 'flac',
   OPUS: 'opus',
 } as const;
+
+/**
+ * Shortest fragDuration in seconds the transcoded video GOP follows.
+ *
+ * @internal
+ */
+const MIN_FRAGMENT_GOP = 0.5;
 
 /**
  * High-level fMP4 streaming with automatic codec detection and transcoding.
@@ -368,6 +442,7 @@ export class FMP4Stream {
   private pendingFragment: ParsedBox[] = [];
   private abortHandler?: () => void;
   private stopRequested = false;
+  private discardOutput = false;
   private stopPromise?: Promise<void>;
   private startAbort?: AbortController;
   private stopSignal = Promise.withResolvers<void>();
@@ -376,6 +451,8 @@ export class FMP4Stream {
     resolve: ((value: IteratorResult<FMP4Fragment>) => void) | null;
     done: boolean;
   } | null = null;
+
+  private packetAgeWatchdog?: PacketAgeWatchdog;
 
   private _droppedFragments = 0;
   private _initSegment: Buffer | null = null;
@@ -392,9 +469,26 @@ export class FMP4Stream {
    *
    * Use {@link create} factory method
    *
+   * @throws {RangeError} If dtsBackwardThreshold, dtsForwardThreshold or maxPacketAge is not a finite number >= 0
+   *
    * @internal
    */
   private constructor(input: string | Demuxer | MediaFrameSource, options: FMP4StreamOptions) {
+    const isLiveInput = typeof input === 'string' && /^(rtsps?|rtmp(?:e|s|t|te|ts)?|s?rtp|udp|srt|tcp|tls|sctp):/i.test(input);
+    const dtsBackwardThreshold = options.dtsBackwardThreshold ?? 10;
+    // Only a source read in real time pairs a gap with the matching wait.
+    const dtsForwardThreshold = options.dtsForwardThreshold ?? (isLiveInput ? 10 : 0);
+    const maxPacketAge = options.maxPacketAge ?? 60;
+    for (const [name, value] of [
+      ['dtsBackwardThreshold', dtsBackwardThreshold],
+      ['dtsForwardThreshold', dtsForwardThreshold],
+      ['maxPacketAge', maxPacketAge],
+    ] as const) {
+      if (!Number.isFinite(value) || value < 0) {
+        throw new RangeError(`${name} must be a finite number of seconds >= 0, got ${value}`);
+      }
+    }
+
     if (typeof input === 'string') {
       this.inputUrl = input;
     } else if (input instanceof Demuxer) {
@@ -406,7 +500,6 @@ export class FMP4Stream {
     }
 
     const inputUrl = this.inputUrl ?? '';
-    const isLiveInput = /^(rtsp|rtmp|rtp|udp|srt|tcp|sctp):/i.test(inputUrl);
     this.inputOptions = {
       ...options.inputOptions,
       options: {
@@ -439,6 +532,9 @@ export class FMP4Stream {
       boxMode: options.boxMode ?? false,
       maxQueuedFragments: options.maxQueuedFragments ?? 16,
       movFlags: options.movFlags ?? '+frag_keyframe+separate_moof+default_base_moof+empty_moov',
+      dtsBackwardThreshold,
+      dtsForwardThreshold,
+      maxPacketAge,
     };
 
     this.signal = options.signal;
@@ -463,6 +559,8 @@ export class FMP4Stream {
    * @param options - Stream configuration options with supported codecs
    *
    * @returns Configured fMP4 stream instance
+   *
+   * @throws {RangeError} If dtsBackwardThreshold, dtsForwardThreshold or maxPacketAge is not a finite number >= 0
    *
    * @example
    * ```typescript
@@ -766,6 +864,7 @@ export class FMP4Stream {
     this.signal?.addEventListener('abort', this.abortHandler, { once: true });
 
     this._droppedFragments = 0;
+    this.discardOutput = false;
 
     // Re-armed per start so a restart is not torn down by the previous run.
     this.stopSignal = Promise.withResolvers<void>();
@@ -876,14 +975,13 @@ export class FMP4Stream {
 
       const effectiveFps = this.options.video.fps ?? currentFps;
       const fpsForGop = isFinite(effectiveFps) && effectiveFps > 0 ? effectiveFps : 30;
-      const fragSeconds = this.options.fragDuration && this.options.fragDuration > 0 ? this.options.fragDuration / 1_000_000 : 2;
       const bitrate = this.options.video.bitrate;
 
       this.videoEncoder = await Encoder.create(encoderCodec, {
         decoder: this.videoDecoder,
         options: encoderOptions,
         configure: (ctx) => {
-          ctx.gopSize = Math.max(1, Math.round(fpsForGop * fragSeconds));
+          ctx.gopSize = this.gopSize(fpsForGop);
           this.applyBitrate(ctx, bitrate);
         },
       });
@@ -962,10 +1060,32 @@ export class FMP4Stream {
   }
 
   /**
+   * GOP size for the video encoder that starts every fragment with a keyframe.
+   *
+   * frag_duration flushes a fragment once it is that long, mid-GOP on a
+   * P-frame unless the GOP has the same length, and strict consumers reject
+   * such fragments. Shorter fragments (the 1 µs default flushes after every
+   * frame) are not matched: a GOP of a few frames multiplies the bitrate, so
+   * below MIN_FRAGMENT_GOP the GOP is 2 s, as with a fragDuration of 0.
+   *
+   * @param fps - Output frame rate
+   *
+   * @returns GOP size in frames
+   *
+   * @internal
+   */
+  private gopSize(fps: number): number {
+    const fragSeconds = this.options.fragDuration / 1_000_000;
+    const seconds = fragSeconds >= MIN_FRAGMENT_GOP ? fragSeconds : 2;
+    return Math.max(1, Math.round(fps * seconds));
+  }
+
+  /**
    * Create the fMP4 output muxer with the fragment-emitting write callback.
    *
    * Uses `this.input` when present (demuxer path) and no input for the
-   * frame-source path.
+   * frame-source path. Attaches a fresh packet age watchdog unless
+   * `maxPacketAge` is 0.
    *
    * @returns The configured muxer
    *
@@ -974,11 +1094,16 @@ export class FMP4Stream {
   private async createOutput(): Promise<Muxer> {
     const cb: IOOutputCallbacks = {
       write: (buffer: Buffer) => {
+        // Swallows what the teardown of a failed session flushes (see attachCompletion).
+        if (this.discardOutput) {
+          return buffer.length;
+        }
         if (this.options.boxMode) {
           // Box mode: buffer until we have complete boxes
           this.processBoxMode(buffer);
         } else {
           // Chunk mode: send raw data immediately
+          this.packetAgeWatchdog?.consumeChunk(buffer);
           const info: FMP4Data = { isComplete: false, boxes: [] };
           this.options.onData(buffer, info);
           this.pushFragment(buffer, info);
@@ -987,11 +1112,13 @@ export class FMP4Stream {
       },
     };
 
-    return await Muxer.open(cb, {
+    const output = await Muxer.open(cb, {
       input: this.input,
       format: 'mp4',
       bufferSize: this.options.bufferSize,
       exitOnError: false,
+      dtsBackwardThreshold: this.options.dtsBackwardThreshold,
+      dtsForwardThreshold: this.options.dtsForwardThreshold,
       configure: (fmt) => {
         const tag = this.options.video?.tag;
         if (!tag) {
@@ -1008,43 +1135,95 @@ export class FMP4Stream {
         frag_duration: this.options.fragDuration,
       },
     });
+
+    // Per session: a restart must not inherit the previous session's backlog.
+    if (this.options.maxPacketAge > 0) {
+      this.packetAgeWatchdog = new PacketAgeWatchdog(this.options.maxPacketAge, (index) => {
+        const codecType = output.getStream(index)?.codecpar.codecType;
+        return codecType === undefined ? '' : (avGetMediaTypeString(codecType) ?? '');
+      });
+      output.setPacketObserver(this.packetAgeWatchdog);
+    }
+
+    return output;
   }
 
   /**
    * Wire the pipeline completion to the fragment/close callbacks.
    *
    * On success ends the fragment iterator and invokes `onClose()`; on error
-   * stops the stream and invokes `onClose(error)`. Runs in the background.
+   * stops the stream, discarding the output the muxer still holds, and invokes
+   * `onClose(error)`. Either way `onClose` runs exactly once and the detached
+   * chain never rejects. Runs in the background.
    *
    * @param completion - The pipeline completion promise
    *
    * @internal
    */
   private attachCompletion(completion: Promise<void>): void {
-    completion
-      .then(() => {
+    // One then() with both handlers: a throwing onClose() in the success path
+    // must not fall through into the error path and fire onClose a second time.
+    completion.then(
+      () => {
         this.endFragments();
         // No-op in the normal case (init segment resolved long ago) - only
         // fires if the stream ended without ever emitting ftyp+moov.
         this.rejectInitSegment(new Error('FMP4Stream ended before init segment was produced'));
-        this.options.onClose?.();
-      })
-      .catch(async (error) => {
+        this.emitClose();
+      },
+      async (reason: unknown) => {
+        const error = reason instanceof Error ? reason : new Error(String(reason));
         this.endFragments();
         // Reject with the pipeline error so an initSegment consumer sees the
         // actual failure instead of the generic "stopped" error from stop().
-        this.rejectInitSegment(error instanceof Error ? error : new Error(String(error)));
+        this.rejectInitSegment(error);
         // A stop() in flight or an aborted signal means the owner is tearing
         // the stream down - the pipeline unwinding with an AbortError is the
-        // expected shutdown path, not a failure.
-        if (this.isDeliberateStop(error)) {
-          await this.stop().catch(() => {});
-          this.options.onClose?.();
-          return;
+        // expected shutdown path, not a failure. Decided before the stop()
+        // below, which would make every failure look deliberate.
+        const deliberate = this.isDeliberateStop(reason);
+        // Closing the output flushes the muxer's backlog and the trailer. After
+        // a failure that backlog is suspect: when a backward jump ends the
+        // session, the packets the timeline had jumped ahead to are still
+        // queued and would leave as a fragment placed that far ahead; after a
+        // stall it holds up to maxPacketAge of retained samples. Nothing is
+        // emitted past the failure, through onData or fragments(). A
+        // deliberate stop keeps its tail.
+        if (!deliberate) {
+          this.discardOutput = true;
         }
-        await this.stop();
-        this.options.onClose?.(error);
-      });
+        // Release the input (e.g. the RTSP connection) before reporting, so an
+        // owner that restarts from onClose never overlaps a live session. A
+        // teardown failure must not swallow the onClose call: without it the
+        // owner never learns the stream is gone.
+        try {
+          await this.stop();
+        } catch {
+          // doStop() already released whatever it could.
+        }
+        this.emitClose(deliberate ? undefined : error);
+      },
+    );
+  }
+
+  /**
+   * Invoke the owner's onClose callback.
+   *
+   * The completion chain runs detached, so an exception from the callback
+   * could only surface as an unhandled rejection - it is logged instead.
+   *
+   * @param error - Pipeline error, or undefined for a clean end
+   *
+   * @internal
+   */
+  private emitClose(error?: Error): void {
+    try {
+      this.options.onClose(error);
+    } catch (callbackError) {
+      // The stream is already closed; logged so a broken restart path in the
+      // owner does not vanish silently.
+      console.error('[FMP4Stream] onClose callback threw:', callbackError);
+    }
   }
 
   /**
@@ -1102,18 +1281,14 @@ export class FMP4Stream {
       }
 
       // Set the framerate explicitly - without a decoder the encoder would infer
-      // it from the frame timebase and pick an absurd level. Bound the GOP to the
-      // fragment duration (2s default) so every fMP4 fragment starts with a
-      // keyframe; otherwise frag_duration flushes fragments mid-GOP on a P-frame
-      // and strict consumers reject them.
-      const fragSeconds = this.options.fragDuration && this.options.fragDuration > 0 ? this.options.fragDuration / 1_000_000 : 2;
+      // it from the frame timebase and pick an absurd level.
       const bitrate = this.options.video.bitrate;
 
       this.videoEncoder = await Encoder.create(encoderCodec, {
         options: encoderOptions,
         configure: (ctx) => {
           ctx.framerate = new Rational(Math.round(fps), 1);
-          ctx.gopSize = Math.max(1, Math.round(fps * fragSeconds));
+          ctx.gopSize = this.gopSize(fps);
           this.applyBitrate(ctx, bitrate);
         },
       });
@@ -1170,7 +1345,8 @@ export class FMP4Stream {
    *
    * Stops the pipeline, closes output, and releases all FFmpeg resources.
    * Safe to call multiple times. After stopping, you can call start() again
-   * to restart the stream.
+   * to restart the stream. Resolves even if the pipeline had failed; that
+   * error is reported through `onClose(error)`.
    *
    * @example
    * ```typescript
@@ -1254,8 +1430,22 @@ export class FMP4Stream {
       // still be draining (header init reads the input's stream parameters),
       // so freeing the input before the muxer has fully settled is a
       // use-after-free on the worker thread.
-      await this.output?.close();
+      // After a failure nothing the output emits is used (see attachCompletion),
+      // so the trailer is skipped instead of flushed into the void.
+      if (this.discardOutput) {
+        this.output?.discardOnClose();
+      }
+      // close() rethrows a failed background write after it freed the muxer.
+      // That error already ended the pipeline and reaches the owner through
+      // onClose(error), so it must not abort the teardown here and leak the
+      // codecs and the input (an RTSP connection) below.
+      try {
+        await this.output?.close();
+      } catch {
+        // Surfaced through the pipeline completion.
+      }
       this.output = undefined;
+      this.packetAgeWatchdog = undefined;
 
       this.videoDecoder?.close();
       this.videoDecoder = undefined;
@@ -1522,6 +1712,9 @@ export class FMP4Stream {
       // is corrupt - recovery is impossible, so drop the rest of this chunk
       // rather than emit garbage framing downstream.
       if (boxSize < headerSize) {
+        // Emitted samples can no longer be counted - stop judging packet ages
+        // instead of mistaking the lost framing for a stalled muxer.
+        this.packetAgeWatchdog?.onFramingLost();
         break;
       }
 
@@ -1538,6 +1731,10 @@ export class FMP4Stream {
         headerSize,
         raw: chunk.subarray(offset, offset + boxSize),
       };
+
+      if (parsed.type === 'moof' || parsed.type === 'moov') {
+        this.packetAgeWatchdog?.consumeBox(parsed.raw);
+      }
 
       if (parsed.type === 'moof') {
         flushImmediate();

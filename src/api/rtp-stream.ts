@@ -48,6 +48,10 @@ export interface RTPStreamOptions {
   /**
    * Callback invoked when the stream is closed or encounters an error.
    *
+   * Called once per started session. On an error the stream has already been
+   * stopped and its resources (including the input connection) released.
+   * Exceptions thrown by the callback are logged and do not propagate.
+   *
    * @param error - Optional error if stream closed due to an error
    */
   onClose?: (error?: Error) => void;
@@ -683,6 +687,9 @@ export class RTPStream {
         decoder: this.audioDecoder,
         filter: this.audioFilter,
         options: encoderOptions,
+        // Silence for an input gap would only go out once the input resumes, as a burst of
+        // late packets; receivers conceal a timestamp gap like packet loss instead
+        audioFrameBuffer: { maxGapFill: 0 },
       });
       this.throwIfStopRequested();
     }
@@ -741,7 +748,8 @@ export class RTPStream {
    * Wire the pipeline completion to the onClose/error callbacks.
    *
    * On success invokes `onClose()`; on error stops the stream and invokes
-   * `onClose(error)`. Runs in the background (not awaited).
+   * `onClose(error)`. Either way `onClose` runs exactly once and the detached
+   * chain never rejects. Runs in the background (not awaited).
    *
    * @param completion - The pipeline completion promise
    *
@@ -750,24 +758,34 @@ export class RTPStream {
   private attachCompletion(completion: Promise<void>): void {
     // Captured so a restart that installed a newer pipeline keeps it.
     const control = this.pipeline;
+    // One then() with both handlers: a throwing onClose() in the success path
+    // must not fall through into the error path and fire onClose a second time.
     completion
-      .then(() => {
-        // Pipeline completed successfully
-        this.options.onClose?.();
-      })
-      .catch(async (error) => {
-        // A stop() in flight or an aborted signal means the owner is tearing
-        // the stream down - the pipeline unwinding with an AbortError (or an
-        // interrupted FFmpeg call) is the expected shutdown path, not a failure.
-        if (this.isDeliberateStop(error)) {
-          await this.stop().catch(() => {});
-          this.options.onClose?.();
-          return;
-        }
-        console.error('[RTPStream] Pipeline error:', error);
-        await this.stop();
-        this.options.onClose?.(error);
-      })
+      .then(
+        () => {
+          // Pipeline completed successfully
+          this.emitClose();
+        },
+        async (reason: unknown) => {
+          const error = reason instanceof Error ? reason : new Error(String(reason));
+          // A stop() in flight or an aborted signal means the owner is tearing
+          // the stream down - the pipeline unwinding with an AbortError (or an
+          // interrupted FFmpeg call) is the expected shutdown path, not a failure.
+          // Decided before the stop() below, which would make every failure look deliberate.
+          const deliberate = this.isDeliberateStop(reason);
+          if (!deliberate) {
+            console.error('[RTPStream] Pipeline error:', error);
+          }
+          // A teardown failure must not swallow the onClose call: without it
+          // the owner never learns the stream is gone.
+          try {
+            await this.stop();
+          } catch {
+            // doStop() already released whatever it could.
+          }
+          this.emitClose(deliberate ? undefined : error);
+        },
+      )
       .finally(() => {
         // Drop the finished pipeline so isStreamActive reports inactive. The
         // demuxer path already clears it in runPipeline(); a frame source has
@@ -776,6 +794,26 @@ export class RTPStream {
           this.pipeline = undefined;
         }
       });
+  }
+
+  /**
+   * Invoke the owner's onClose callback.
+   *
+   * The completion chain runs detached, so an exception from the callback
+   * could only surface as an unhandled rejection - it is logged instead.
+   *
+   * @param error - Pipeline error, or undefined for a clean end
+   *
+   * @internal
+   */
+  private emitClose(error?: Error): void {
+    try {
+      this.options.onClose(error);
+    } catch (callbackError) {
+      // The stream is already closed; logged so a broken restart path in the
+      // owner does not vanish silently.
+      console.error('[RTPStream] onClose callback threw:', callbackError);
+    }
   }
 
   /**
@@ -901,6 +939,7 @@ export class RTPStream {
       this.audioEncoder = await Encoder.create(encoderCodec, {
         filter: this.audioFilter,
         options: encoderOptions,
+        audioFrameBuffer: { maxGapFill: 0 },
       });
 
       this.audioOutput = await this.createAudioOutput();
@@ -1083,7 +1122,8 @@ export class RTPStream {
    *
    * Stops the pipeline, closes output, and releases all FFmpeg resources.
    * Safe to call multiple times. After stopping, you can call start() again
-   * to restart the stream.
+   * to restart the stream. Resolves even if the pipeline had failed; that
+   * error is reported through `onClose(error)`.
    *
    * @example
    * ```typescript
@@ -1160,10 +1200,21 @@ export class RTPStream {
         }
       }
 
-      // Close all resources
-      await this.videoOutput?.close();
+      // Close all resources. close() rethrows a failed background write after it
+      // freed the muxer. That error already ended the pipeline and reaches the
+      // owner through onClose(error), so it must not abort the teardown here and
+      // leak the other output, the codecs and the input (an RTSP connection).
+      try {
+        await this.videoOutput?.close();
+      } catch {
+        // Surfaced through the pipeline completion.
+      }
       this.videoOutput = undefined;
-      await this.audioOutput?.close();
+      try {
+        await this.audioOutput?.close();
+      } catch {
+        // Surfaced through the pipeline completion.
+      }
       this.audioOutput = undefined;
 
       this.videoEncoder?.close();

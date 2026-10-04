@@ -8,9 +8,12 @@ import {
   AV_DISPOSITION_ATTACHED_PIC,
   AV_DISPOSITION_DEFAULT,
   AV_NOPTS_VALUE,
+  AV_OPT_TYPE_BOOL,
+  AV_OPT_TYPE_INT,
   AV_TIME_BASE_Q,
   AVERROR_EAGAIN,
   AVERROR_EOF,
+  AVFMT_AVOID_NEG_TS_MAKE_ZERO,
   AVFMT_FLAG_CUSTOM_IO,
   AVFMT_GLOBALHEADER,
   AVFMT_NOFILE,
@@ -33,7 +36,7 @@ import { IOStream } from './io-stream.js';
 import { AsyncQueue } from './utilities/async-queue.js';
 import { applyContextOptions } from './utilities/context-options.js';
 
-import type { MuxerFormat, MuxerOptionsFor } from '../constants/index.js';
+import type { AVMediaType, MuxerFormat, MuxerOptionsFor } from '../constants/index.js';
 import type { IRational, OutputFormat, Stream } from '../lib/index.js';
 import type { BitStreamFilterAPI } from './bitstream-filter.js';
 import type { Demuxer, RTPDemuxer } from './demuxer.js';
@@ -58,16 +61,41 @@ interface StreamDescription {
   isStreamCopy: boolean;
   sqIdxMux: number; // Index in sync queue, -1 if not using sync queue
   preMuxQueue: (Packet | null)[]; // PreMuxQueue: Buffered packets (or NULL for EOF marker) before muxer starts
+  preMuxArrivals: number[]; // Arrival time of each preMuxQueue entry, in lockstep with it
+  sqArrivals: number[]; // Arrival times of this stream's packets in the sync queue, oldest first
   preMuxQueueDataSize: number;
   eofReceived: boolean; // Track if EOF (NULL packet) was received for this stream
   lastMuxDts: bigint;
+  firstMuxTs?: bigint; // DTS (PTS without DTS) of the stream's first written packet, output time base
+  muxTimeBase?: Rational; // Output time base, read on the first written packet (fixed by the header)
+  muxCodecType?: AVMediaType; // Output media type, read on the first written packet
+  forward?: ForwardDtsState; // dtsForwardThreshold bookkeeping (audio/video streams with the check enabled)
   tsRescaleDeltaLast: { value: bigint }; // For av_rescale_delta (audio streamcopy)
   streamcopyStarted: boolean; // Track if streamcopy has started for this stream
   startTimeOffset?: bigint; // Effective per-stream startTime offset (decided on the first packet)
 }
 
 /**
- * A queued packet write: the packet, its stream state, and stream index.
+ * Per-stream state of the dtsForwardThreshold check.
+ *
+ * Offsets are real time minus media time in ms, relative to the stream's first
+ * written packet: they stay level while a live stream keeps pace with real time
+ * and drop when its DTS runs ahead.
+ *
+ * @internal
+ */
+interface ForwardDtsState {
+  msPerTick: number; // Output time base in ms
+  lastTs: bigint; // DTS (PTS without DTS) of the last accepted packet
+  lastArrival: number; // Arrival time of that packet, NaN before the first
+  offset: number; // Offset of that packet
+  windowMin: number; // Lowest offset in the current window bucket
+  windowPrevMin: number; // Lowest offset in the previous window bucket
+  windowCount: number; // Packets in the current window bucket
+}
+
+/**
+ * A queued packet write: the packet, its stream state, stream index and arrival time.
  *
  * @internal
  */
@@ -75,7 +103,55 @@ interface WriteJob {
   pkt: Packet;
   streamInfo: StreamDescription;
   streamIndex: number;
+  arrival: number;
 }
+
+/**
+ * Observer for the packets a Muxer accepts for writing.
+ *
+ * @internal
+ */
+export interface MuxerPacketObserver {
+  /** A packet with payload was accepted; throwing fails the write like a muxing error. */
+  onPacket(streamIndex: number): void;
+  /**
+   * An accepted packet of this stream will not reach the output (dropped, or rejected by libavformat).
+   * A libavformat error for an earlier, buffered packet is reported against the packet submitted with it.
+   */
+  onPacketRejected(streamIndex: number): void;
+}
+
+/**
+ * Output formats implemented by libavformat/movenc.c, whose sample durations are 32-bit.
+ *
+ * @internal
+ */
+const MOV_FAMILY_FORMATS = new Set(['mov', 'mp4', '3gp', '3g2', 'psp', 'ipod', 'ismv', 'f4v', 'avif']);
+
+/**
+ * Smallest DTS step or packet duration (stream time base ticks) rejected for movenc outputs.
+ *
+ * movenc aborts the process via av_assert0(next_dts <= INT_MAX) in get_cluster_duration()
+ * when it writes a sample table. A step of exactly INT_MAX still trips it once movenc nudges
+ * a later DTS by one tick, so the limit itself is already rejected.
+ *
+ * @internal
+ */
+const MOV_SAMPLE_DURATION_LIMIT = 0x7fffffffn;
+
+/**
+ * Packets per bucket of the window of recent packets the dtsForwardThreshold check compares a packet with.
+ *
+ * Two buckets cover a stream's last 128 to 256 packets. After a gap in a live
+ * source, a parser or encoder first releases the frames it held back before
+ * the gap: those frames absorb the wait, and the first frame after the gap,
+ * though on time, steps forward by the whole gap against them. Against the
+ * frames before the gap it does not, and parsers and encoders hold back far
+ * fewer frames than the window spans.
+ *
+ * @internal
+ */
+const FORWARD_WINDOW_BUCKET = 128;
 
 /**
  * Options for Muxer creation.
@@ -134,10 +210,59 @@ export interface MuxerOptions<F extends MuxerFormat | (string & {}) = MuxerForma
    *
    * When enabled, the muxer will terminate on the first write error.
    * When disabled, errors are logged but processing continues.
+   * Timestamp discontinuities the muxer refuses to write (see
+   * {@link MuxerOptions.dtsBackwardThreshold} and
+   * {@link MuxerOptions.dtsForwardThreshold}) are thrown either way.
    *
    * @default true
    */
   exitOnError?: boolean;
+
+  /**
+   * Backward DTS jump in seconds above which writing a packet fails.
+   *
+   * Audio and video DTS must not decrease, so a packet behind the stream's last
+   * written DTS is clamped forward. After a large backward jump (a live source
+   * restarting its clock) every following packet is clamped to one tick past the
+   * previous one until the source catches up again, collapsing the timeline for
+   * as long as the jump. With a threshold set, such a packet is rejected with an
+   * error instead, so the owner can restart on a fresh timeline. Smaller jumps
+   * are still clamped. `0` disables the check.
+   *
+   * Independent of this option, MP4/MOV-family outputs always reject a DTS step
+   * or packet duration that their 32-bit sample durations cannot store (INT_MAX
+   * ticks or more), where movenc would otherwise collapse the step to one tick
+   * or abort the process. Without an edit list (fragmented output without
+   * `delay_moov`) they also reject the first packet of a stream that starts
+   * more than `max_interleave_delta` (10 s) after the others and ends before
+   * the output's start, which movenc cannot store either.
+   *
+   * @default 0
+   */
+  dtsBackwardThreshold?: number;
+
+  /**
+   * Forward DTS jump in seconds, beyond the real time that passed, above which
+   * writing a packet fails.
+   *
+   * For a source read in real time, timestamps advance with the clock: a gap
+   * in the stream comes with a matching wait for the packet after it. A packet
+   * whose DTS runs further ahead than the time that passed is a
+   * discontinuity (a live source restarting its clock behind a restreamer),
+   * and writing it would leave a sample spanning the jump. With a threshold
+   * set, such a packet is rejected with an error before it reaches the
+   * output, so the owner can restart on a fresh timeline. Real time is
+   * measured per audio/video stream from when its packets are passed to
+   * writePacket(), and a packet is compared with the stream's last 128 to 256
+   * packets, so frames a parser or encoder held back during a gap do not make
+   * the end of the gap look like a jump. A stream's first packet is not
+   * checked, and a packet without DTS is measured by its PTS. Use it only for
+   * sources read in real time: a file read faster than real time has its gaps
+   * without the wait. `0` disables the check.
+   *
+   * @default 0
+   */
+  dtsForwardThreshold?: number;
 
   /**
    * Maximum number of packets to buffer per stream in the sync queue.
@@ -376,13 +501,32 @@ export class Muxer implements AsyncDisposable, Disposable {
   private writeWorkerPromise?: Promise<void>; // Background worker promise
   private writeWorkerError?: Error; // First error from the write worker - poisons subsequent writes and close()
   private signal?: AbortSignal;
+  private movSampleLimit = false; // Output is a movenc format with 32-bit sample durations (set before the header write)
+  private tsNonStrict = false; // Output allows equal consecutive DTS (AVFMT_TS_NONSTRICT, set before the header write)
+  private movZeroStart = false; // movenc puts each track's first sample at the output's start (no edit list, set after the header write)
+  private interleaveDeltaUs = 0n; // libavformat's max_interleave_delta in µs (set after the header write)
+  private trailerDiscarded = false; // close() skips the trailer, see discardOnClose()
+  private forwardThresholdMs = 0; // dtsForwardThreshold in ms, 0 = off
+  private clock: () => number = () => performance.now(); // Monotonic ms clock for packet arrival times
+  private packetObserver?: MuxerPacketObserver; // Follows the accepted packets (FMP4Stream's maxPacketAge)
 
   /**
    * @param options - Media output options
    *
+   * @throws {RangeError} If dtsBackwardThreshold or dtsForwardThreshold is not a finite number >= 0
+   *
    * @internal
    */
   private constructor(options?: MuxerOptions) {
+    for (const [name, threshold] of [
+      ['dtsBackwardThreshold', options?.dtsBackwardThreshold],
+      ['dtsForwardThreshold', options?.dtsForwardThreshold],
+    ] as const) {
+      if (threshold !== undefined && (!Number.isFinite(threshold) || threshold < 0)) {
+        throw new RangeError(`${name} must be a finite number of seconds >= 0, got ${threshold}`);
+      }
+    }
+
     this.options = {
       copyInitialNonkeyframes: false,
       exitOnError: true,
@@ -390,6 +534,7 @@ export class Muxer implements AsyncDisposable, Disposable {
       useAsyncWrite: true,
       ...options,
     };
+    this.forwardThresholdMs = (options?.dtsForwardThreshold ?? 0) * 1000;
 
     this.formatContext = new FormatContext();
   }
@@ -410,6 +555,8 @@ export class Muxer implements AsyncDisposable, Disposable {
    * @returns Opened muxer instance
    *
    * @throws {Error} If format required for custom I/O
+   *
+   * @throws {RangeError} If dtsBackwardThreshold or dtsForwardThreshold is not a finite number >= 0
    *
    * @throws {FFmpegError} If allocation or opening fails
    *
@@ -596,6 +743,8 @@ export class Muxer implements AsyncDisposable, Disposable {
    * @returns Opened muxer instance
    *
    * @throws {Error} If format required for custom I/O
+   *
+   * @throws {RangeError} If dtsBackwardThreshold or dtsForwardThreshold is not a finite number >= 0
    *
    * @throws {FFmpegError} If allocation or opening fails
    *
@@ -1017,6 +1166,8 @@ export class Muxer implements AsyncDisposable, Disposable {
         isStreamCopy: true,
         sqIdxMux: -1, // Will be set if sync queue is needed
         preMuxQueue: [],
+        preMuxArrivals: [],
+        sqArrivals: [],
         preMuxQueueDataSize: 0,
         eofReceived: false,
         lastMuxDts: AV_NOPTS_VALUE,
@@ -1037,6 +1188,8 @@ export class Muxer implements AsyncDisposable, Disposable {
         isStreamCopy: false,
         sqIdxMux: -1, // Will be set if sync queue is needed
         preMuxQueue: [],
+        preMuxArrivals: [],
+        sqArrivals: [],
         preMuxQueueDataSize: 0,
         eofReceived: false,
         lastMuxDts: AV_NOPTS_VALUE,
@@ -1198,6 +1351,9 @@ export class Muxer implements AsyncDisposable, Disposable {
    *
    * @throws {Error} If stream invalid or encoder not initialized
    *
+   * @throws {Error} On a timestamp discontinuity the output cannot take (see {@link MuxerOptions.dtsBackwardThreshold}).
+   * With the background write queue (more than one stream) it surfaces from a later writePacket() or close().
+   *
    * @throws {FFmpegError} If write fails
    *
    * @example
@@ -1343,6 +1499,7 @@ export class Muxer implements AsyncDisposable, Disposable {
       if (uninitialized || this.headerWritePromise) {
         // Buffer NULL as EOF marker (no size contribution)
         streamInfo.preMuxQueue.push(null);
+        streamInfo.preMuxArrivals.push(0);
         return;
       }
 
@@ -1379,7 +1536,7 @@ export class Muxer implements AsyncDisposable, Disposable {
               throw new Error('Failed to clone packet from sync queue');
             }
             pkt.streamIndex = recvRet;
-            await this.write(pkt, recvStreamInfo, recvRet);
+            await this.write(pkt, recvStreamInfo, recvRet, recvStreamInfo.sqArrivals.shift() ?? 0);
           }
         }
       }
@@ -1393,6 +1550,11 @@ export class Muxer implements AsyncDisposable, Disposable {
       throw new Error('Failed to clone packet for writing');
     }
 
+    // The forward check compares DTS steps with the time between packets as
+    // they reach the muxer. Taken here and carried through the pre-mux, sync
+    // and write queues, so time a packet spends queued does not count.
+    const arrival = this.forwardThresholdMs > 0 ? this.clock() : 0;
+
     // Apply streamcopy filtering BEFORE buffering
     // This ensures rejected packets never enter the queue/buffer
     if (streamInfo.isStreamCopy) {
@@ -1405,6 +1567,10 @@ export class Muxer implements AsyncDisposable, Disposable {
       // For encoded (non-streamcopy) streams, strip the device's startTime base.
       this.applyStartTimeOffset(clonedPacket, streamInfo);
     }
+
+    // Announced on acceptance, so the observer also counts what waits in the
+    // pre-mux queue for the header.
+    const observed = this.announcePacket(clonedPacket, streamIndex);
 
     // Check if any streams are still uninitialized or header is being written
     const uninitialized = Array.from(this._streams.values()).some((s) => !s.initialized);
@@ -1427,6 +1593,9 @@ export class Muxer implements AsyncDisposable, Disposable {
       // Check if we would exceed packet limit (only if threshold reached)
       if (currentPackets >= effectiveMaxPackets) {
         clonedPacket.free(); // Free the clone since we can't buffer it
+        if (observed) {
+          this.packetObserver?.onPacketRejected(streamIndex);
+        }
         throw new Error(
           // eslint-disable-next-line @stylistic/max-len
           `Too many packets buffered for output stream ${streamIndex} (packets: ${currentPackets}, bytes: ${currentBytes}, threshold: ${dataThreshold}, max: ${maxPackets})`,
@@ -1435,6 +1604,7 @@ export class Muxer implements AsyncDisposable, Disposable {
 
       // Buffer in PreMuxQueue (per-stream FIFO)
       streamInfo.preMuxQueue.push(clonedPacket);
+      streamInfo.preMuxArrivals.push(arrival);
       streamInfo.preMuxQueueDataSize += packetSize;
 
       return; // Don't proceed to header write yet
@@ -1449,10 +1619,17 @@ export class Muxer implements AsyncDisposable, Disposable {
         FFmpegError.throwIfError(ret, 'Failed to write header');
 
         this.headerWritten = true;
+        this.readHeaderSetup();
 
         // PHASE 2: Flush PreMuxQueue in DTS-sorted order (once after header write)
         // Packets go: PreMuxQueue → SyncQueue (if present) → Muxer
-        await this.flushPreMuxQueues();
+        // Concurrent writers keep queueing while headerWritePromise is set, also
+        // after a flush found the queues empty. Drain until they are empty and
+        // clear the promise in that same tick, or such packets are never written.
+        do {
+          await this.flushPreMuxQueues();
+        } while (this.hasPreMuxPackets());
+        this.headerWritePromise = undefined;
       })();
 
       await this.headerWritePromise;
@@ -1473,6 +1650,9 @@ export class Muxer implements AsyncDisposable, Disposable {
 
       // Handle errors from sq_send
       if (ret < 0) {
+        if (observed) {
+          this.packetObserver?.onPacketRejected(streamIndex);
+        }
         if (ret === AVERROR_EOF) {
           // Stream finished - this is normal, just return
           return;
@@ -1483,6 +1663,8 @@ export class Muxer implements AsyncDisposable, Disposable {
         }
         return;
       }
+      // The sync queue keeps each stream's packets in order and drops none.
+      streamInfo.sqArrivals.push(arrival);
 
       // Receive synchronized packets from queue and write to muxer
       while (!this.isClosed) {
@@ -1506,13 +1688,13 @@ export class Muxer implements AsyncDisposable, Disposable {
           pkt.streamIndex = recvRet;
 
           // Write packet (muxer takes ownership)
-          await this.write(pkt, recvStreamInfo, recvRet);
+          await this.write(pkt, recvStreamInfo, recvRet, recvStreamInfo.sqArrivals.shift() ?? 0);
         }
       }
     } else {
       // No sync queue needed - write directly
       clonedPacket.streamIndex = streamIndex;
-      await this.write(clonedPacket, streamInfo, streamIndex);
+      await this.write(clonedPacket, streamInfo, streamIndex, arrival);
     }
   }
 
@@ -1545,6 +1727,8 @@ export class Muxer implements AsyncDisposable, Disposable {
    * @param streamIndex - Target stream index
    *
    * @throws {Error} If stream invalid or encoder not initialized
+   *
+   * @throws {Error} On a timestamp discontinuity the output cannot take (see {@link MuxerOptions.dtsBackwardThreshold})
    *
    * @throws {FFmpegError} If write fails
    *
@@ -1692,6 +1876,7 @@ export class Muxer implements AsyncDisposable, Disposable {
       if (uninitialized || this.headerWritePromise) {
         // Buffer NULL as EOF marker (no size contribution)
         streamInfo.preMuxQueue.push(null);
+        streamInfo.preMuxArrivals.push(0);
         return;
       }
 
@@ -1728,7 +1913,7 @@ export class Muxer implements AsyncDisposable, Disposable {
               throw new Error('Failed to clone packet from sync queue');
             }
             pkt.streamIndex = recvRet;
-            this.writeSync(pkt, recvStreamInfo, recvRet);
+            this.writeSync(pkt, recvStreamInfo, recvRet, recvStreamInfo.sqArrivals.shift() ?? 0);
           }
         }
       }
@@ -1742,6 +1927,8 @@ export class Muxer implements AsyncDisposable, Disposable {
       throw new Error('Failed to clone packet for writing');
     }
 
+    const arrival = this.forwardThresholdMs > 0 ? this.clock() : 0;
+
     // Apply streamcopy filtering BEFORE buffering
     // This ensures rejected packets never enter the queue/buffer
     if (streamInfo.isStreamCopy) {
@@ -1754,6 +1941,10 @@ export class Muxer implements AsyncDisposable, Disposable {
       // For encoded (non-streamcopy) streams, strip the device's startTime base.
       this.applyStartTimeOffset(clonedPacket, streamInfo);
     }
+
+    // Announced on acceptance, so the observer also counts what waits in the
+    // pre-mux queue for the header.
+    const observed = this.announcePacket(clonedPacket, streamIndex);
 
     // Check if any streams are still uninitialized
     const uninitialized = Array.from(this._streams.values()).some((s) => !s.initialized);
@@ -1776,6 +1967,9 @@ export class Muxer implements AsyncDisposable, Disposable {
       // Check if we would exceed packet limit (only if threshold reached)
       if (currentPackets >= effectiveMaxPackets) {
         clonedPacket.free(); // Free the clone since we can't buffer it
+        if (observed) {
+          this.packetObserver?.onPacketRejected(streamIndex);
+        }
         throw new Error(
           // eslint-disable-next-line @stylistic/max-len
           `Too many packets buffered for output stream ${streamIndex} (packets: ${currentPackets}, bytes: ${currentBytes}, threshold: ${dataThreshold}, max: ${maxPackets})`,
@@ -1784,6 +1978,7 @@ export class Muxer implements AsyncDisposable, Disposable {
 
       // Buffer in PreMuxQueue (per-stream FIFO)
       streamInfo.preMuxQueue.push(clonedPacket);
+      streamInfo.preMuxArrivals.push(arrival);
       streamInfo.preMuxQueueDataSize += packetSize;
 
       return; // Don't proceed to header write yet
@@ -1796,6 +1991,7 @@ export class Muxer implements AsyncDisposable, Disposable {
       const ret = this.formatContext.writeHeaderSync();
       FFmpegError.throwIfError(ret, 'Failed to write header');
       this.headerWritten = true;
+      this.readHeaderSetup();
 
       // PHASE 2: Flush PreMuxQueue in DTS-sorted order (once after header write)
       // Packets go: PreMuxQueue → SyncQueue (if present) → Muxer
@@ -1813,6 +2009,9 @@ export class Muxer implements AsyncDisposable, Disposable {
 
       // Handle errors from sq_send
       if (ret < 0) {
+        if (observed) {
+          this.packetObserver?.onPacketRejected(streamIndex);
+        }
         if (ret === AVERROR_EOF) {
           // Stream finished - this is normal, just return
           return;
@@ -1823,6 +2022,7 @@ export class Muxer implements AsyncDisposable, Disposable {
         }
         return;
       }
+      streamInfo.sqArrivals.push(arrival);
 
       // Receive synchronized packets from queue and write to muxer
       while (!this.isClosed) {
@@ -1846,13 +2046,13 @@ export class Muxer implements AsyncDisposable, Disposable {
           pkt.streamIndex = recvRet;
 
           // Write packet (muxer takes ownership)
-          this.writeSync(pkt, recvStreamInfo, recvRet);
+          this.writeSync(pkt, recvStreamInfo, recvRet, recvStreamInfo.sqArrivals.shift() ?? 0);
         }
       }
     } else {
       // No sync queue needed - write directly
       clonedPacket.streamIndex = streamIndex;
-      this.writeSync(clonedPacket, streamInfo, streamIndex);
+      this.writeSync(clonedPacket, streamInfo, streamIndex, arrival);
     }
   }
 
@@ -1884,6 +2084,8 @@ export class Muxer implements AsyncDisposable, Disposable {
     }
 
     this.isClosed = true;
+    // Detached first, so the final flush can never fail on the observer.
+    this.packetObserver = undefined;
 
     // A header write launched by a concurrent writePacket() must settle before
     // teardown: nulling pb / freeing the format context under a running
@@ -1919,6 +2121,7 @@ export class Muxer implements AsyncDisposable, Disposable {
         pkt?.free();
       }
       streamInfo.preMuxQueue = [];
+      streamInfo.preMuxArrivals = [];
     }
 
     // Free sync queue resources
@@ -1933,7 +2136,7 @@ export class Muxer implements AsyncDisposable, Disposable {
 
     // Try to write trailer if header was written but trailer wasn't
     try {
-      if (this.headerWritten && !this.trailerWritten) {
+      if (this.headerWritten && !this.trailerWritten && !this.trailerDiscarded) {
         await this.formatContext.writeTrailer();
         this.trailerWritten = true;
       }
@@ -2010,6 +2213,7 @@ export class Muxer implements AsyncDisposable, Disposable {
     }
 
     this.isClosed = true;
+    this.packetObserver = undefined;
 
     // Free PreMuxQueue packets
     for (const streamInfo of this._streams.values()) {
@@ -2018,6 +2222,7 @@ export class Muxer implements AsyncDisposable, Disposable {
         pkt?.free();
       }
       streamInfo.preMuxQueue = [];
+      streamInfo.preMuxArrivals = [];
     }
 
     // Free sync queue resources
@@ -2032,7 +2237,7 @@ export class Muxer implements AsyncDisposable, Disposable {
 
     // Try to write trailer if header was written but trailer wasn't
     try {
-      if (this.headerWritten && !this.trailerWritten) {
+      if (this.headerWritten && !this.trailerWritten && !this.trailerDiscarded) {
         this.formatContext.writeTrailerSync();
         this.trailerWritten = true;
       }
@@ -2088,6 +2293,76 @@ export class Muxer implements AsyncDisposable, Disposable {
   }
 
   /**
+   * Follow the packets this muxer accepts for writing.
+   *
+   * The observer hears about every packet with payload once it is accepted
+   * (before it waits in the pre-mux queue or reaches libavformat) and about
+   * every such packet that is dropped later, so together with the output it
+   * knows what the muxer holds. close() detaches it.
+   *
+   * @param observer - Observer, or undefined to detach
+   *
+   * @internal
+   */
+  setPacketObserver(observer: MuxerPacketObserver | undefined): void {
+    this.packetObserver = observer;
+  }
+
+  /**
+   * Replace the clock that stamps packet arrival times for the dtsForwardThreshold check.
+   *
+   * Lets tests drive real time deterministically. Set it before the first packet.
+   *
+   * @param clock - Monotonic time in ms
+   *
+   * @internal
+   */
+  setClock(clock: () => number): void {
+    this.clock = clock;
+  }
+
+  /**
+   * Make close() skip the trailer.
+   *
+   * For owners that drop whatever the muxer still emits, such as FMP4Stream
+   * after a failed session: the trailer would only push libavformat's backlog
+   * into the void, and movenc asserts on some track states a failed session
+   * can leave behind. The backlog is freed with the format context instead.
+   *
+   * @internal
+   */
+  discardOnClose(): void {
+    this.trailerDiscarded = true;
+  }
+
+  /**
+   * Announce a packet the muxer has accepted to the packet observer.
+   *
+   * @param pkt - The muxer's clone of the packet
+   *
+   * @param streamIndex - Output stream index
+   *
+   * @returns True when the observer now tracks the packet
+   *
+   * @throws {Error} If the observer fails the write (the clone is freed)
+   *
+   * @internal
+   */
+  private announcePacket(pkt: Packet, streamIndex: number): boolean {
+    // movenc drops packets without payload instead of storing a sample.
+    if (this.packetObserver === undefined || pkt.size <= 0) {
+      return false;
+    }
+    try {
+      this.packetObserver.onPacket(streamIndex);
+    } catch (error) {
+      pkt.free();
+      throw error;
+    }
+    return true;
+  }
+
+  /**
    * Apply shared pre-header setup for writePacket and writePacketSync.
    *
    * Configures sync queues, dispositions and container metadata, then applies
@@ -2103,6 +2378,29 @@ export class Muxer implements AsyncDisposable, Disposable {
 
     applyContextOptions(this.formatContext, this.options.context);
     this.options.configure?.(this.formatContext);
+
+    const oformat = this.formatContext.oformat;
+    this.movSampleLimit = MOV_FAMILY_FORMATS.has(oformat?.name ?? '');
+    this.tsNonStrict = oformat?.hasFlags(AVFMT_TS_NONSTRICT) ?? false;
+  }
+
+  /**
+   * Read the muxing setup libavformat settles while writing the header.
+   *
+   * movenc decides on edit lists only then: without one (fragmented output
+   * without delay_moov) it shifts the output to start at 0 and puts each
+   * track's first sample there, which {@link checkMovLateStart} guards.
+   *
+   * @internal
+   */
+  private readHeaderSetup(): void {
+    if (!this.movSampleLimit) {
+      return;
+    }
+
+    const ctx = this.formatContext;
+    this.movZeroStart = ctx.getOption('use_editlist', AV_OPT_TYPE_BOOL) === false && ctx.getOption('avoid_negative_ts', AV_OPT_TYPE_INT) === AVFMT_AVOID_NEG_TS_MAKE_ZERO;
+    this.interleaveDeltaUs = ctx.maxInterleaveDelta;
   }
 
   /**
@@ -2151,6 +2449,22 @@ export class Muxer implements AsyncDisposable, Disposable {
         streamInfo.sqIdxMux = -1;
       }
     }
+  }
+
+  /**
+   * Whether any stream still holds packets (or an EOF marker) in its pre-mux queue.
+   *
+   * @returns True if a pre-mux queue is not empty
+   *
+   * @internal
+   */
+  private hasPreMuxPackets(): boolean {
+    for (const streamInfo of this._streams.values()) {
+      if (streamInfo.preMuxQueue.length > 0) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -2204,6 +2518,7 @@ export class Muxer implements AsyncDisposable, Disposable {
 
       // 3. Take packet from stream with earliest DTS (or NULL for EOF)
       const pkt = minStreamInfo.preMuxQueue.shift()!;
+      const arrival = minStreamInfo.preMuxArrivals.shift() ?? 0;
 
       // 4. Handle NULL packet (EOF marker)
       // FFmpeg: if (pkt) { send packet } else { tq_send_finish() }
@@ -2231,15 +2546,21 @@ export class Muxer implements AsyncDisposable, Disposable {
         // NOTE: Do NOT set pkt.timeBase here!
         // Packet must keep its source timebase so muxFixupTs can rescale correctly
         // pkt.timeBase = minStreamInfo.stream.timeBase;  // ❌ WRONG!
+        const size = pkt.size;
         const ret = this.syncQueue.send(minStreamInfo.sqIdxMux, pkt);
-        if (ret < 0 && ret !== AVERROR_EOF) {
+        if (ret < 0 && size > 0) {
+          this.packetObserver?.onPacketRejected(minStreamIndex);
+        }
+        if (ret >= 0) {
+          minStreamInfo.sqArrivals.push(arrival);
+        } else if (ret !== AVERROR_EOF) {
           if (this.options.exitOnError) {
             FFmpegError.throwIfError(ret, 'Failed to send packet to sync queue during PreMuxQueue flush');
           }
         }
       } else {
         // Write directly to muxer
-        await this.write(pkt, minStreamInfo, minStreamIndex);
+        await this.write(pkt, minStreamInfo, minStreamIndex, arrival);
       }
     }
 
@@ -2265,7 +2586,7 @@ export class Muxer implements AsyncDisposable, Disposable {
           pkt.streamIndex = recvRet;
 
           // Write packet (muxer takes ownership)
-          await this.write(pkt, recvStreamInfo, recvRet);
+          await this.write(pkt, recvStreamInfo, recvRet, recvStreamInfo.sqArrivals.shift() ?? 0);
         }
       }
     }
@@ -2318,6 +2639,7 @@ export class Muxer implements AsyncDisposable, Disposable {
 
       // 3. Take packet from stream with earliest DTS (or NULL for EOF)
       const pkt = minStreamInfo.preMuxQueue.shift()!;
+      const arrival = minStreamInfo.preMuxArrivals.shift() ?? 0;
 
       // 4. Handle NULL packet (EOF marker)
       // FFmpeg: if (pkt) { send packet } else { tq_send_finish() }
@@ -2345,15 +2667,21 @@ export class Muxer implements AsyncDisposable, Disposable {
         // NOTE: Do NOT set pkt.timeBase here!
         // Packet must keep its source timebase so muxFixupTs can rescale correctly
         // pkt.timeBase = minStreamInfo.stream.timeBase;  // ❌ WRONG!
+        const size = pkt.size;
         const ret = this.syncQueue.send(minStreamInfo.sqIdxMux, pkt);
-        if (ret < 0 && ret !== AVERROR_EOF) {
+        if (ret < 0 && size > 0) {
+          this.packetObserver?.onPacketRejected(minStreamIndex);
+        }
+        if (ret >= 0) {
+          minStreamInfo.sqArrivals.push(arrival);
+        } else if (ret !== AVERROR_EOF) {
           if (this.options.exitOnError) {
             FFmpegError.throwIfError(ret, 'Failed to send packet to sync queue during PreMuxQueue flush');
           }
         }
       } else {
         // Write directly to muxer
-        this.writeSync(pkt, minStreamInfo, minStreamIndex);
+        this.writeSync(pkt, minStreamInfo, minStreamIndex, arrival);
       }
     }
 
@@ -2379,7 +2707,7 @@ export class Muxer implements AsyncDisposable, Disposable {
           pkt.streamIndex = recvRet;
 
           // Write packet (muxer takes ownership)
-          this.writeSync(pkt, recvStreamInfo, recvRet);
+          this.writeSync(pkt, recvStreamInfo, recvRet, recvStreamInfo.sqArrivals.shift() ?? 0);
         }
       }
     }
@@ -2394,22 +2722,24 @@ export class Muxer implements AsyncDisposable, Disposable {
    *
    * @param streamIndex - Stream index
    *
+   * @param arrival - When the packet reached the muxer (ms on the arrival clock)
+   *
    * @internal
    */
-  private async write(pkt: Packet, streamInfo: StreamDescription, streamIndex: number): Promise<void> {
+  private async write(pkt: Packet, streamInfo: StreamDescription, streamIndex: number, arrival: number): Promise<void> {
     if (this.writeQueue) {
       // Use async queue for serialized writes.
       // If the worker died with a write error, the queue is poisoned and send()
       // rethrows that error - free the clone since it never reaches the worker.
       try {
-        await this.writeQueue.send({ pkt, streamInfo, streamIndex });
+        await this.writeQueue.send({ pkt, streamInfo, streamIndex, arrival });
       } catch (error) {
         pkt.free();
         throw error;
       }
     } else {
       // Direct write without serialization
-      await this.writeInternal(pkt, streamInfo, streamIndex);
+      await this.writeInternal(pkt, streamInfo, streamIndex, arrival);
     }
   }
 
@@ -2423,16 +2753,22 @@ export class Muxer implements AsyncDisposable, Disposable {
    *
    * @param streamIndex - Stream index
    *
+   * @param arrival - When the packet reached the muxer (ms on the arrival clock)
+   *
    * @internal
    */
-  private async writeInternal(pkt: Packet, streamInfo: StreamDescription, streamIndex: number): Promise<void> {
+  private async writeInternal(pkt: Packet, streamInfo: StreamDescription, streamIndex: number, arrival: number): Promise<void> {
+    // Read before the write moves the payload out (see announcePacket()).
+    const observed = this.packetObserver !== undefined && pkt.size > 0;
+    let accepted = false;
     try {
       // Fix timestamps (rescale, DTS>PTS fix, monotonic DTS enforcement)
-      this.muxFixupTs(pkt, streamInfo, streamIndex);
+      this.muxFixupTs(pkt, streamInfo, streamIndex, arrival);
 
       // Write the packet (muxer takes ownership and will unref it)
       // NOTE: Caller must clone packet if they need to keep it (e.g., for SyncQueue)
       const ret = await this.formatContext.interleavedWriteFrame(pkt);
+      accepted = ret >= 0;
 
       // Handle write errors
       if (ret < 0 && ret !== AVERROR_EOF) {
@@ -2441,6 +2777,9 @@ export class Muxer implements AsyncDisposable, Disposable {
         }
       }
     } finally {
+      if (observed && !accepted) {
+        this.packetObserver?.onPacketRejected(streamIndex);
+      }
       // Every packet reaching here is a clone this class made, and the write
       // has consumed its contents. Release the struct now instead of leaving a
       // GC-sized backlog of them behind - this is the last owner.
@@ -2466,7 +2805,7 @@ export class Muxer implements AsyncDisposable, Disposable {
         while (true) {
           const job = await this.writeQueue!.receive();
           if (!job) break; // Queue closed
-          await this.writeInternal(job.pkt, job.streamInfo, job.streamIndex);
+          await this.writeInternal(job.pkt, job.streamInfo, job.streamIndex, job.arrival);
         }
       } catch (error) {
         // A write failure kills the worker. Without propagation the next send()
@@ -2491,19 +2830,27 @@ export class Muxer implements AsyncDisposable, Disposable {
    *
    * @param streamIndex - Stream index
    *
+   * @param arrival - When the packet reached the muxer (ms on the arrival clock)
+   *
    * @internal
    */
-  private writeSync(pkt: Packet, streamInfo: StreamDescription, streamIndex: number): void {
+  private writeSync(pkt: Packet, streamInfo: StreamDescription, streamIndex: number, arrival: number): void {
+    const observed = this.packetObserver !== undefined && pkt.size > 0;
+    let accepted = false;
     try {
       // Fix timestamps (rescale, DTS>PTS fix, monotonic DTS enforcement)
-      this.muxFixupTs(pkt, streamInfo, streamIndex);
+      this.muxFixupTs(pkt, streamInfo, streamIndex, arrival);
 
       // Write the packet (muxer takes ownership and will unref it)
       // NOTE: Caller must clone packet if they need to keep it (e.g., for SyncQueue)
       const ret = this.formatContext.interleavedWriteFrameSync(pkt);
+      accepted = ret >= 0;
 
       FFmpegError.throwIfError(ret, 'Failed to write packet');
     } finally {
+      if (observed && !accepted) {
+        this.packetObserver?.onPacketRejected(streamIndex);
+      }
       // See writeInternal(): this is the last owner of the clone.
       pkt.free();
     }
@@ -2536,11 +2883,12 @@ export class Muxer implements AsyncDisposable, Disposable {
    * Apply the configured `startTime` offset to an encoded packet, per stream.
    *
    * `startTime` exists to strip a device's boot-relative timestamp base (e.g. the
-   * mach uptime avfoundation reports). But audio encoders re-stamp their output to
-   * a ~0 baseline, so subtracting a large device startTime from them would push the
-   * timestamps hugely negative and produce a broken/overflowed edit list that strict
-   * players (QuickTime) reject. The effective offset is therefore decided once on the
-   * stream's first packet and clamped to what the stream actually carries —
+   * mach uptime avfoundation reports). But not every stream of an output carries
+   * that base (e.g. zero-based audio next to device video), so subtracting a large
+   * device startTime from such a stream would push its timestamps hugely negative and
+   * produce a broken/overflowed edit list that strict players (QuickTime) reject. The
+   * effective offset is therefore decided once on the stream's first packet and
+   * clamped to what the stream actually carries —
    * `min(startTime, max(0, firstPts))`: boot-relative streams normalize to zero,
    * already-zero-based streams are left untouched.
    *
@@ -2650,8 +2998,14 @@ export class Muxer implements AsyncDisposable, Disposable {
    * Performs timestamp corrections:
    * 1. Rescales timestamps to output timebase (av_rescale_delta for audio streamcopy)
    * 2. Sets pkt.timeBase to output stream timebase
-   * 3. Fixes invalid DTS > PTS relationships
-   * 4. Enforces monotonic DTS (never decreasing)
+   * 3. Rejects backward jumps beyond dtsBackwardThreshold
+   * 4. Fixes invalid DTS > PTS relationships
+   * 5. Enforces monotonic DTS (never decreasing), shrinking a clamped packet's duration to the clamped step
+   * 6. Rejects forward jumps that run ahead of real time beyond dtsForwardThreshold
+   * 7. Rejects DTS steps/durations a movenc output cannot store, and a late stream's first packet before its start
+   *
+   * The stream's last muxed DTS only advances when the packet is accepted and
+   * carries a DTS.
    *
    * @param pkt - Packet to fix
    *
@@ -2659,77 +3013,361 @@ export class Muxer implements AsyncDisposable, Disposable {
    *
    * @param streamIndex - Stream index
    *
+   * @param arrival - When the packet reached the muxer (ms on the arrival clock)
+   *
+   * @throws {Error} On a rejected timestamp discontinuity
+   *
    * @internal
    */
-  private muxFixupTs(pkt: Packet, streamInfo: StreamDescription, streamIndex: number): void {
-    const outputStream = this.formatContext.streams[streamIndex];
-    if (!outputStream) return;
+  private muxFixupTs(pkt: Packet, streamInfo: StreamDescription, streamIndex: number, arrival: number): void {
+    const outputStream = streamInfo.outputStream;
+    // Both are final once the header is written, which happens before the
+    // first packet gets here.
+    const dstTb = (streamInfo.muxTimeBase ??= outputStream.timeBase);
+    const codecType = (streamInfo.muxCodecType ??= outputStream.codecpar.codecType);
+    const lastMuxDts = streamInfo.lastMuxDts;
 
-    const codecType = streamInfo.outputStream.codecpar.codecType;
-    const dstTb = outputStream.timeBase;
-    // const srcTb = streamInfo.sourceTimeBase!;
+    // Every timestamp getter is a native call returning a new BigInt, so each
+    // value is read once, corrected in locals, and only changes are written back.
+    let dts = pkt.dts;
+    let pts = pkt.pts;
 
     // Check if timestamps are valid before rescaling
     // FFmpeg's av_rescale_q/av_rescale_delta don't accept AV_NOPTS_VALUE
-    if (pkt.dts === AV_NOPTS_VALUE && pkt.pts === AV_NOPTS_VALUE) {
+    if (dts === AV_NOPTS_VALUE && pts === AV_NOPTS_VALUE) {
       // Set packet timebase anyway for muxer
       pkt.timeBase = dstTb;
       return;
     }
 
     // 1. Rescale timestamps to the stream timebase
+    const srcTb = streamInfo.sourceTimeBase!;
     if (codecType === AVMEDIA_TYPE_AUDIO && streamInfo.isStreamCopy) {
-      let duration = avGetAudioFrameDuration2(streamInfo.outputStream.codecpar, pkt.size);
+      const codecpar = outputStream.codecpar;
+      let duration = avGetAudioFrameDuration2(codecpar, pkt.size);
       if (!duration) {
-        duration = streamInfo.outputStream.codecpar.frameSize;
+        duration = codecpar.frameSize;
       }
 
-      const srcTb = streamInfo.sourceTimeBase!;
-      const sampleRate = streamInfo.outputStream.codecpar.sampleRate;
-      const fsTb: IRational = { num: 1, den: sampleRate };
+      const fsTb: IRational = { num: 1, den: codecpar.sampleRate };
 
-      pkt.dts = avRescaleDelta(srcTb, pkt.dts, fsTb, duration, streamInfo.tsRescaleDeltaLast, dstTb);
-      pkt.pts = pkt.dts;
+      dts = avRescaleDelta(srcTb, dts, fsTb, duration, streamInfo.tsRescaleDeltaLast, dstTb);
+      pts = dts;
+      pkt.dts = dts;
+      pkt.pts = pts;
 
       pkt.duration = avRescaleQ(pkt.duration, srcTb, dstTb);
     } else {
       // For video or encoded audio, use regular rescaling
-      const srcTb = streamInfo.sourceTimeBase!;
       pkt.rescaleTs(srcTb, dstTb);
+      dts = pkt.dts;
+      pts = pkt.pts;
     }
 
     // 2. Set packet timeBase
     // av_interleaved_write_frame uses this for sorting!
     pkt.timeBase = dstTb;
 
-    // 3. Fix DTS > PTS (invalid relationship)
+    const isAudioVideo = codecType === AVMEDIA_TYPE_AUDIO || codecType === AVMEDIA_TYPE_VIDEO;
+
+    // 3. Reject a large backward jump while it is still visible - the corrections
+    // below would turn it into a run of one-tick steps
+    if (isAudioVideo) {
+      this.checkBackwardDts(dts, lastMuxDts, dstTb, streamIndex);
+    }
+
+    // 4. Fix DTS > PTS (invalid relationship)
     // FFmpeg formula: median of (pts, dts, last_mux_dts+1)
-    if (pkt.dts !== AV_NOPTS_VALUE && pkt.pts !== AV_NOPTS_VALUE && pkt.dts > pkt.pts) {
-      const last = streamInfo.lastMuxDts !== AV_NOPTS_VALUE ? streamInfo.lastMuxDts + 1n : 0n;
-      const min = pkt.pts < pkt.dts ? (pkt.pts < last ? pkt.pts : last) : pkt.dts < last ? pkt.dts : last;
-      const max = pkt.pts > pkt.dts ? (pkt.pts > last ? pkt.pts : last) : pkt.dts > last ? pkt.dts : last;
-      const median = pkt.pts + pkt.dts + last - min - max;
+    if (dts !== AV_NOPTS_VALUE && pts !== AV_NOPTS_VALUE && dts > pts) {
+      const last = lastMuxDts !== AV_NOPTS_VALUE ? lastMuxDts + 1n : 0n;
+      const min = pts < dts ? (pts < last ? pts : last) : dts < last ? dts : last;
+      const max = pts > dts ? (pts > last ? pts : last) : dts > last ? dts : last;
+      const median = pts + dts + last - min - max;
+      pts = median;
+      dts = median;
       pkt.pts = median;
       pkt.dts = median;
     }
 
-    // 4. Enforce monotonic DTS
-    if ((codecType === AVMEDIA_TYPE_AUDIO || codecType === AVMEDIA_TYPE_VIDEO) && pkt.dts !== AV_NOPTS_VALUE && streamInfo.lastMuxDts !== AV_NOPTS_VALUE) {
+    // 5. Enforce monotonic DTS
+    let clampedDuration: bigint | undefined;
+    if (isAudioVideo && dts !== AV_NOPTS_VALUE && lastMuxDts !== AV_NOPTS_VALUE) {
       // FFmpeg: max = last_mux_dts + !(oformat->flags & AVFMT_TS_NONSTRICT)
       // AVFMT_TS_NONSTRICT allows non-strict monotonic timestamps (equal DTS is OK)
-      const tsNonStrict = this.formatContext.oformat?.hasFlags(AVFMT_TS_NONSTRICT) ?? false;
-      const max = streamInfo.lastMuxDts + (tsNonStrict ? 0n : 1n);
-      if (pkt.dts < max) {
+      const max = lastMuxDts + (this.tsNonStrict ? 0n : 1n);
+      if (dts < max) {
         // Adjust PTS if it would create invalid relationship
-        if (pkt.pts !== AV_NOPTS_VALUE && pkt.pts >= pkt.dts) {
-          pkt.pts = pkt.pts > max ? pkt.pts : max;
+        if (pts !== AV_NOPTS_VALUE && pts >= dts && pts < max) {
+          pts = max;
+          pkt.pts = max;
         }
+        dts = max;
         pkt.dts = max;
+
+        // The clamped packet must not keep its source duration: after a fragment
+        // flush movenc continues the track at the previous DTS plus its duration,
+        // which then lies ahead of the clamped timeline. movenc corrects that by
+        // moving later DTS itself and can end with a negative sample duration
+        // (av_assert0 in get_cluster_duration). A duration of 0 does not help -
+        // mux.c guesses a new one - so use the clamped step.
+        if (max > lastMuxDts) {
+          clampedDuration = max - lastMuxDts;
+          pkt.duration = clampedDuration;
+        }
       }
     }
 
-    // 5. Update last mux DTS for next packet
-    streamInfo.lastMuxDts = pkt.dts;
+    // mux.c derives a missing DTS from the PTS and never above it (its PTS-0
+    // fallback aside, which only steps one frame), so the PTS stands in for the
+    // DTS of such a packet in the checks below.
+    const ts = dts !== AV_NOPTS_VALUE ? dts : pts;
+
+    // 6. Reject a forward jump on the DTS libavformat would see, before the
+    // packet enters it: once in, movenc takes the jump as the duration of the
+    // stream's previous sample.
+    let forwardOffset = NaN;
+    if (isAudioVideo && this.forwardThresholdMs > 0) {
+      forwardOffset = this.checkForwardDts(ts, arrival, streamInfo, streamIndex);
+    }
+
+    // 7. Reject what movenc cannot store before it reaches its abort
+    if (this.movSampleLimit) {
+      const duration = clampedDuration ?? pkt.duration;
+      this.checkMovSampleDuration(ts, duration, lastMuxDts, dstTb, streamIndex);
+      if (this.movZeroStart && streamInfo.firstMuxTs === undefined) {
+        this.checkMovLateStart(ts, duration, dstTb, streamIndex);
+      }
+    }
+
+    // 8. Update last mux DTS for next packet. mux.c fills a missing DTS itself
+    // and rejects it unless it lies past the previous one, so the last known
+    // DTS stays a valid reference: the clamp and the guards remain armed for
+    // the next packet instead of letting it through unchecked.
+    if (dts !== AV_NOPTS_VALUE) {
+      streamInfo.lastMuxDts = dts;
+    }
+    streamInfo.firstMuxTs ??= ts;
+    if (streamInfo.forward && !Number.isNaN(forwardOffset)) {
+      this.recordForwardDts(streamInfo.forward, ts, forwardOffset, arrival);
+    }
+  }
+
+  /**
+   * Reject a packet whose DTS lies further behind the stream's last muxed DTS
+   * than the configured dtsBackwardThreshold.
+   *
+   * Expects the DTS already rescaled to the output stream time base. No-op when
+   * the threshold is unset or 0.
+   *
+   * @param dts - Packet DTS in the output time base
+   *
+   * @param lastMuxDts - The stream's last muxed DTS
+   *
+   * @param timeBase - Output stream time base
+   *
+   * @param streamIndex - Stream index
+   *
+   * @throws {Error} If the backward jump exceeds the threshold
+   *
+   * @internal
+   */
+  private checkBackwardDts(dts: bigint, lastMuxDts: bigint, timeBase: IRational, streamIndex: number): void {
+    const threshold = this.options.dtsBackwardThreshold;
+    if (!threshold || dts === AV_NOPTS_VALUE || lastMuxDts === AV_NOPTS_VALUE || dts >= lastMuxDts) {
+      return;
+    }
+
+    const regression = lastMuxDts - dts;
+    const thresholdUs = BigInt(Math.round(threshold * 1_000_000));
+    if (avCompareTs(regression, timeBase, thresholdUs, AV_TIME_BASE_Q) <= 0) {
+      return;
+    }
+
+    const seconds = ((Number(regression) * timeBase.num) / timeBase.den).toFixed(3);
+    throw new Error(`Timestamp discontinuity on output stream ${streamIndex}: DTS jumped back ${seconds}s, more than dtsBackwardThreshold (${threshold}s)`);
+  }
+
+  /**
+   * Reject a packet whose DTS runs further ahead of real time than the
+   * configured dtsForwardThreshold.
+   *
+   * Tracks per stream how real time and media time move apart (the offset) and
+   * compares the packet's offset with the lowest one of the stream's recent
+   * packets, see FORWARD_WINDOW_BUCKET. A gap in a live source leaves the
+   * offset level, since the wait comes with it; a jump lowers it by the size
+   * of the jump. The stream's first packet only sets the starting point.
+   *
+   * @param ts - Final packet DTS (PTS without DTS) in the output time base
+   *
+   * @param arrival - When the packet reached the muxer (ms on the arrival clock)
+   *
+   * @param streamInfo - Stream description
+   *
+   * @param streamIndex - Stream index
+   *
+   * @returns The packet's offset, for {@link recordForwardDts} once the packet is accepted
+   *
+   * @throws {Error} If the DTS runs ahead of real time by more than the threshold
+   *
+   * @internal
+   */
+  private checkForwardDts(ts: bigint, arrival: number, streamInfo: StreamDescription, streamIndex: number): number {
+    const tb = streamInfo.muxTimeBase!;
+    const state = (streamInfo.forward ??= {
+      msPerTick: (1000 * tb.num) / tb.den,
+      lastTs: AV_NOPTS_VALUE,
+      lastArrival: NaN,
+      offset: 0,
+      windowMin: Infinity,
+      windowPrevMin: Infinity,
+      windowCount: 0,
+    });
+    if (Number.isNaN(state.lastArrival)) {
+      return 0;
+    }
+
+    const stepMs = Number(ts - state.lastTs) * state.msPerTick;
+    const elapsedMs = arrival - state.lastArrival;
+    const offset = state.offset + elapsedMs - stepMs;
+    const reference = state.windowMin < state.windowPrevMin ? state.windowMin : state.windowPrevMin;
+    if (reference - offset <= this.forwardThresholdMs) {
+      return offset;
+    }
+
+    const jump = `DTS jumped forward ${(stepMs / 1000).toFixed(3)}s while ${(elapsedMs / 1000).toFixed(3)}s passed`;
+    throw new Error(`Timestamp discontinuity on output stream ${streamIndex}: ${jump}, more than dtsForwardThreshold (${this.options.dtsForwardThreshold}s)`);
+  }
+
+  /**
+   * Make an accepted packet the reference of the stream's next forward check.
+   *
+   * @param state - The stream's forward check state
+   *
+   * @param ts - The packet's DTS (PTS without DTS) in the output time base
+   *
+   * @param offset - The packet's offset from {@link checkForwardDts}
+   *
+   * @param arrival - When the packet reached the muxer (ms on the arrival clock)
+   *
+   * @internal
+   */
+  private recordForwardDts(state: ForwardDtsState, ts: bigint, offset: number, arrival: number): void {
+    state.lastTs = ts;
+    state.offset = offset;
+    state.lastArrival = arrival;
+    if (offset < state.windowMin) {
+      state.windowMin = offset;
+    }
+    // Two buckets keep the window between one and two buckets long in O(1).
+    if (++state.windowCount >= FORWARD_WINDOW_BUCKET) {
+      state.windowPrevMin = state.windowMin;
+      state.windowMin = Infinity;
+      state.windowCount = 0;
+    }
+  }
+
+  /**
+   * Reject a packet whose DTS step or duration a movenc output cannot store.
+   *
+   * Runs after the monotonic clamp, on the DTS movenc will see. Steps are
+   * measured against the stream's last muxed DTS.
+   *
+   * @param dts - Final packet DTS, or its PTS for a packet without DTS
+   *
+   * @param duration - Final packet duration
+   *
+   * @param lastMuxDts - The stream's last muxed DTS
+   *
+   * @param timeBase - Output stream time base
+   *
+   * @param streamIndex - Stream index
+   *
+   * @throws {Error} If the step or duration reaches INT_MAX ticks
+   *
+   * @internal
+   */
+  private checkMovSampleDuration(dts: bigint, duration: bigint, lastMuxDts: bigint, timeBase: IRational, streamIndex: number): void {
+    const step = dts !== AV_NOPTS_VALUE && lastMuxDts !== AV_NOPTS_VALUE ? dts - lastMuxDts : 0n;
+    const ticks = step >= MOV_SAMPLE_DURATION_LIMIT ? step : duration >= MOV_SAMPLE_DURATION_LIMIT ? duration : undefined;
+    if (ticks === undefined) {
+      return;
+    }
+
+    const what = ticks === step ? 'DTS jumped forward' : 'packet duration is';
+    const seconds = ((Number(ticks) * timeBase.num) / timeBase.den).toFixed(3);
+    const format = this.formatContext.oformat?.name ?? 'mov';
+    const detail = `${what} ${ticks} ticks (${seconds}s at time base ${timeBase.num}/${timeBase.den})`;
+    throw new Error(
+      `Timestamp discontinuity on output stream ${streamIndex}: ${detail}, but ${format} sample durations must stay below ${MOV_SAMPLE_DURATION_LIMIT} ticks`,
+    );
+  }
+
+  /**
+   * Reject a stream's first packet that ends before the output's start.
+   *
+   * Without an edit list movenc puts each track's first sample at the output's
+   * start, so a first packet that ends before it becomes a sample of negative
+   * duration, and movenc aborts the process (av_assert0 in
+   * get_cluster_duration) at the next fragment or the trailer unless a second
+   * sample reaches it first. libavformat sets that start from the lowest DTS
+   * it holds when it writes its first packet. It holds every packet until each
+   * stream has sent one or its queue spans max_interleave_delta, so only a
+   * stream that starts that much later than the others can land before it.
+   *
+   * @param ts - Packet DTS (PTS without DTS) in the output time base
+   *
+   * @param duration - Packet duration
+   *
+   * @param timeBase - Output stream time base
+   *
+   * @param streamIndex - Stream index
+   *
+   * @throws {Error} If the packet ends before a start libavformat may already have set
+   *
+   * @internal
+   */
+  private checkMovLateStart(ts: bigint, duration: bigint, timeBase: IRational, streamIndex: number): void {
+    if (this.interleaveDeltaUs <= 0n) {
+      return;
+    }
+
+    // The other streams' earliest and latest timestamp so far, in µs
+    let start: { ts: bigint; timeBase: IRational; index: number } | undefined;
+    let startUs = 0n;
+    let latestUs = 0n;
+    for (const [index, other] of this._streams) {
+      const first = other.firstMuxTs;
+      const otherTb = other.muxTimeBase;
+      if (first === undefined || !otherTb) {
+        continue;
+      }
+      const firstUs = avRescaleQ(first, otherTb, AV_TIME_BASE_Q);
+      const lastUs = other.lastMuxDts !== AV_NOPTS_VALUE ? avRescaleQ(other.lastMuxDts, otherTb, AV_TIME_BASE_Q) : firstUs;
+      if (!start) {
+        latestUs = lastUs;
+      } else if (lastUs > latestUs) {
+        latestUs = lastUs;
+      }
+      if (!start || firstUs < startUs) {
+        start = { ts: first, timeBase: otherTb, index };
+        startUs = firstUs;
+      }
+    }
+    // Until its queue spans max_interleave_delta, libavformat has written nothing
+    // and will start the output at this packet if it is the lowest.
+    if (!start || latestUs - startUs <= this.interleaveDeltaUs) {
+      return;
+    }
+
+    const end = ts + (duration > 0n ? duration : 0n);
+    if (avCompareTs(end, timeBase, start.ts, start.timeBase) >= 0) {
+      return;
+    }
+
+    const seconds = (Number(startUs - avRescaleQ(end, timeBase, AV_TIME_BASE_Q)) / 1_000_000).toFixed(3);
+    const format = this.formatContext.oformat?.name ?? 'mov';
+    const detail = `its first packet ends ${seconds}s before the start of output stream ${start.index}`;
+    throw new Error(`Timestamp discontinuity on output stream ${streamIndex}: ${detail}, which ${format} without an edit list cannot store`);
   }
 
   /**
