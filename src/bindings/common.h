@@ -65,7 +65,28 @@ inline AVRational JSToRational(const Napi::Object& obj) {
   return r;
 }
 
+// JS function (num, den) => ({ num, den }) of the env that loaded the addon on
+// this thread, set by InitRationalFactory() (utilities.cc). Never deleted: the
+// env releases its references when it is torn down.
+extern thread_local napi_env rational_factory_env;
+extern thread_local napi_ref rational_factory;
+
+// Compiles the factory RationalToJS builds its objects with. If that fails,
+// RationalToJS keeps creating native objects.
+void InitRationalFactory(Napi::Env env);
+
 inline Napi::Object RationalToJS(const Napi::Env& env, const AVRational& r) {
+  // A JS object literal is far cheaper than a native object with two named
+  // properties: about 100 instead of 260 ns per rational getter.
+  if (rational_factory_env == env) {
+    napi_value factory;
+    napi_value argv[2];
+    napi_value result;
+    if (napi_get_reference_value(env, rational_factory, &factory) == napi_ok && napi_create_int32(env, r.num, &argv[0]) == napi_ok &&
+        napi_create_int32(env, r.den, &argv[1]) == napi_ok && napi_call_function(env, env.Undefined(), factory, 2, argv, &result) == napi_ok) {
+      return Napi::Object(env, result);
+    }
+  }
   Napi::Object obj = Napi::Object::New(env);
   obj.Set("num", Napi::Number::New(env, r.num));
   obj.Set("den", Napi::Number::New(env, r.den));

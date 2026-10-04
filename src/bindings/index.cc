@@ -44,6 +44,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   // Register all input/output devices (avfoundation, v4l2, dshow, etc.)
   avdevice_register_all();
 
+  InitRationalFactory(env);
+
   // Core Types
   Packet::Init(env, exports);
   Frame::Init(env, exports);
