@@ -452,8 +452,11 @@ Napi::Value FormatContext::CloseInputAsync(const Napi::CallbackInfo& info) {
   // Interrupt BEFORE guarding: a reader blocked inside av_read_frame() only
   // returns once the AVIO interrupt callback fires - the op counter cannot
   // abort it, only wait for it. With the flag set, blocked readers unwind
-  // with AVERROR_EXIT and release the counter, letting the guard pass.
+  // with AVERROR_EXIT and release the counter, letting the guard pass. A read,
+  // seek or open parked in a custom-IO callback never sees the flag; failing
+  // the callbacks unblocks it, which also lets the join below return.
   RequestInterrupt();
+  AbortCustomIO();
 
   // Wait for remaining in-flight async operations (read/seek/write/...) so
   // the close below cannot free the context under a threadpool op

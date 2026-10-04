@@ -2148,9 +2148,10 @@ export class Demuxer implements AsyncDisposable, Disposable {
    * Interrupt a blocking read without closing the demuxer.
    *
    * Aborts any in-progress `av_read_frame()` (e.g. on a quiet RTSP/network source
-   * that is waiting for data) and signals end-of-stream to packet consumers, so
-   * an active pipeline can drain and finish. The demuxer is not freed and its
-   * streams stay valid - call {@link close} afterwards to release resources.
+   * or a stalled Readable/custom I/O source that is waiting for data) and signals
+   * end-of-stream to packet consumers, so an active pipeline can drain and finish.
+   * The demuxer is not freed and its streams stay valid - call {@link close}
+   * afterwards to release resources.
    *
    * Mainly used by pipeline teardown: a blocking read only unblocks on close, but
    * closing while the pipeline is still draining would free the context too early,
@@ -2673,6 +2674,8 @@ export class Demuxer implements AsyncDisposable, Disposable {
    * Close demuxer and free resources.
    *
    * Releases format context and I/O context.
+   * A read waiting for a stalled Readable or custom I/O source is abandoned,
+   * so closing never waits for the source to deliver.
    * Safe to call multiple times.
    * Automatically called by Symbol.asyncDispose.
    *
@@ -2765,6 +2768,7 @@ export class Demuxer implements AsyncDisposable, Disposable {
    * Synchronous version of close.
    *
    * Releases format context and I/O context.
+   * A read waiting for a stalled Readable or custom I/O source is abandoned.
    * Safe to call multiple times.
    * Automatically called by Symbol.dispose.
    *
@@ -2793,11 +2797,20 @@ export class Demuxer implements AsyncDisposable, Disposable {
     this.signalCleanup?.();
     this.signalCleanup = undefined;
 
+    // Stop the demux thread and wake generators parked on an empty queue: they
+    // resume once this returns and end, as in close()
+    this.demuxThreadActive = false;
+    this.demuxEof = true;
+    this.wakeDemuxThread();
+    for (const resolvers of this.queueResolvers.values()) {
+      for (const resolve of resolvers) {
+        resolve();
+      }
+    }
+    this.queueResolvers.clear();
+
     // Close FormatContext; a custom pb is detached inside so it is not closed with the input
     this.formatContext.closeInputSync(!!this.ioContext);
-
-    this.demuxThreadActive = false;
-    this.wakeDemuxThread();
 
     for (const queue of this.packetQueues.values()) {
       for (const packet of queue) {
@@ -2806,8 +2819,7 @@ export class Demuxer implements AsyncDisposable, Disposable {
       queue.length = 0;
     }
     this.packetQueues.clear();
-    this.queueResolvers.clear();
-    this.demuxEof = false;
+    this.packetQueueConsumers.clear();
 
     // NOW we can safely release the IOContext (see close() for why dispose)
     if (this.ioContext) {

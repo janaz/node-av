@@ -1,16 +1,274 @@
 #include "io_context.h"
 #include <libavutil/error.h>
 #include <libavutil/mem.h>
-#include <future>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
 #include <thread>
 
 namespace ffmpeg {
 
 thread_local Napi::FunctionReference IOContext::constructor;
+thread_local std::shared_ptr<IOExitState> IOContext::exit_state_;
+
+namespace {
+
+// How often a thread waiting for a promise the JS callback returned asks the JS
+// thread whether its env still runs JS. worker.terminate() emits no 'exit'
+// event, and such a promise never settles once the env is torn down.
+constexpr auto kExitProbeInterval = std::chrono::milliseconds(250);
+
+// Set by the main thread's 'exit' event: the whole process is going down and
+// joins the threadpool, so no env's callback will run again
+std::atomic<bool> g_process_exiting{false};
+
+// Waiting side of a callback round-trip, linked into a registry so an exiting
+// env, an aborted context or a finalized TSFN can wake its waiters. Waits have
+// no timeout: live sources keep a read or write pending for as long as they stall.
+class CallWaiter {
+public:
+  CallWaiter(std::shared_ptr<IOExitState> exit_state, std::shared_ptr<IOExitState> abort_state, std::shared_ptr<IOCallbackState> callback_state)
+      : exit_state_(std::move(exit_state)), abort_state_(std::move(abort_state)), callback_state_(std::move(callback_state)) {}
+
+  // Wakes the waiting calls ended by `state` (an env's or a context's), or of
+  // every env when null
+  static void WakeExitState(const IOExitState* state) {
+    WakeIf([state](const CallWaiter& waiter) { return !state || waiter.exit_state_.get() == state || waiter.abort_state_.get() == state; });
+  }
+
+  // Wakes the waiting calls of one callback's TSFN
+  static void WakeCallback(const IOCallbackState* state) {
+    WakeIf([state](const CallWaiter& waiter) { return waiter.callback_state_.get() == state; });
+  }
+
+protected:
+  bool ExitRequested() const {
+    return g_process_exiting.load(std::memory_order_acquire) || exit_state_->exiting.load(std::memory_order_acquire) ||
+           abort_state_->exiting.load(std::memory_order_acquire) || callback_state_->finalized.load(std::memory_order_acquire);
+  }
+
+  // Called without holding mutex_ (lock order: registry, then waiter)
+  void Register() {
+    Registry& registry = GetRegistry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    next_ = registry.head;
+    if (next_) {
+      next_->prev_ = this;
+    }
+    registry.head = this;
+  }
+
+  void Unregister() {
+    Registry& registry = GetRegistry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    if (prev_) {
+      prev_->next_ = next_;
+    } else {
+      registry.head = next_;
+    }
+    if (next_) {
+      next_->prev_ = prev_;
+    }
+    prev_ = next_ = nullptr;
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::shared_ptr<IOExitState> exit_state_;
+  std::shared_ptr<IOExitState> abort_state_;
+  std::shared_ptr<IOCallbackState> callback_state_;
+
+private:
+  struct Registry {
+    std::mutex mutex;
+    CallWaiter* head = nullptr;
+  };
+
+  // Never destroyed: threads outside the threadpool (an InputReader on custom
+  // IO) can still unregister while static destructors run at process exit
+  static Registry& GetRegistry() {
+    static Registry* registry = new Registry();
+    return *registry;
+  }
+
+  template <typename Pred>
+  static void WakeIf(Pred&& matches) {
+    Registry& registry = GetRegistry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    for (CallWaiter* waiter = registry.head; waiter; waiter = waiter->next_) {
+      if (matches(*waiter)) {
+        // Under the waiter's lock, so a check-then-wait cannot miss it
+        std::lock_guard<std::mutex> waiter_lock(waiter->mutex_);
+        waiter->cv_.notify_all();
+      }
+    }
+  }
+
+  CallWaiter* prev_ = nullptr;
+  CallWaiter* next_ = nullptr;
+};
+
+// Fails pending and later threadpool round-trips of one env, or every callback
+// of one context
+void MarkExitState(const std::shared_ptr<IOExitState>& state) {
+  state->exiting.store(true, std::memory_order_release);
+  CallWaiter::WakeExitState(state.get());
+}
+
+// One round-trip of a custom-IO callback from a threadpool thread to the JS
+// thread. The JS side completes it (directly, or from a .then() long after the
+// call) unless the waiting thread gave up first because the env exits; the
+// FFmpeg buffer is only touched under the lock while the call is pending, so a
+// late JS result never writes into a buffer the waiter already abandoned.
+template <typename T>
+class PendingCall : public CallWaiter {
+public:
+  PendingCall(std::shared_ptr<IOExitState> exit_state, std::shared_ptr<IOExitState> abort_state, std::shared_ptr<IOCallbackState> callback_state)
+      : CallWaiter(std::move(exit_state), std::move(abort_state), std::move(callback_state)) {}
+
+  // JS thread: runs `fn` under the lock while the call is still pending.
+  // Returns false once the waiter gave up.
+  template <typename Fn>
+  bool WhilePending(Fn&& fn) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (state_ != kPending) {
+      return false;
+    }
+    fn();
+    return true;
+  }
+
+  // JS thread: false once the waiter gave up (nobody needs the callback then)
+  bool Pending() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return state_ == kPending;
+  }
+
+  // JS thread: publishes the value `produce` returns (run under the lock, may
+  // fill the FFmpeg buffer). Ignored once settled or abandoned.
+  template <typename Fn>
+  void CompleteWith(Fn&& produce) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (state_ != kPending) {
+      return;
+    }
+    value_ = produce();
+    state_ = kDone;
+    cv_.notify_all();
+  }
+
+  void Complete(T value) {
+    CompleteWith([value] { return value; });
+  }
+
+  // JS thread: the callback returned a promise, which only settles while the
+  // env runs JS - from now on the waiter probes for a torn-down env
+  void AwaitingPromise() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (state_ == kPending) {
+      awaiting_promise_ = true;
+      cv_.notify_all();
+    }
+  }
+
+  // Threadpool thread: waits for the JS result, or returns `on_exit` once the
+  // env or the process exits or the TSFN goes away
+  T Await(Napi::ThreadSafeFunction tsfn, T on_exit) {
+    Register();
+    T result = Wait(tsfn, on_exit);
+    Unregister();
+    return result;
+  }
+
+private:
+  enum State { kPending, kDone, kAbandoned };
+
+  T Wait(Napi::ThreadSafeFunction& tsfn, T on_exit) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    auto next_probe = std::chrono::steady_clock::time_point::max();
+    while (state_ == kPending) {
+      if (ExitRequested()) {
+        state_ = kAbandoned;
+        return on_exit;
+      }
+      if (!awaiting_promise_) {
+        cv_.wait(lock);
+        continue;
+      }
+      auto now = std::chrono::steady_clock::now();
+      if (next_probe == std::chrono::steady_clock::time_point::max()) {
+        next_probe = now + kExitProbeInterval;
+      }
+      if (now < next_probe) {
+        cv_.wait_until(lock, next_probe);
+        continue;
+      }
+      // One probe per interval, answered or not: a closing TSFN drops queued
+      // calls without running them, so waiting for an answer could wait forever
+      next_probe = now + kExitProbeInterval;
+      lock.unlock();
+      std::shared_ptr<IOExitState> exit_state = exit_state_;
+      napi_status status = tsfn.NonBlockingCall([exit_state](Napi::Env env, Napi::Function) {
+        if (!CanCallIntoJs(env)) {
+          MarkExitState(exit_state);
+        }
+      });
+      lock.lock();
+      if (status != napi_ok) {
+        // A closing TSFN never runs this call's callback either
+        callback_state_->closed.store(true, std::memory_order_release);
+        if (state_ == kPending) {
+          state_ = kAbandoned;
+          return on_exit;
+        }
+      }
+    }
+    return value_;
+  }
+
+  State state_ = kPending;
+  T value_{};
+  bool awaiting_promise_ = false;
+};
+
+// Creates the ThreadSafeFunction for one callback. It does not hold the event
+// loop open (a context the user never frees must not prevent exit). Once it is
+// finalized, calls still queued on it are dropped without running, so the
+// finalizer wakes their waiters.
+Napi::ThreadSafeFunction NewCallbackTsfn(Napi::Env env, Napi::Function fn, const char* name, std::shared_ptr<IOCallbackState> state) {
+  // Unlimited queue, one thread (the AVIOContext's threadpool user)
+  Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(env, fn, name, 0, 1, [state](Napi::Env) {
+    state->finalized.store(true, std::memory_order_release);
+    CallWaiter::WakeCallback(state.get());
+  });
+  tsfn.Unref(env);
+  return tsfn;
+}
+
+// Releases our thread count of a callback's TSFN unless env teardown finalized
+// it or a failed call already consumed the count
+void ReleaseCallbackTsfn(Napi::ThreadSafeFunction& tsfn, const IOCallbackState& state) {
+  if (!state.finalized.load(std::memory_order_acquire) && !state.closed.load(std::memory_order_acquire)) {
+    tsfn.Release();
+  }
+}
+
+} // namespace
 
 Napi::Object IOContext::Init(Napi::Env env, Napi::Object exports) {
+  // Fresh state per env: a thread can host a new env after the old one exited
+  exit_state_ = std::make_shared<IOExitState>();
+
+  // Env teardown (worker.terminate(), a worker's or the main thread's natural
+  // end) runs every cleanup hook before it finalizes the env's TSFNs, and no JS
+  // runs from then on. Waking the env's waiters here frees threads outside the
+  // threadpool (an InputReader on custom IO) before the reader's TSFN finalizer
+  // joins them, whatever order libuv finalizes the TSFNs in.
+  env.AddCleanupHook([state = exit_state_] { MarkExitState(state); });
+
   Napi::Function func = DefineClass(env, "IOContext", {
+    StaticMethod<&IOContext::MarkExiting>("markExiting"),
     InstanceMethod<&IOContext::AllocContext>("allocContext"),
     InstanceMethod<&IOContext::AllocContextWithCallbacks>("allocContextWithCallbacks"),
     InstanceMethod<&IOContext::FreeContext>("freeContext"),
@@ -81,6 +339,13 @@ int IOContext::ReadPacket(void* opaque, uint8_t* buf, int buf_size) {
     return AVERROR_EOF;
   }
 
+  // The input reading through this context is closed or interrupted. Its
+  // source may never deliver again, and FFmpeg retries reads after an error
+  // (avio_feof() clears eof_reached), so every later call fails as well.
+  if (data->abort_state->exiting.load(std::memory_order_acquire)) {
+    return AVERROR_EXIT;
+  }
+
   // Try direct call first (for synchronous operations in main thread)
   // IMPORTANT: Only use direct call if we're in the same thread where callbacks were registered
   if (data->env && !data->read_callback_direct.IsEmpty() &&
@@ -113,12 +378,30 @@ int IOContext::ReadPacket(void* opaque, uint8_t* buf, int buf_size) {
     }
   }
 
-  // Fallback to ThreadSafeFunction (for async operations or when not in main thread)
-  // Use shared_ptr so the promise can outlive the callback (needed for async JS callbacks)
-  auto promisePtr = std::make_shared<std::promise<int>>();
-  std::future<int> future = promisePtr->get_future();
+  // Fallback to ThreadSafeFunction (for async operations or when not in main thread).
+  // An exiting env never runs the callback again (process.exit() then joins this
+  // thread, a terminated worker waits for it), so fail instead of parking here;
+  // same for a TSFN that is gone (see IOCallbackState).
+  if (!CanRoundTrip(data, *data->read_state)) {
+    return AVERROR_EXIT;
+  }
 
-  auto callback = [promisePtr, buf, buf_size](Napi::Env env, Napi::Function jsCallback) {
+  // Shared with the JS side so a result can arrive after this thread gave up
+  // (env exit, input close): the late result is then dropped untouched
+  auto call = std::make_shared<PendingCall<int>>(data->exit_state, data->abort_state, data->read_state);
+  std::shared_ptr<IOExitState> exit_state = data->exit_state;
+
+  auto callback = [call, exit_state, buf, buf_size](Napi::Env env, Napi::Function jsCallback) {
+    // Dispatched during env teardown (worker.terminate()): no JS can run, and a
+    // failed napi call would escalate to a fatal error (see CanCallIntoJs)
+    if (!CanCallIntoJs(env)) {
+      MarkExitState(exit_state);
+      call->Complete(AVERROR_EXIT);
+      return;
+    }
+    if (!call->Pending()) {
+      return;
+    }
     try {
       Napi::Value result = jsCallback.Call({Napi::Number::New(env, buf_size)});
 
@@ -129,62 +412,73 @@ int IOContext::ReadPacket(void* opaque, uint8_t* buf, int buf_size) {
           // It's a Promise - attach .then() handler
           Napi::Function thenFn = obj.Get("then").As<Napi::Function>();
 
-          // Create resolve handler - captures buf for memcpy
-          auto onResolve = Napi::Function::New(env, [promisePtr, buf, buf_size](const Napi::CallbackInfo& info) {
+          // Create resolve handler - fills buf only while the reader still waits for it
+          auto onResolve = Napi::Function::New(env, [call, buf, buf_size](const Napi::CallbackInfo& info) {
             if (info.Length() == 0 || info[0].IsNull() || info[0].IsUndefined()) {
-              promisePtr->set_value(AVERROR_EOF);
+              call->Complete(AVERROR_EOF);
             } else if (info[0].IsBuffer()) {
               Napi::Buffer<uint8_t> buffer = info[0].As<Napi::Buffer<uint8_t>>();
-              int bytes = std::min(static_cast<int>(buffer.Length()), buf_size);
-              memcpy(buf, buffer.Data(), bytes);
-              promisePtr->set_value(bytes);
+              call->CompleteWith([&] {
+                int bytes = std::min(static_cast<int>(buffer.Length()), buf_size);
+                memcpy(buf, buffer.Data(), bytes);
+                return bytes;
+              });
             } else if (info[0].IsNumber()) {
-              promisePtr->set_value(info[0].As<Napi::Number>().Int32Value());
+              call->Complete(info[0].As<Napi::Number>().Int32Value());
             } else {
-              promisePtr->set_value(AVERROR(EINVAL));
+              call->Complete(AVERROR(EINVAL));
             }
           });
 
           // Create reject handler
-          auto onReject = Napi::Function::New(env, [promisePtr](const Napi::CallbackInfo& info) {
-            promisePtr->set_value(AVERROR(EIO));
+          auto onReject = Napi::Function::New(env, [call](const Napi::CallbackInfo& info) {
+            call->Complete(AVERROR(EIO));
           });
 
+          call->AwaitingPromise();
           thenFn.Call(obj, {onResolve, onReject});
-          return; // Don't set promise value here - wait for .then()
+          return; // Don't complete here - wait for .then()
         }
       }
 
       // Synchronous result
       if (result.IsNull() || result.IsUndefined()) {
-        promisePtr->set_value(AVERROR_EOF);
+        call->Complete(AVERROR_EOF);
       } else if (result.IsBuffer()) {
         Napi::Buffer<uint8_t> buffer = result.As<Napi::Buffer<uint8_t>>();
-        int bytes_read = std::min(static_cast<int>(buffer.Length()), buf_size);
-        memcpy(buf, buffer.Data(), bytes_read);
-        promisePtr->set_value(bytes_read);
+        call->CompleteWith([&] {
+          int bytes_read = std::min(static_cast<int>(buffer.Length()), buf_size);
+          memcpy(buf, buffer.Data(), bytes_read);
+          return bytes_read;
+        });
       } else if (result.IsNumber()) {
-        promisePtr->set_value(result.As<Napi::Number>().Int32Value());
+        call->Complete(result.As<Napi::Number>().Int32Value());
       } else {
-        promisePtr->set_value(AVERROR(EINVAL));
+        call->Complete(AVERROR(EINVAL));
       }
     } catch (...) {
-      promisePtr->set_value(AVERROR(EIO));
+      call->Complete(AVERROR(EIO));
     }
   };
 
   napi_status status = data->read_callback.BlockingCall(callback);
   if (status != napi_ok) {
+    data->read_state->closed.store(true, std::memory_order_release);
     return AVERROR(EIO);
   }
 
-  return future.get();
+  return call->Await(data->read_callback, AVERROR_EXIT);
 }
 
 int IOContext::WritePacket(void* opaque, const uint8_t* buf, int buf_size) {
   CallbackData* data = static_cast<CallbackData*>(opaque);
   if (!data || !data->active || !data->has_write_callback) {
     return AVERROR(ENOSYS);
+  }
+
+  // Closed or interrupted input (see ReadPacket)
+  if (data->abort_state->exiting.load(std::memory_order_acquire)) {
+    return AVERROR_EXIT;
   }
 
   // Try direct call first (for synchronous operations in main thread)
@@ -211,14 +505,29 @@ int IOContext::WritePacket(void* opaque, const uint8_t* buf, int buf_size) {
     }
   }
 
-  // Fallback to ThreadSafeFunction (for async operations or when not in main thread)
-  // Use shared_ptr so the promise can outlive the callback (needed for async JS callbacks)
-  auto promisePtr = std::make_shared<std::promise<int>>();
-  std::future<int> future = promisePtr->get_future();
+  // Fallback to ThreadSafeFunction (for async operations or when not in main thread).
+  // An exiting env never runs the callback again (see ReadPacket).
+  if (!CanRoundTrip(data, *data->write_state)) {
+    return AVERROR_EXIT;
+  }
 
-  auto callback = [promisePtr, buf, buf_size](Napi::Env env, Napi::Function jsCallback) {
+  // Shared with the JS side so a result can arrive after this thread gave up
+  auto call = std::make_shared<PendingCall<int>>(data->exit_state, data->abort_state, data->write_state);
+  std::shared_ptr<IOExitState> exit_state = data->exit_state;
+
+  auto callback = [call, exit_state, buf, buf_size](Napi::Env env, Napi::Function jsCallback) {
+    // Dispatched during env teardown (see ReadPacket)
+    if (!CanCallIntoJs(env)) {
+      MarkExitState(exit_state);
+      call->Complete(AVERROR_EXIT);
+      return;
+    }
     try {
-      Napi::Buffer<uint8_t> buffer = Napi::Buffer<uint8_t>::Copy(env, const_cast<uint8_t*>(buf), buf_size);
+      // Copy while the writer still waits: once it gave up, buf may be reused
+      Napi::Buffer<uint8_t> buffer;
+      if (!call->WhilePending([&] { buffer = Napi::Buffer<uint8_t>::Copy(env, const_cast<uint8_t*>(buf), buf_size); })) {
+        return;
+      }
       Napi::Value result = jsCallback.Call({buffer});
 
       // Check if result is a Promise (has .then method)
@@ -229,47 +538,54 @@ int IOContext::WritePacket(void* opaque, const uint8_t* buf, int buf_size) {
           Napi::Function thenFn = obj.Get("then").As<Napi::Function>();
 
           // Create resolve handler
-          auto onResolve = Napi::Function::New(env, [promisePtr, buf_size](const Napi::CallbackInfo& info) {
+          auto onResolve = Napi::Function::New(env, [call, buf_size](const Napi::CallbackInfo& info) {
             int value = buf_size;
             if (info.Length() > 0 && info[0].IsNumber()) {
               value = info[0].As<Napi::Number>().Int32Value();
             }
-            promisePtr->set_value(value);
+            call->Complete(value);
           });
 
           // Create reject handler
-          auto onReject = Napi::Function::New(env, [promisePtr](const Napi::CallbackInfo& info) {
-            promisePtr->set_value(AVERROR(EIO));
+          auto onReject = Napi::Function::New(env, [call](const Napi::CallbackInfo& info) {
+            call->Complete(AVERROR(EIO));
           });
 
+          call->AwaitingPromise();
           thenFn.Call(obj, {onResolve, onReject});
-          return; // Don't set promise value here - wait for .then()
+          return; // Don't complete here - wait for .then()
         }
       }
 
       // Synchronous result
       if (result.IsNumber()) {
-        promisePtr->set_value(result.As<Napi::Number>().Int32Value());
+        call->Complete(result.As<Napi::Number>().Int32Value());
       } else {
-        promisePtr->set_value(buf_size);  // Assume all bytes written
+        call->Complete(buf_size);  // Assume all bytes written
       }
     } catch (...) {
-      promisePtr->set_value(AVERROR(EIO));
+      call->Complete(AVERROR(EIO));
     }
   };
 
   napi_status status = data->write_callback.BlockingCall(callback);
   if (status != napi_ok) {
+    data->write_state->closed.store(true, std::memory_order_release);
     return AVERROR(EIO);
   }
 
-  return future.get();
+  return call->Await(data->write_callback, AVERROR_EXIT);
 }
 
 int64_t IOContext::Seek(void* opaque, int64_t offset, int whence) {
   CallbackData* data = static_cast<CallbackData*>(opaque);
   if (!data || !data->active || !data->has_seek_callback) {
     return AVERROR(ENOSYS);
+  }
+
+  // Closed or interrupted input (see ReadPacket)
+  if (data->abort_state->exiting.load(std::memory_order_acquire)) {
+    return AVERROR_EXIT;
   }
 
   // Special case: AVSEEK_SIZE
@@ -307,12 +623,26 @@ int64_t IOContext::Seek(void* opaque, int64_t offset, int whence) {
     }
   }
 
-  // Fallback to ThreadSafeFunction (for async operations or when not in main thread)
-  // Use shared_ptr so the promise can outlive the callback (needed for async JS callbacks)
-  auto promisePtr = std::make_shared<std::promise<int64_t>>();
-  std::future<int64_t> future = promisePtr->get_future();
+  // Fallback to ThreadSafeFunction (for async operations or when not in main thread).
+  // An exiting env never runs the callback again (see ReadPacket).
+  if (!CanRoundTrip(data, *data->seek_state)) {
+    return AVERROR_EXIT;
+  }
 
-  auto callback = [promisePtr, offset, whence](Napi::Env env, Napi::Function jsCallback) {
+  // Shared with the JS side so a result can arrive after this thread gave up
+  auto call = std::make_shared<PendingCall<int64_t>>(data->exit_state, data->abort_state, data->seek_state);
+  std::shared_ptr<IOExitState> exit_state = data->exit_state;
+
+  auto callback = [call, exit_state, offset, whence](Napi::Env env, Napi::Function jsCallback) {
+    // Dispatched during env teardown (see ReadPacket)
+    if (!CanCallIntoJs(env)) {
+      MarkExitState(exit_state);
+      call->Complete(AVERROR_EXIT);
+      return;
+    }
+    if (!call->Pending()) {
+      return;
+    }
     try {
       Napi::Value result = jsCallback.Call({
         Napi::BigInt::New(env, offset),
@@ -327,7 +657,7 @@ int64_t IOContext::Seek(void* opaque, int64_t offset, int whence) {
           Napi::Function thenFn = obj.Get("then").As<Napi::Function>();
 
           // Create resolve handler
-          auto onResolve = Napi::Function::New(env, [promisePtr](const Napi::CallbackInfo& info) {
+          auto onResolve = Napi::Function::New(env, [call](const Napi::CallbackInfo& info) {
             int64_t value = AVERROR(EINVAL);
             if (info.Length() > 0) {
               if (info[0].IsBigInt()) {
@@ -337,39 +667,66 @@ int64_t IOContext::Seek(void* opaque, int64_t offset, int whence) {
                 value = static_cast<int64_t>(info[0].As<Napi::Number>().Int64Value());
               }
             }
-            promisePtr->set_value(value);
+            call->Complete(value);
           });
 
           // Create reject handler
-          auto onReject = Napi::Function::New(env, [promisePtr](const Napi::CallbackInfo& info) {
-            promisePtr->set_value(static_cast<int64_t>(AVERROR(EIO)));
+          auto onReject = Napi::Function::New(env, [call](const Napi::CallbackInfo& info) {
+            call->Complete(static_cast<int64_t>(AVERROR(EIO)));
           });
 
+          call->AwaitingPromise();
           thenFn.Call(obj, {onResolve, onReject});
-          return; // Don't set promise value here - wait for .then()
+          return; // Don't complete here - wait for .then()
         }
       }
 
       // Synchronous result
       if (result.IsBigInt()) {
         bool lossless;
-        promisePtr->set_value(result.As<Napi::BigInt>().Int64Value(&lossless));
+        call->Complete(result.As<Napi::BigInt>().Int64Value(&lossless));
       } else if (result.IsNumber()) {
-        promisePtr->set_value(static_cast<int64_t>(result.As<Napi::Number>().Int64Value()));
+        call->Complete(static_cast<int64_t>(result.As<Napi::Number>().Int64Value()));
       } else {
-        promisePtr->set_value(static_cast<int64_t>(AVERROR(EINVAL)));
+        call->Complete(static_cast<int64_t>(AVERROR(EINVAL)));
       }
     } catch (...) {
-      promisePtr->set_value(static_cast<int64_t>(AVERROR(EIO)));
+      call->Complete(static_cast<int64_t>(AVERROR(EIO)));
     }
   };
 
   napi_status status = data->seek_callback.BlockingCall(callback);
   if (status != napi_ok) {
+    data->seek_state->closed.store(true, std::memory_order_release);
     return AVERROR(EIO);
   }
 
-  return future.get();
+  return call->Await(data->seek_callback, static_cast<int64_t>(AVERROR_EXIT));
+}
+
+bool IOContext::CanRoundTrip(const CallbackData* data, const IOCallbackState& state) {
+  return !g_process_exiting.load(std::memory_order_acquire) && !data->exit_state->exiting.load(std::memory_order_acquire) &&
+         !state.finalized.load(std::memory_order_acquire) && !state.closed.load(std::memory_order_acquire);
+}
+
+void IOContext::AbortCallbacks(const std::shared_ptr<IOExitState>& state) {
+  if (state) {
+    MarkExitState(state);
+  }
+}
+
+Napi::Value IOContext::MarkExiting(const Napi::CallbackInfo& info) {
+  // Runs from 'exit', the last point before process.exit() joins the threadpool
+  // (env cleanup hooks and atexit handlers only run after that join, if at all)
+  bool process_exit = info.Length() > 0 && info[0].IsBoolean() && info[0].As<Napi::Boolean>().Value();
+  if (exit_state_) {
+    MarkExitState(exit_state_);
+  }
+  if (process_exit) {
+    g_process_exiting.store(true, std::memory_order_release);
+    CallWaiter::WakeExitState(nullptr);
+  }
+  return info.Env().Undefined();
 }
 
 bool IOContext::GuardOps(Napi::Env env) {
@@ -392,18 +749,21 @@ bool IOContext::GuardOps(Napi::Env env) {
 void IOContext::CleanupCallbacks() {
   if (callback_data_ && callback_data_->active) {
     callback_data_->active = false;
+    // A round-trip still waiting on these callbacks fails now rather than once
+    // the TSFNs released below finalize on a later event loop turn
+    MarkExitState(callback_data_->abort_state);
     if (callback_data_->has_read_callback) {
-      callback_data_->read_callback.Release();
+      ReleaseCallbackTsfn(callback_data_->read_callback, *callback_data_->read_state);
       callback_data_->read_callback_direct.Reset();
       callback_data_->has_read_callback = false;
     }
     if (callback_data_->has_write_callback) {
-      callback_data_->write_callback.Release();
+      ReleaseCallbackTsfn(callback_data_->write_callback, *callback_data_->write_state);
       callback_data_->write_callback_direct.Reset();
       callback_data_->has_write_callback = false;
     }
     if (callback_data_->has_seek_callback) {
-      callback_data_->seek_callback.Release();
+      ReleaseCallbackTsfn(callback_data_->seek_callback, *callback_data_->seek_state);
       callback_data_->seek_callback_direct.Reset();
       callback_data_->has_seek_callback = false;
     }
@@ -509,6 +869,7 @@ Napi::Value IOContext::AllocContextWithCallbacks(const Napi::CallbackInfo& info)
   callback_data_->io_context = this;
   callback_data_->env = env;  // Store env for direct calls
   callback_data_->main_thread_id = std::this_thread::get_id();  // Store thread ID for safety check
+  callback_data_->exit_state = exit_state_ ? exit_state_ : std::make_shared<IOExitState>();
   callback_data_->active = true;
 
   // Setup callbacks
@@ -519,16 +880,7 @@ Napi::Value IOContext::AllocContextWithCallbacks(const Napi::CallbackInfo& info)
   // Read callback
   if (info.Length() > 2 && info[2].IsFunction()) {
     Napi::Function read_fn = info[2].As<Napi::Function>();
-    callback_data_->read_callback = Napi::ThreadSafeFunction::New(
-      env,
-      read_fn,
-      "IOReadCallback",
-      0,  // Unlimited queue
-      1   // One thread
-    );
-    // Don't hold the event loop open: a context the user never frees must not
-    // prevent process exit; the TSFN stays callable as long as the process runs
-    callback_data_->read_callback.Unref(env);
+    callback_data_->read_callback = NewCallbackTsfn(env, read_fn, "IOReadCallback", callback_data_->read_state);
     callback_data_->read_callback_direct = Napi::Persistent(read_fn);
     callback_data_->has_read_callback = true;
     read_cb = ReadPacket;
@@ -537,14 +889,7 @@ Napi::Value IOContext::AllocContextWithCallbacks(const Napi::CallbackInfo& info)
   // Write callback
   if (info.Length() > 3 && info[3].IsFunction()) {
     Napi::Function write_fn = info[3].As<Napi::Function>();
-    callback_data_->write_callback = Napi::ThreadSafeFunction::New(
-      env,
-      write_fn,
-      "IOWriteCallback",
-      0,  // Unlimited queue
-      1   // One thread
-    );
-    callback_data_->write_callback.Unref(env);
+    callback_data_->write_callback = NewCallbackTsfn(env, write_fn, "IOWriteCallback", callback_data_->write_state);
     callback_data_->write_callback_direct = Napi::Persistent(write_fn);
     callback_data_->has_write_callback = true;
     write_cb = WritePacket;
@@ -553,14 +898,7 @@ Napi::Value IOContext::AllocContextWithCallbacks(const Napi::CallbackInfo& info)
   // Seek callback
   if (info.Length() > 4 && info[4].IsFunction()) {
     Napi::Function seek_fn = info[4].As<Napi::Function>();
-    callback_data_->seek_callback = Napi::ThreadSafeFunction::New(
-      env,
-      seek_fn,
-      "IOSeekCallback",
-      0,  // Unlimited queue
-      1   // One thread
-    );
-    callback_data_->seek_callback.Unref(env);
+    callback_data_->seek_callback = NewCallbackTsfn(env, seek_fn, "IOSeekCallback", callback_data_->seek_state);
     callback_data_->seek_callback_direct = Napi::Persistent(seek_fn);
     callback_data_->has_seek_callback = true;
     seek_cb = Seek;

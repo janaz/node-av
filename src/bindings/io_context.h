@@ -15,6 +15,24 @@ extern "C" {
 
 namespace ffmpeg {
 
+// Exit state ending callback round-trips: one per JS environment (main thread
+// or worker), shared by the callback-backed IOContexts created in it, and one
+// per IOContext for its own callbacks (see CallbackData::abort_state)
+struct IOExitState {
+  std::atomic<bool> exiting{false};
+};
+
+// State of one callback's ThreadSafeFunction, shared by the threads calling it
+// and its finalizer
+struct IOCallbackState {
+  // Set by the finalizer (our Release, or env teardown closing it). Releasing
+  // a finalized TSFN deadlocks on its lock or touches freed memory.
+  std::atomic<bool> finalized{false};
+  // Set once a call failed: a call on a closing TSFN consumes our thread
+  // count, after which Node may free it, so it must not be called again
+  std::atomic<bool> closed{false};
+};
+
 class IOContext : public Napi::ObjectWrap<IOContext> {
 public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
@@ -85,9 +103,28 @@ private:
     bool has_seek_callback = false;
     void* opaque_data;  // User data passed to callbacks
     std::atomic<bool> active{false};
+    // Exit state of the env the callbacks belong to: once set (or once the
+    // process exits) threadpool round-trips fail with AVERROR_EXIT
+    std::shared_ptr<IOExitState> exit_state;
+    // Exit state of this context alone, set once the input reading through it
+    // is closed or interrupted, or once the callbacks are released: from then
+    // on every callback fails with AVERROR_EXIT, pending threadpool round-trips
+    // included. A read waiting for a source that stalls for good would
+    // otherwise keep the input's close waiting with it. Outlives this struct.
+    std::shared_ptr<IOExitState> abort_state = std::make_shared<IOExitState>();
+    // Per-TSFN state, outlives this struct. Env teardown finalizes the TSFNs
+    // before this context's own finalizer runs, possibly while still holding
+    // the TSFN's mutex, so CleanupCallbacks() must not release them then.
+    std::shared_ptr<IOCallbackState> read_state = std::make_shared<IOCallbackState>();
+    std::shared_ptr<IOCallbackState> write_state = std::make_shared<IOCallbackState>();
+    std::shared_ptr<IOCallbackState> seek_state = std::make_shared<IOCallbackState>();
   };
-  
+
   std::unique_ptr<CallbackData> callback_data_;
+
+  // Exit state of the environment running on this thread, renewed per module
+  // load (one env per thread, like the thread_local constructors)
+  static thread_local std::shared_ptr<IOExitState> exit_state_;
 
   // Helper to clean up callbacks
   void CleanupCallbacks();
@@ -99,7 +136,19 @@ private:
   static int ReadPacket(void* opaque, uint8_t* buf, int buf_size);
   static int WritePacket(void* opaque, const uint8_t* buf, int buf_size);
   static int64_t Seek(void* opaque, int64_t offset, int whence);
-  
+
+  // False once the callbacks' env or the whole process exits, or once the
+  // TSFN behind `state` is finalized or closed: a round-trip would never return
+  static bool CanRoundTrip(const CallbackData* data, const IOCallbackState& state);
+
+  // Fails the pending and later callbacks of the context owning `state` (its
+  // abort_state) with AVERROR_EXIT; for FormatContext's input close paths
+  static void AbortCallbacks(const std::shared_ptr<IOExitState>& state);
+
+  // Called from the env's 'exit' event: fails pending and future threadpool
+  // round-trips of this env (of every env when the main thread exits)
+  static Napi::Value MarkExiting(const Napi::CallbackInfo& info);
+
   Napi::Value AllocContext(const Napi::CallbackInfo& info);
   Napi::Value AllocContextWithCallbacks(const Napi::CallbackInfo& info);
   Napi::Value Open2Async(const Napi::CallbackInfo& info);

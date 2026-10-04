@@ -395,12 +395,13 @@ Napi::Value FormatContext::CloseInputSync(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  if (!StopReaderSync(env)) {
-    return env.Undefined();
-  }
-  if (info.Length() > 0 && info[0].ToBoolean().Value() && ctx_) {
-    ctx_->pb = nullptr;
-  }
+  bool detachPb = info.Length() > 0 && info[0].ToBoolean().Value();
+
+  // A read, seek or open parked in a custom-IO callback waits for this
+  // thread's event loop: fail the callbacks first, or the join below and the
+  // guard after it would wait for a callback that cannot run
+  AbortCustomIO();
+  StopReader();
 
   // Request interrupt to cancel any pending av_read_frame()
   FormatContext::RequestInterrupt();
@@ -435,6 +436,12 @@ Napi::Value FormatContext::CloseInputSync(const Napi::CallbackInfo& info) {
   if (!ctx_) {
     // Freed concurrently while waiting
     return env.Undefined();
+  }
+
+  // Detach a caller-owned pb only now: until the guard above waited for it, an
+  // open failed by the abort may still be freeing ctx_ on its threadpool thread
+  if (detachPb) {
+    ctx_->pb = nullptr;
   }
 
   // Clear our references

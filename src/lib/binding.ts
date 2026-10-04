@@ -8,6 +8,7 @@
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
+import { isMainThread } from 'node:worker_threads';
 
 import { getDirname } from '../utils/electron.js';
 
@@ -99,7 +100,16 @@ interface NativeOutputFormatConstructor {
   guessFormat(shortName: string | null, filename: string | null, mimeType: string | null): NativeOutputFormat | null;
 }
 
-type NativeIOContextConstructor = new () => NativeIOContext;
+/**
+ * IOContext constructor with its static members.
+ *
+ * @internal
+ */
+interface NativeIOContextConstructor {
+  new (): NativeIOContext;
+  // Optional: a stale binary without it must not throw from the 'exit' listener
+  markExiting?(processExit: boolean): void;
+}
 
 type NativeDictionaryConstructor = new () => NativeDictionary;
 
@@ -432,5 +442,18 @@ function loadBinding(): NativeBinding {
 
 // Load the native binding with fallback logic
 const bindings = loadBinding();
+
+// Custom-IO callbacks called from the threadpool wait for this thread's event
+// loop without a timeout (live sources stall legitimately). After 'exit' that
+// loop never runs them, and process.exit() joins the threadpool, so the waiting
+// threads must fail with AVERROR_EXIT instead of blocking the exit forever.
+// Only the main thread's exit ends every environment. Node sets _exiting before
+// every real 'exit'; a manual process.emit('exit') (from an embedder or a test
+// harness) must not end IO, and the real exit can still follow, hence on().
+process.on('exit', () => {
+  if (Reflect.get(process, '_exiting') === true) {
+    bindings.IOContext.markExiting?.(isMainThread);
+  }
+});
 
 export { bindings };

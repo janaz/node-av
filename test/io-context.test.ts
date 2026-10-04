@@ -1,10 +1,11 @@
 import assert from 'node:assert';
+import { spawn } from 'node:child_process';
 import { readFileSync, statSync, writeFileSync } from 'node:fs';
 import { readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { afterEach, describe, it } from 'node:test';
 import { pathToFileURL } from 'node:url';
 
-import { AVERROR_EOF, AVIO_FLAG_READ, AVIO_FLAG_WRITE, AVSEEK_CUR, AVSEEK_END, AVSEEK_SET, AVSEEK_SIZE, IOContext } from '../src/index.js';
+import { AVERROR_EOF, AVIO_FLAG_READ, AVIO_FLAG_WRITE, AVSEEK_CUR, AVSEEK_END, AVSEEK_SET, AVSEEK_SIZE, FormatContext, InputFormat, IOContext } from '../src/index.js';
 import { getInputFile, getOutputFile, prepareTestEnvironment } from './index.js';
 
 import type { AVSeekWhence } from '../src/index.js';
@@ -1049,6 +1050,294 @@ describe('IOContext', () => {
       // With no operations in flight the context frees cleanly
       io.freeContext();
     });
+  });
+
+  describe('Environment Exit', () => {
+    // A threadpool thread parked in a custom-IO callback waits for the JS thread
+    // without a timeout. Once the env exits that thread never runs the callback,
+    // so the parked thread must give up instead of blocking process.exit() (which
+    // joins the threadpool) or worker teardown forever.
+    const srcUrl = new URL('../src/index.ts', import.meta.url).href;
+    const tsxLoader = import.meta.resolve('tsx');
+    const tsxApi = import.meta.resolve('tsx/esm/api');
+
+    // Script body that parks one async callback operation of `kind` on `io`
+    const parkScript = (kind: 'read' | 'write' | 'size'): string => `
+      const { IOContext } = await import(${JSON.stringify(srcUrl)});
+      const never = () => new Promise(() => {});
+      const io = new IOContext();
+      if (${JSON.stringify(kind)} === 'write') {
+        io.allocContextWithCallbacks(4096, 1, null, never);
+        void io.write(Buffer.alloc(16384)).catch(() => {});
+      } else if (${JSON.stringify(kind)} === 'size') {
+        io.allocContextWithCallbacks(4096, 0, () => null, null, never);
+        void io.size().catch(() => {});
+      } else {
+        io.allocContextWithCallbacks(4096, 0, never);
+        void io.read(1024).catch(() => {});
+      }
+    `;
+
+    const runScript = async (script: string, timeoutMs = 20000): Promise<{ code: number | null; hung: boolean; stdout: string; stderr: string }> => {
+      return new Promise((resolve) => {
+        const child = spawn(process.execPath, ['--import', tsxLoader, '--input-type=module', '-e', script], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let stdout = '';
+        let stderr = '';
+        let hung = false;
+        child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
+        child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
+        const timer = setTimeout(() => {
+          hung = true;
+          child.kill('SIGKILL');
+        }, timeoutMs);
+        child.on('close', (code) => {
+          clearTimeout(timer);
+          resolve({ code, hung, stdout, stderr });
+        });
+      });
+    };
+
+    for (const kind of ['read', 'write', 'size'] as const) {
+      it(`should not block process.exit() while a ${kind} callback is parked`, { timeout: 30000 }, async () => {
+        const result = await runScript(`
+          ${parkScript(kind)}
+          setTimeout(() => {
+            console.log('exiting');
+            process.exit(0);
+          }, 300);
+        `);
+        assert.equal(result.hung, false, `process.exit() deadlocked (stderr: ${result.stderr})`);
+        assert.equal(result.code, 0, result.stderr);
+        assert.match(result.stdout, /exiting/);
+      });
+    }
+
+    it('should let worker.terminate() finish while a callback is parked in the worker', { timeout: 30000 }, async () => {
+      const workerScript = `
+        const { register } = await import(${JSON.stringify(tsxApi)});
+        register();
+        const { parentPort } = await import('node:worker_threads');
+        ${parkScript('read')}
+        setTimeout(() => parentPort.postMessage('parked'), 200);
+      `;
+      const result = await runScript(`
+        import { Worker } from 'node:worker_threads';
+        const worker = new Worker(new URL('data:text/javascript,' + encodeURIComponent(${JSON.stringify(workerScript)})));
+        worker.on('error', (err) => console.log('worker error', err.message));
+        worker.once('message', async () => {
+          await worker.terminate();
+          console.log('terminated');
+        });
+      `);
+      assert.equal(result.hung, false, `worker.terminate() deadlocked (stderr: ${result.stderr})`);
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /terminated/);
+    });
+
+    it('should let a worker end while a callback context is still allocated', { timeout: 30000 }, async () => {
+      // Env teardown finalizes the context's ThreadSafeFunctions before the context itself;
+      // releasing them again from its finalizer used to deadlock the worker thread
+      const workerScript = `
+        const { register } = await import(${JSON.stringify(tsxApi)});
+        register();
+        const { IOContext } = await import(${JSON.stringify(srcUrl)});
+        globalThis.keep = new IOContext();
+        globalThis.keep.allocContextWithCallbacks(4096, 1, () => null, () => {}, () => 0n);
+      `;
+      const result = await runScript(`
+        import { Worker } from 'node:worker_threads';
+        const worker = new Worker(new URL('data:text/javascript,' + encodeURIComponent(${JSON.stringify(workerScript)})));
+        worker.on('error', (err) => console.log('worker error', err.message));
+        worker.on('exit', (code) => console.log('worker exited', code));
+      `);
+      assert.equal(result.hung, false, `worker teardown deadlocked (stderr: ${result.stderr})`);
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /worker exited 0/);
+    });
+
+    // Worker script whose Demuxer read loop parks in the read callback of a Readable that stalls
+    const parkedReaderScript = (how: 'terminate' | 'exit'): string => `
+      const { register } = await import(${JSON.stringify(tsxApi)});
+      register();
+      const { parentPort } = await import('node:worker_threads');
+      const { PassThrough } = await import('node:stream');
+      const { readFileSync } = await import('node:fs');
+      const { Demuxer } = await import(${JSON.stringify(srcUrl)});
+      const live = new PassThrough();
+      live.write(readFileSync(${JSON.stringify(getInputFile('audio.mp3'))}).subarray(0, 256 * 1024));
+      const demuxer = await Demuxer.open(live, { format: 'mp3' });
+      setTimeout(() => {
+        parentPort.postMessage('parked');
+        if (${JSON.stringify(how)} === 'exit') process.exit(0);
+      }, 300);
+      for await (const packet of demuxer.packets()) {
+        if (!packet) break;
+        packet.free();
+      }
+    `;
+
+    for (const how of ['terminate', 'exit'] as const) {
+      it(`should let a worker end via ${how} while its Demuxer read loop is parked`, { timeout: 30000 }, async () => {
+        // Env teardown frees the read loop of a Demuxer nobody closed; its owner is
+        // finalized afterwards and must not stop the freed loop again (SIGABRT)
+        const result = await runScript(`
+          import { Worker } from 'node:worker_threads';
+          const worker = new Worker(new URL('data:text/javascript,' + encodeURIComponent(${JSON.stringify(parkedReaderScript(how))})));
+          worker.on('error', (err) => console.log('worker error', err.message));
+          worker.once('message', () => {
+            if (${JSON.stringify(how)} === 'terminate') void worker.terminate();
+          });
+          worker.on('exit', () => {
+            console.log('worker ended');
+            setTimeout(() => console.log('main alive'), 200);
+          });
+        `);
+        assert.equal(result.hung, false, `worker teardown deadlocked (stderr: ${result.stderr})`);
+        assert.equal(result.code, 0, result.stderr);
+        assert.match(result.stdout, /worker ended[\s\S]*main alive/);
+      });
+    }
+
+    it('should not abort when the process ends with active Demuxer read loops', { timeout: 30000 }, async () => {
+      const result = await runScript(`
+        const { PassThrough } = await import('node:stream');
+        const { readFileSync } = await import('node:fs');
+        const { Demuxer } = await import(${JSON.stringify(srcUrl)});
+        const live = new PassThrough();
+        live.write(readFileSync(${JSON.stringify(getInputFile('audio.mp3'))}).subarray(0, 256 * 1024));
+        const demuxers = [await Demuxer.open(${JSON.stringify(testVideoFile)}), await Demuxer.open(live, { format: 'mp3' })];
+        for (const demuxer of demuxers) {
+          const packets = demuxer.packets();
+          for (let i = 0; i < 5; i++) {
+            const { value } = await packets.next();
+            value?.free();
+          }
+        }
+        console.log('leaving demuxers open');
+      `);
+      assert.equal(result.hung, false, `process exit deadlocked (stderr: ${result.stderr})`);
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /leaving demuxers open/);
+    });
+
+    it('should ignore an exit event emitted by hand', { timeout: 30000 }, async () => {
+      // Only a real exit (process._exiting) may fail threadpool round-trips
+      const result = await runScript(`
+        const { IOContext } = await import(${JSON.stringify(srcUrl)});
+        process.emit('exit', 0);
+        let written = 0;
+        const io = new IOContext();
+        io.allocContextWithCallbacks(4096, 1, null, async (buffer) => {
+          written += buffer.length;
+        });
+        await io.write(Buffer.alloc(16384));
+        await io.flush();
+        io.freeContext();
+        console.log('written', written);
+      `);
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /written 16384/);
+    });
+
+    it('should still wait for slow callbacks while the env runs', { timeout: 15000 }, async () => {
+      // Slower than the exit poll and probe intervals: must neither fail nor time out
+      const delay = async (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+      const source = Buffer.from('slow consumers are waited for');
+
+      const reader = new IOContext();
+      reader.allocContextWithCallbacks(4096, 0, async () => {
+        await delay(800);
+        return source;
+      });
+      const read = await reader.read(source.length);
+      assert.ok(Buffer.isBuffer(read), `read should return data, got ${String(read)}`);
+      assert.deepEqual(read, source);
+      reader.freeContext();
+
+      const written: Buffer[] = [];
+      const writer = new IOContext();
+      writer.allocContextWithCallbacks(4096, 1, null, async (buffer: Buffer) => {
+        await delay(800);
+        written.push(buffer);
+      });
+      await writer.write(source);
+      await writer.flush();
+      assert.deepEqual(Buffer.concat(written), source);
+      writer.freeContext();
+    });
+  });
+
+  describe('Input Close', () => {
+    // FFmpeg never polls the interrupt callback while a custom read waits for its
+    // JS promise, which settles only once the source delivers. Closing or
+    // interrupting the input must fail that round-trip, or the close waits for
+    // the source. Waits are bounded and the source is released afterwards, so a
+    // regression fails instead of hanging the run.
+    type Settled<T> = { status: 'fulfilled'; value: T } | { status: 'rejected'; reason: unknown } | { status: 'pending' };
+
+    // Outcome of `promise`, or 'pending' when it has not settled within `ms`
+    const settleWithin = async <T>(promise: Promise<T>, ms = 3000): Promise<Settled<T>> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<Settled<T>>((resolve) => {
+        timer = setTimeout(() => resolve({ status: 'pending' }), ms);
+      });
+      try {
+        return await Promise.race([
+          promise.then(
+            (value): Settled<T> => ({ status: 'fulfilled', value }),
+            (reason: unknown): Settled<T> => ({ status: 'rejected', reason }),
+          ),
+          timeout,
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    // Input context whose open is parked in a read callback that never delivers
+    const openParked = async () => {
+      const stalled = Promise.withResolvers<Buffer | null>();
+      const { promise: parked, resolve: onParked } = Promise.withResolvers<void>();
+      let reads = 0;
+      const io = new IOContext();
+      io.allocContextWithCallbacks(4096, 0, async () => {
+        reads++;
+        onParked();
+        return stalled.promise;
+      });
+      const ctx = new FormatContext();
+      ctx.allocContext();
+      ctx.pb = io;
+      const opening = ctx.openInput('', InputFormat.findInputFormat('mp3'), null);
+      await parked;
+      return { io, ctx, opening, release: () => stalled.resolve(null), reads: () => reads };
+    };
+
+    for (const close of ['closeInput', 'interrupt', 'closeInputSync'] as const) {
+      it(`${close}() should end an open parked in a read callback`, { timeout: 15000 }, async () => {
+        const { io, ctx, opening, release, reads } = await openParked();
+
+        try {
+          if (close === 'closeInput') {
+            assert.equal((await settleWithin(ctx.closeInput(true))).status, 'fulfilled', 'closeInput() must settle while the open is parked');
+          } else if (close === 'closeInputSync') {
+            ctx.closeInputSync(true);
+          } else {
+            ctx.interrupt();
+          }
+          const opened = await settleWithin(opening);
+          assert.equal(opened.status, 'fulfilled', 'the parked open must return once the input is closed');
+          assert.ok(opened.status === 'fulfilled' && opened.value < 0, 'the aborted open must fail');
+          // The callback is not called again for this input
+          assert.equal(reads(), 1, 'no read callback after the input closed');
+        } finally {
+          release();
+          await opening;
+          await ctx.closeInput(true);
+          io.freeContext();
+        }
+      });
+    }
   });
 
   describe('Static Methods', () => {

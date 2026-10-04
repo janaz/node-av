@@ -449,17 +449,32 @@ export class IOStream {
       undefined, // no seek
     );
 
-    // The demuxer frees the I/O context on close - that is the only signal we
-    // get that consumption stopped (possibly before EOF). Hook it so listeners
-    // and buffered chunks don't stay attached to the caller's stream forever.
-    const nativeFree = ioContext.freeContext.bind(ioContext);
-    ioContext.freeContext = () => {
+    // The demuxer frees the I/O context on close (or disposes it when the
+    // caller passed it in) - the only signal we get that consumption stopped,
+    // possibly before EOF. Hook both so listeners and buffered chunks don't
+    // stay attached to the caller's stream forever. The native side has
+    // already stopped waiting for a read parked here once the input closed.
+    const release = () => {
       ioFreed = true;
       removeListeners();
       chunks = [];
       totalBuffered = 0;
-      wakeUp(); // release a read parked on an empty buffer
+      wakeUp(); // settle a read parked on an empty buffer
+    };
+    const nativeFree = ioContext.freeContext.bind(ioContext);
+    const nativeDispose = ioContext[Symbol.dispose].bind(ioContext);
+    const nativeAsyncDispose = ioContext[Symbol.asyncDispose].bind(ioContext);
+    ioContext.freeContext = () => {
+      release();
       nativeFree();
+    };
+    ioContext[Symbol.dispose] = () => {
+      release();
+      nativeDispose();
+    };
+    ioContext[Symbol.asyncDispose] = async () => {
+      release();
+      await nativeAsyncDispose();
     };
 
     return ioContext;

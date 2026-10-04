@@ -532,7 +532,7 @@ NodeAV provides direct bindings to FFmpeg's C APIs, which work with raw memory p
 NodeAV works inside `worker_threads`, with two caveats:
 
 - **Prefer graceful shutdown over `worker.terminate()`.** Terminating a worker while native calls are in flight is mitigated (pending completions are dropped safely instead of aborting), but a termination that lands exactly inside a running synchronous native call can still abort the process — a limitation of Node-API error handling during isolate teardown. Signal the worker to close its NodeAV resources and exit on its own. For test runners, process isolation (e.g. vitest `pool: 'forks'`) is the most robust choice.
-- **Async operations share the libuv thread pool** (default: 4 threads, process-wide across all workers). A custom IO read callback that never settles parks one pool thread until it resolves; enough of them stall every async NodeAV operation in the entire process. Make custom IO callbacks always settle (return `null` for EOF, throw on error), and raise `UV_THREADPOOL_SIZE` when running many parallel live inputs.
+- **Async operations share the libuv thread pool** (default: 4 threads, process-wide across all workers). A custom IO read callback that never settles parks one pool thread until it resolves or its input is closed or interrupted (a closing `Demuxer` or an exiting process or worker fails it with `AVERROR_EXIT`); enough of them stall every async NodeAV operation in the entire process. Make custom IO callbacks always settle (return `null` for EOF, throw on error), and raise `UV_THREADPOOL_SIZE` when running many parallel live inputs.
 
 ## Electron
 

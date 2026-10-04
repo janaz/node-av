@@ -1,8 +1,10 @@
 import assert from 'node:assert';
+import { once } from 'node:events';
 import { createReadStream, readFileSync } from 'node:fs';
 import { copyFile, readFile, rename, unlink } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { after, describe, it } from 'node:test';
+import { Worker } from 'node:worker_threads';
 
 import { Demuxer } from '../src/api/index.js';
 import { IOStream } from '../src/api/io-stream.js';
@@ -923,6 +925,307 @@ describe('Demuxer', () => {
 
       await media.close();
     });
+  });
+
+  describe('stalled sources', () => {
+    // A read waiting for a Readable or read callback that never delivers again
+    // must not keep close() or an aborted open waiting with it. Every wait below
+    // is bounded and each test releases its source afterwards, so a regression
+    // fails the test instead of hanging the run.
+    const mp3 = readFileSync(getInputFile('audio.mp3'));
+    const srcUrl = new URL('../src/index.ts', import.meta.url).href;
+    const tsxApi = import.meta.resolve('tsx/esm/api');
+
+    type Settled<T> = { status: 'fulfilled'; value: T } | { status: 'rejected'; reason: unknown } | { status: 'pending' };
+
+    // Outcome of `promise`, or 'pending' when it has not settled within `ms`
+    const settleWithin = async <T>(promise: Promise<T>, ms = 3000): Promise<Settled<T>> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<Settled<T>>((resolve) => {
+        timer = setTimeout(() => resolve({ status: 'pending' }), ms);
+      });
+      try {
+        return await Promise.race([
+          promise.then(
+            (value): Settled<T> => ({ status: 'fulfilled', value }),
+            (reason: unknown): Settled<T> => ({ status: 'rejected', reason }),
+          ),
+          timeout,
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    // Readable holding the first `bytes` of the mp3, all buffered up front.
+    // `parked` resolves once the demuxer drained it and its read waits for data
+    // that never comes. IOStream reads until read() comes back empty, so only an
+    // empty read that does not end such a burst means drained.
+    const stalledReadable = (bytes: number): { stream: Readable; parked: Promise<void>; listeners: () => number } => {
+      const stream = new Readable({ read() {} });
+      if (bytes > 0) {
+        stream.push(mp3.subarray(0, bytes));
+      }
+      const { promise: parked, resolve } = Promise.withResolvers<void>();
+      const read = stream.read.bind(stream);
+      let burst = false;
+      stream.read = (size?: number) => {
+        const chunk = read(size);
+        if (chunk === null && !burst) {
+          resolve();
+        }
+        burst = chunk !== null;
+        return chunk;
+      };
+      const listeners = () => ['readable', 'end', 'error', 'close'].reduce((sum, event) => sum + stream.listenerCount(event), 0);
+      return { stream, parked, listeners };
+    };
+
+    // Read callback serving the first `bytes` of the mp3, then a promise that
+    // settles only through `settle`/`fail`
+    const stalledCallbacks = (bytes: number) => {
+      let position = 0;
+      const { promise: parked, resolve: onParked } = Promise.withResolvers<void>();
+      const stalled = Promise.withResolvers<Buffer | null>();
+      const callbacks: IOInputCallbacks = {
+        read: (size: number) => {
+          if (position >= bytes) {
+            onParked();
+            return stalled.promise;
+          }
+          const chunk = mp3.subarray(position, Math.min(position + size, bytes));
+          position += chunk.length;
+          return chunk;
+        },
+      };
+      return { callbacks, parked, settle: stalled.resolve, fail: stalled.reject };
+    };
+
+    // Consumes packets() until it ends
+    const drain = async (media: Demuxer): Promise<number> => {
+      let count = 0;
+      for await (using packet of media.packets()) {
+        if (packet) count++;
+      }
+      return count;
+    };
+
+    for (const source of ['Readable', 'IOStream context'] as const) {
+      it(`close() should not wait for a stalled ${source} (async)`, { timeout: 15000 }, async () => {
+        const { stream, parked, listeners } = stalledReadable(256 * 1024);
+        const baseline = listeners();
+        const media = source === 'Readable' ? await Demuxer.open(stream, { format: 'mp3' }) : await Demuxer.open(IOStream.create(stream), { format: 'mp3' });
+        const reading = drain(media);
+        await parked;
+
+        try {
+          const closed = await settleWithin(media.close());
+          assert.equal(closed.status, 'fulfilled', 'close() must settle while the read is parked on the stalled stream');
+          const drained = await settleWithin(reading);
+          assert.equal(drained.status, 'fulfilled', 'packets() must end once the demuxer is closed');
+          assert.equal(listeners(), baseline, 'close() must detach the demuxer from the stream');
+        } finally {
+          stream.push(null); // releases the parked read if close() did not
+        }
+      });
+    }
+
+    it('closeSync() should not wait for a stalled Readable (sync)', { timeout: 15000 }, async () => {
+      const { stream, parked, listeners } = stalledReadable(256 * 1024);
+      const baseline = listeners();
+      const media = await Demuxer.open(stream, { format: 'mp3' });
+      const reading = drain(media);
+      await parked;
+
+      try {
+        // Joining the parked reader thread used to deadlock, so this threw instead
+        media.closeSync();
+        const drained = await settleWithin(reading);
+        assert.equal(drained.status, 'fulfilled', 'packets() must end once the demuxer is closed');
+        assert.equal(listeners(), baseline, 'closeSync() must detach the demuxer from the stream');
+      } finally {
+        stream.push(null);
+      }
+    });
+
+    it('close() should not wait for a stalled read callback and drop its late result (async)', { timeout: 15000 }, async () => {
+      const { callbacks, parked, settle } = stalledCallbacks(256 * 1024);
+      const media = await Demuxer.open(callbacks, { format: 'mp3' });
+      const reading = drain(media);
+      await parked;
+
+      try {
+        const closed = await settleWithin(media.close());
+        assert.equal(closed.status, 'fulfilled', 'close() must settle while the read callback is pending');
+        assert.equal((await settleWithin(reading)).status, 'fulfilled', 'packets() must end once the demuxer is closed');
+      } finally {
+        // Arrives after the close: the I/O buffer it would fill is freed by now,
+        // so it must be dropped untouched. Larger than any I/O buffer on purpose.
+        settle(Buffer.alloc(1024 * 1024, 0x55));
+      }
+    });
+
+    it('closeSync() should not wait for a stalled read callback and drop its late failure (sync)', { timeout: 15000 }, async () => {
+      const { callbacks, parked, fail } = stalledCallbacks(256 * 1024);
+      const media = await Demuxer.open(callbacks, { format: 'mp3' });
+      const reading = drain(media);
+      await parked;
+
+      try {
+        media.closeSync();
+        assert.equal((await settleWithin(reading)).status, 'fulfilled', 'packets() must end once the demuxer is closed');
+      } finally {
+        fail(new Error('late source failure'));
+      }
+
+      // The dropped results leave the process healthy
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const media2 = await Demuxer.open(inputFile);
+      assert.ok((await drain(media2)) > 0, 'a demuxer opened afterwards should read normally');
+      await media2.close();
+    });
+
+    it('close() should not wait for a stalled seek callback', { timeout: 15000 }, async () => {
+      const buffer = readFileSync(inputFile);
+      let position = 0;
+      let stall = false;
+      const { promise: parked, resolve: onParked } = Promise.withResolvers<void>();
+      const stalled = Promise.withResolvers<bigint>();
+      const media = await Demuxer.open(
+        {
+          read: (size: number) => {
+            if (position >= buffer.length) return null;
+            const chunk = buffer.subarray(position, Math.min(position + size, buffer.length));
+            position += chunk.length;
+            return chunk;
+          },
+          seek: (offset: bigint, whence: AVSeekWhence) => {
+            if (whence === AVSEEK_SIZE) return BigInt(buffer.length);
+            if (stall) {
+              onParked();
+              return stalled.promise;
+            }
+            if (whence === AVSEEK_SET) position = Number(offset);
+            else if (whence === AVSEEK_CUR) position += Number(offset);
+            else if (whence === AVSEEK_END) position = buffer.length + Number(offset);
+            return BigInt(position);
+          },
+        },
+        { format: 'mp4', bufferSize: 4096 },
+      );
+
+      // Start reading first, so the seek runs on the demuxer's reader thread
+      const packets = media.packets();
+      (await packets.next()).value?.free();
+      stall = true;
+      const seeking = media.seek(5);
+
+      try {
+        assert.equal((await settleWithin(parked)).status, 'fulfilled', 'the seek should reach the stalled seek callback');
+        const closed = await settleWithin(media.close());
+        assert.equal(closed.status, 'fulfilled', 'close() must settle while the seek callback is pending');
+        assert.equal((await settleWithin(seeking)).status, 'fulfilled', 'the parked seek must settle once the demuxer is closed');
+        assert.equal((await settleWithin(packets.return(null))).status, 'fulfilled');
+      } finally {
+        stalled.resolve(0n);
+      }
+    });
+
+    it('interrupt() should end packets() on a stalled Readable', { timeout: 15000 }, async () => {
+      const { stream, parked } = stalledReadable(256 * 1024);
+      const media = await Demuxer.open(stream, { format: 'mp3' });
+      const reading = drain(media);
+      await parked;
+
+      try {
+        media.interrupt();
+        assert.equal((await settleWithin(reading)).status, 'fulfilled', 'packets() must end after interrupt()');
+        assert.equal((await settleWithin(media.close())).status, 'fulfilled', 'close() must settle after interrupt()');
+      } finally {
+        stream.push(null);
+      }
+    });
+
+    it('an aborted open should not wait for a stalled Readable', { timeout: 15000 }, async () => {
+      const { stream, parked, listeners } = stalledReadable(0);
+      const baseline = listeners();
+      const controller = new AbortController();
+      const opening = Demuxer.open(stream, { format: 'mp3', signal: controller.signal });
+      await parked; // the probe waits for the first bytes
+
+      try {
+        controller.abort();
+        const opened = await settleWithin(opening);
+        assert.equal(opened.status, 'rejected', 'open must reject once aborted while probing');
+        assert.equal(listeners(), baseline, 'a failed open must detach from the stream');
+      } finally {
+        stream.push(null);
+      }
+    });
+
+    it('should keep waiting for a source that stalls while the demuxer is open', { timeout: 15000 }, async () => {
+      const { stream, parked } = stalledReadable(64 * 1024);
+      const media = await Demuxer.open(stream, { format: 'mp3' });
+      let count = 0;
+      const reading = (async () => {
+        for await (using packet of media.packets()) {
+          if (packet) count++;
+        }
+      })();
+      await parked;
+
+      // Longer than the native exit probe interval: an open demuxer has no read timeout
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      const beforeResume = count;
+      stream.push(mp3.subarray(64 * 1024));
+      stream.push(null);
+      await reading;
+
+      assert.ok(count > beforeResume, `packets after the stall should still arrive (${beforeResume} -> ${count})`);
+      await media.close();
+    });
+
+    for (const method of ['close', 'closeSync'] as const) {
+      it(`${method}() in a worker should not wait for a stalled Readable`, { timeout: 30000 }, async () => {
+        const script = `
+          const { register } = await import(${JSON.stringify(tsxApi)});
+          register();
+          const { parentPort } = await import('node:worker_threads');
+          const { Readable } = await import('node:stream');
+          const { readFileSync } = await import('node:fs');
+          const { Demuxer } = await import(${JSON.stringify(srcUrl)});
+          const stream = new Readable({ read() {} });
+          stream.push(readFileSync(${JSON.stringify(getInputFile('audio.mp3'))}).subarray(0, 256 * 1024));
+          const { promise: parked, resolve } = Promise.withResolvers();
+          const read = stream.read.bind(stream);
+          let burst = false;
+          stream.read = (size) => {
+            const chunk = read(size);
+            if (chunk === null && !burst) resolve();
+            burst = chunk !== null;
+            return chunk;
+          };
+          const media = await Demuxer.open(stream, { format: 'mp3' });
+          const reading = (async () => {
+            for await (const packet of media.packets()) {
+              if (!packet) break;
+              packet.free();
+            }
+          })();
+          await parked;
+          await media.${method}();
+          await reading;
+          parentPort.postMessage('closed');
+        `;
+        const worker = new Worker(new URL('data:text/javascript,' + encodeURIComponent(script)));
+        try {
+          const closed = await settleWithin(once(worker, 'message'), 15000);
+          assert.equal(closed.status, 'fulfilled', `${method}() in the worker must settle while its read is parked`);
+        } finally {
+          await worker.terminate();
+        }
+      });
+    }
   });
 
   describe('seek', () => {

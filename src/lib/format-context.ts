@@ -614,6 +614,9 @@ export class FormatContext extends OptionMember<NativeFormatContext> implements 
    * Close an input format context.
    *
    * Closes input file and releases resources.
+   * A pb with JS callbacks stops serving this input: a read, seek or open
+   * still waiting for one of its callbacks fails with AVERROR_EXIT, and its
+   * callbacks are not called again, so a stalled source cannot block the close.
    *
    * Direct mapping to avformat_close_input().
    *
@@ -640,6 +643,7 @@ export class FormatContext extends OptionMember<NativeFormatContext> implements 
    * Synchronous version of closeInput.
    *
    * Closes input file and releases resources.
+   * A pb with JS callbacks stops serving this input (see closeInput).
    *
    * Direct mapping to avformat_close_input().
    *
@@ -1466,6 +1470,9 @@ export class FormatContext extends OptionMember<NativeFormatContext> implements 
    * quiet RTSP socket) returns immediately instead of waiting for data. The
    * context is not freed and remains valid - this only aborts the pending
    * operation, so a reader can drain and shut down before closing the input.
+   * An input pb with JS callbacks stops serving the input as on close: a call
+   * waiting for one of its callbacks fails with AVERROR_EXIT, and its callbacks
+   * are not called again.
    *
    * @example
    * ```typescript

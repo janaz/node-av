@@ -81,7 +81,7 @@ private:
   Completion* NewCompletion(Napi::Env env, std::vector<Napi::Object> pins);
   void Complete(Completion* completion, int result);
   void Deliver(Napi::Env env, Completion* completion, int result);
-  void Discard(Completion* completion);
+  static void Discard(Completion* completion);
   void Track(Napi::Env env);
   void Untrack(Napi::Env env);
 
