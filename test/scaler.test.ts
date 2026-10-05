@@ -508,7 +508,13 @@ describe('Scaler', () => {
         assert.throws(() => scaler.toBufferSync(frame, { ...options, output: Buffer.alloc(320 * 180 * 3 - 1) }), TypeError);
         await assert.rejects(scaler.toBuffer(frame, { ...options, output: Buffer.alloc(16) }), TypeError);
         const size = 320 * 180 * 3;
-        for (const output of [new ArrayBuffer(size), new DataView(new ArrayBuffer(size)), new Float32Array(size / 4 + 16), new Uint16Array(size / 2)]) {
+        for (const output of [
+          new Uint8Array(size),
+          new ArrayBuffer(size),
+          new DataView(new ArrayBuffer(size)),
+          new Float32Array(size / 4 + 16),
+          new Uint16Array(size / 2),
+        ]) {
           const name = output.constructor.name;
           await assert.rejects(scaler.toBuffer(frame, { ...options, output: output as unknown as Buffer }), TypeError, name);
           assert.throws(() => scaler.toBufferSync(frame, { ...options, output: output as unknown as Buffer }), TypeError, name);

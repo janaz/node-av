@@ -968,7 +968,7 @@ describe('Frame', () => {
       const size = 64 * 48 * 3;
       using frame = Frame.fromVideoBuffer(Buffer.alloc(size), { width: 64, height: 48, format: AV_PIX_FMT_RGB24 });
       assert.throws(() => frame.toBuffer(Buffer.alloc(size - 1)), TypeError);
-      for (const output of [new DataView(new ArrayBuffer(size)), new Float32Array(size / 4 + 4)]) {
+      for (const output of [new Uint8Array(size), new DataView(new ArrayBuffer(size)), new Float32Array(size / 4 + 4)]) {
         assert.throws(() => frame.toBuffer(output as unknown as Buffer), TypeError, output.constructor.name);
       }
     });

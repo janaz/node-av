@@ -60,8 +60,9 @@ export interface ScaleOptions {
   format?: ScaledImageFormat;
   /**
    * Optional buffer to write the result into instead of allocating a new one.
-   * It must hold at least the result's size; the returned buffer is then a view
-   * of its first bytes. Do not read or write it until the call has settled.
+   * It must be a Buffer of at least the result's size and must not overlap the
+   * source frame's data; the returned buffer is then a view of its first bytes.
+   * Do not read or write it until the call has settled.
    */
   output?: Buffer;
 }
@@ -265,6 +266,11 @@ export class Scaler implements Disposable {
       throw new Error('Scaler has been disposed');
     }
 
+    // The native side accepts any Uint8Array, but the result would then not be a Buffer
+    if (options.output !== undefined && !Buffer.isBuffer(options.output)) {
+      throw new TypeError('output must be a Buffer');
+    }
+
     if (frame.isHwFrame()) {
       // With a hardware context, crop/scale/convert on the GPU and download only
       // the small result. Without one, fall back to downloading the full frame
@@ -312,6 +318,10 @@ export class Scaler implements Disposable {
   toBufferSync(frame: Frame, options: ScaleOptions = {}): Buffer {
     if (this.disposed) {
       throw new Error('Scaler has been disposed');
+    }
+
+    if (options.output !== undefined && !Buffer.isBuffer(options.output)) {
+      throw new TypeError('output must be a Buffer');
     }
 
     if (frame.isHwFrame()) {
