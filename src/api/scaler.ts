@@ -58,6 +58,12 @@ export interface ScaleOptions {
   resize?: ScalerResize;
   /** Optional output pixel format. Omit to keep the source format. */
   format?: ScaledImageFormat;
+  /**
+   * Optional buffer to write the result into instead of allocating a new one.
+   * It must hold at least the result's size; the returned buffer is then a view
+   * of its first bytes. Do not read or write it until the call has settled.
+   */
+  output?: Buffer;
 }
 
 /**
@@ -235,15 +241,21 @@ export class Scaler implements Disposable {
    *
    * @param frame - Source frame (software or hardware; hardware frames are processed on the GPU and downloaded)
    *
-   * @param options - Crop, resize, and format options
+   * @param options - Crop, resize, format, and output buffer options
    *
-   * @returns Tightly packed pixel data
+   * @returns Tightly packed pixel data (a view of `options.output` when given)
    *
    * @throws {FFmpegError} If scaling fails
+   *
+   * @throws {TypeError} If `options.output` is not a Buffer or is smaller than the result
    *
    * @example
    * ```typescript
    * const gray = await scaler.toBuffer(frame, { resize: { width: 320, height: 180 }, format: 'gray' });
+   *
+   * // Reuse one buffer across frames
+   * const reused = Buffer.allocUnsafe(320 * 180);
+   * await scaler.toBuffer(frame, { resize: { width: 320, height: 180 }, format: 'gray', output: reused });
    * ```
    *
    * @see {@link toBufferSync} For synchronous version
@@ -260,7 +272,7 @@ export class Scaler implements Disposable {
       if (this.hardware) {
         const out = await this.toFrame(frame, options.crop, options.resize, options.format ?? 'nv12');
         try {
-          return out.toBuffer();
+          return out.toBuffer(options.output);
         } finally {
           out.free();
         }
@@ -282,11 +294,13 @@ export class Scaler implements Disposable {
    *
    * @param frame - Source frame (software or hardware; hardware frames are processed on the GPU and downloaded)
    *
-   * @param options - Crop, resize, and format options
+   * @param options - Crop, resize, format, and output buffer options
    *
-   * @returns Tightly packed pixel data
+   * @returns Tightly packed pixel data (a view of `options.output` when given)
    *
    * @throws {FFmpegError} If scaling fails
+   *
+   * @throws {TypeError} If `options.output` is not a Buffer or is smaller than the result
    *
    * @example
    * ```typescript
@@ -304,7 +318,7 @@ export class Scaler implements Disposable {
       if (this.hardware) {
         const out = this.toFrameSync(frame, options.crop, options.resize, options.format ?? 'nv12');
         try {
-          return out.toBuffer();
+          return out.toBuffer(options.output);
         } finally {
           out.free();
         }

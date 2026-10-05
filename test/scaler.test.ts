@@ -402,6 +402,123 @@ describe('Scaler', () => {
     });
   });
 
+  describe('output buffer', () => {
+    it('writes into options.output and hands it back', async () => {
+      const { frame, close } = await firstFrame();
+      using scaler = new Scaler();
+      try {
+        const options = { resize: { width: 320, height: 180 }, format: 'rgb' } as const;
+        const expected = scaler.toBufferSync(frame, options);
+
+        const output = Buffer.alloc(expected.length);
+        const got = await scaler.toBuffer(frame, { ...options, output });
+        assert.ok(got === output, 'an output of the exact size comes back as is');
+        assert.ok(output.equals(expected));
+
+        const syncOutput = Buffer.alloc(expected.length);
+        assert.ok(scaler.toBufferSync(frame, { ...options, output: syncOutput }) === syncOutput, 'the sync variant hands the output back too');
+        assert.ok(syncOutput.equals(expected));
+      } finally {
+        await close();
+      }
+    });
+
+    it('returns a view of the first bytes of a larger output and leaves the rest untouched', async () => {
+      const { frame, close } = await firstFrame();
+      using scaler = new Scaler();
+      try {
+        const options = { resize: { width: 416, height: 234 }, format: 'rgb' } as const;
+        const expected = scaler.toBufferSync(frame, options);
+        const arena = Buffer.alloc(expected.length + 96, 0xab);
+        const output = arena.subarray(32);
+
+        for (const got of [await scaler.toBuffer(frame, { ...options, output }), scaler.toBufferSync(frame, { ...options, output })]) {
+          assert.ok(got.buffer === arena.buffer && got.byteOffset === output.byteOffset, 'the result is a view of the output');
+          assert.strictEqual(got.length, expected.length);
+          assert.ok(got.equals(expected));
+          assert.ok(
+            arena.subarray(0, 32).every((b) => b === 0xab),
+            'nothing written before the output',
+          );
+          assert.ok(
+            arena.subarray(32 + expected.length).every((b) => b === 0xab),
+            'nothing written past the result',
+          );
+        }
+      } finally {
+        await close();
+      }
+    });
+
+    it('writes the same bytes into aligned and unaligned outputs', async () => {
+      const { frame, close } = await firstFrame();
+      using scaler = new Scaler();
+      try {
+        // rows of 960, 1248, 1280 and 320 bytes are written by swscale directly; 900 and 150, rgba 300 wide (x86 writes
+        // it in 8-pixel blocks) and an odd start go through a staging frame
+        const cases = [
+          { resize: { width: 320, height: 180 }, format: 'rgb' },
+          { resize: { width: 416, height: 234 }, format: 'rgb' },
+          { resize: { width: 300, height: 300 }, format: 'rgb' },
+          { resize: { width: 320, height: 180 }, format: 'rgba' },
+          { resize: { width: 300, height: 300 }, format: 'rgba' },
+          { crop: { x: 0, y: 0, width: 300, height: 200 }, format: 'rgba' },
+          { resize: { width: 320, height: 180 }, format: 'gray' },
+          { resize: { width: 150, height: 84 }, format: 'gray' },
+          { resize: { width: 320, height: 320 }, format: 'nv12' },
+          { crop: { x: 11, y: 7, width: 133, height: 91 }, resize: { width: 640, height: 640 }, format: 'rgb' },
+        ] as const;
+        for (const options of cases) {
+          const name = JSON.stringify(options);
+          const expected = scaler.toBufferSync(frame, options);
+          const size = expected.length;
+          const alignedArena = Buffer.alloc(size + 64, 0xab);
+          const oddArena = Buffer.alloc(size + 65, 0xab);
+          assert.ok((await scaler.toBuffer(frame, { ...options, output: alignedArena.subarray(0, size) })).equals(expected), name);
+          assert.ok(scaler.toBufferSync(frame, { ...options, output: oddArena.subarray(1, 1 + size) }).equals(expected), name);
+          assert.ok(
+            alignedArena.subarray(size).every((b) => b === 0xab) && oddArena[0] === 0xab && oddArena.subarray(1 + size).every((b) => b === 0xab),
+            `${name}: nothing written outside the output`,
+          );
+        }
+      } finally {
+        await close();
+      }
+    });
+
+    it('takes the output for a pure crop too', async () => {
+      const { frame, close } = await firstFrame();
+      using scaler = new Scaler();
+      try {
+        const options = { crop: { x: 16, y: 8, width: 96, height: 64 } };
+        const expected = await scaler.toBuffer(frame, options);
+        const output = Buffer.alloc(expected.length);
+        assert.ok((await scaler.toBuffer(frame, { ...options, output })) === output, 'a pure crop is copied into the output');
+        assert.ok(output.equals(expected));
+      } finally {
+        await close();
+      }
+    });
+
+    it('rejects an output that is too small or not a Buffer', async () => {
+      const { frame, close } = await firstFrame();
+      using scaler = new Scaler();
+      try {
+        const options = { resize: { width: 320, height: 180 }, format: 'rgb' } as const;
+        assert.throws(() => scaler.toBufferSync(frame, { ...options, output: Buffer.alloc(320 * 180 * 3 - 1) }), TypeError);
+        await assert.rejects(scaler.toBuffer(frame, { ...options, output: Buffer.alloc(16) }), TypeError);
+        const size = 320 * 180 * 3;
+        for (const output of [new ArrayBuffer(size), new DataView(new ArrayBuffer(size)), new Float32Array(size / 4 + 16), new Uint16Array(size / 2)]) {
+          const name = output.constructor.name;
+          await assert.rejects(scaler.toBuffer(frame, { ...options, output: output as unknown as Buffer }), TypeError, name);
+          assert.throws(() => scaler.toBufferSync(frame, { ...options, output: output as unknown as Buffer }), TypeError, name);
+        }
+      } finally {
+        await close();
+      }
+    });
+  });
+
   describe('lifecycle', () => {
     it('rejects after dispose', async () => {
       const { frame, close } = await firstFrame();
@@ -511,6 +628,39 @@ describe('Scaler', () => {
           }
           const rgb = await scaler.toBuffer(frame, { resize: { width: 320, height: 180 }, format: 'rgb' });
           assert.strictEqual(rgb.length, 320 * 180 * 3);
+        } finally {
+          await close();
+        }
+      } finally {
+        hw.dispose();
+      }
+    });
+
+    it('writes hardware frames into options.output, with and without a hardware context', skipInCI, async () => {
+      const hw = HardwareContext.auto();
+      if (!hw) {
+        console.log('No hardware acceleration available - skipping HW output buffer test');
+        return;
+      }
+
+      try {
+        const { frame, close } = await firstFrame(hw);
+        using gpu = new Scaler({ hardware: hw });
+        using cpu = new Scaler();
+        try {
+          if (!frame.isHwFrame()) {
+            return;
+          }
+          const options = { resize: { width: 320, height: 180 }, format: 'rgb' } as const;
+          for (const scaler of [gpu, cpu]) {
+            const expected = await scaler.toBuffer(frame, options);
+            const output = Buffer.alloc(expected.length + 8, 0xab);
+            const got = await scaler.toBuffer(frame, { ...options, output });
+            assert.ok(got.buffer === output.buffer && got.byteOffset === output.byteOffset, 'the result is a view of the output');
+            assert.ok(got.equals(expected));
+            assert.ok(output.subarray(expected.length).every((b) => b === 0xab));
+            assert.ok(scaler.toBufferSync(frame, { ...options, output }).buffer === output.buffer, 'the sync variant writes into the output too');
+          }
         } finally {
           await close();
         }
