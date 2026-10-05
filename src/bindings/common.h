@@ -108,6 +108,36 @@ inline bool CanCallIntoJs(Napi::Env env) {
   return napi_get_named_property(env, global, "undefined", &probe) == napi_ok;
 }
 
+// The caller's output buffer when given (it must hold at least `size` bytes),
+// otherwise a new one; throws a TypeError and returns false for an unusable output
+inline bool ResolveOutputBuffer(Napi::Env env, const Napi::Value& output, size_t size, Napi::Buffer<uint8_t>& dst) {
+  if (output.IsEmpty() || output.IsUndefined() || output.IsNull()) {
+    dst = Napi::Buffer<uint8_t>::New(env, size);
+    return true;
+  }
+  // IsBuffer() is true for every ArrayBufferView, a DataView or wider typed array would break Length() and subarray()
+  if (!output.IsTypedArray() || output.As<Napi::TypedArray>().TypedArrayType() != napi_uint8_array) {
+    Napi::TypeError::New(env, "output must be a Buffer").ThrowAsJavaScriptException();
+    return false;
+  }
+  dst = output.As<Napi::Buffer<uint8_t>>();
+  if (dst.Length() < size) {
+    Napi::TypeError::New(env, "output holds " + std::to_string(dst.Length()) + " bytes, " + std::to_string(size) + " are needed")
+        .ThrowAsJavaScriptException();
+    return false;
+  }
+  return true;
+}
+
+// dst itself when it has exactly `size` bytes, otherwise a view of its first `size` bytes
+inline Napi::Value ExactBufferView(Napi::Env env, Napi::Buffer<uint8_t> dst, size_t size) {
+  if (dst.Length() == size) {
+    return dst;
+  }
+  Napi::Function subarray = dst.Get("subarray").As<Napi::Function>();
+  return subarray.Call(dst, {Napi::Number::New(env, 0), Napi::Number::New(env, static_cast<double>(size))});
+}
+
 template<typename T>
 T* UnwrapNativeObject(const Napi::Env& env, const Napi::Value& value, const char* typeName) {
   if (!value.IsObject()) {

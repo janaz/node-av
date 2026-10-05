@@ -147,7 +147,7 @@ export interface NativeFrame extends Disposable {
   copyProps(src: NativeFrame): number;
   copy(src: NativeFrame): number;
   fromBuffer(buffer: Buffer): number;
-  toBuffer(): Buffer;
+  toBuffer(output?: Buffer): Buffer;
   hwframeTransferData(dst: NativeFrame, flags?: number): Promise<number>;
   hwframeTransferDataSync(dst: NativeFrame, flags?: number): number;
   isHwFrame(): boolean;
@@ -714,6 +714,7 @@ export interface NativeScaler {
       crop?: { x: number; y: number; width: number; height: number };
       resize?: { width: number; height: number };
       format?: string;
+      output?: Buffer;
     },
   ): Promise<Buffer>;
   processSync(
@@ -722,6 +723,7 @@ export interface NativeScaler {
       crop?: { x: number; y: number; width: number; height: number };
       resize?: { width: number; height: number };
       format?: string;
+      output?: Buffer;
     },
   ): Buffer;
   close(): void;
