@@ -935,6 +935,45 @@ describe('Frame', () => {
     });
   });
 
+  describe('toBuffer into an output buffer', () => {
+    it('copies a video frame into the output and returns a view of exactly its size', () => {
+      const source = Buffer.alloc(320 * 240 * 3);
+      for (let i = 0; i < source.length; i++) source[i] = (i * 7) & 255;
+      using frame = Frame.fromVideoBuffer(source, { width: 320, height: 240, format: AV_PIX_FMT_RGB24 });
+
+      const exact = Buffer.alloc(source.length);
+      assert.ok(frame.toBuffer(exact) === exact, 'an output of the exact size comes back as is');
+      assert.ok(exact.equals(source));
+
+      const larger = Buffer.alloc(source.length + 16, 0xab);
+      const view = frame.toBuffer(larger);
+      assert.ok(view.buffer === larger.buffer, 'the result is a view of the output');
+      assert.strictEqual(view.length, source.length);
+      assert.ok(view.equals(source));
+      assert.ok(larger.subarray(source.length).every((b) => b === 0xab));
+    });
+
+    it('copies an audio frame into the output', () => {
+      const source = Buffer.alloc(960 * 2 * 4);
+      for (let i = 0; i < source.length; i += 4) source.writeFloatLE(Math.sin(i / 100), i);
+      using frame = Frame.fromAudioBuffer(source, { nbSamples: 960, format: AV_SAMPLE_FMT_FLT, sampleRate: 48000, channelLayout: AV_CHANNEL_LAYOUT_STEREO });
+
+      const output = Buffer.alloc(source.length + 4);
+      const view = frame.toBuffer(output);
+      assert.ok(view.buffer === output.buffer, 'the result is a view of the output');
+      assert.ok(view.equals(frame.toBuffer()));
+    });
+
+    it('rejects an output that is too small or not a Buffer', () => {
+      const size = 64 * 48 * 3;
+      using frame = Frame.fromVideoBuffer(Buffer.alloc(size), { width: 64, height: 48, format: AV_PIX_FMT_RGB24 });
+      assert.throws(() => frame.toBuffer(Buffer.alloc(size - 1)), TypeError);
+      for (const output of [new DataView(new ArrayBuffer(size)), new Float32Array(size / 4 + 4)]) {
+        assert.throws(() => frame.toBuffer(output as unknown as Buffer), TypeError, output.constructor.name);
+      }
+    });
+  });
+
   describe('Factory Methods', () => {
     describe('fromVideoBuffer', () => {
       it('should create video frame from buffer', () => {
