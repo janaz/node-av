@@ -78,7 +78,9 @@ void InitRationalFactory(Napi::Env env);
 inline Napi::Object RationalToJS(const Napi::Env& env, const AVRational& r) {
   // A JS object literal is far cheaper than a native object with two named
   // properties: about 100 instead of 260 ns per rational getter.
-  if (rational_factory_env == env) {
+  // Compare raw handles: under C++20 MSVC finds napi_env == Napi::Env ambiguous
+  // (built-in comparison vs. the reversed BasicEnv::operator==)
+  if (rational_factory_env == static_cast<napi_env>(env)) {
     napi_value factory;
     napi_value argv[2];
     napi_value result;
