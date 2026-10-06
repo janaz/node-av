@@ -12,11 +12,11 @@ Napi::Value Scaler::Process(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
 
   ScaleJob job;
-  if (!PrepareJob(env, info, job)) {
+  Napi::Buffer<uint8_t> outBuffer;
+  if (!PrepareJob(env, info, job, outBuffer)) {
     return env.Undefined();
   }
 
-  Napi::Buffer<uint8_t> outBuffer = Napi::Buffer<uint8_t>::New(env, job.outSize);
   int ret = RunJob(job, outBuffer.Data());
   if (job.cropped) av_frame_free(&job.cropped);
 
@@ -27,7 +27,7 @@ Napi::Value Scaler::Process(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  return outBuffer;
+  return ExactBufferView(env, outBuffer, static_cast<size_t>(job.outSize));
 }
 
 } // namespace ffmpeg

@@ -17,7 +17,7 @@ export { Encoder, type EncoderContextOptions, type EncoderOptions } from './enco
 export { EncoderPool, type EncoderPoolOptions } from './encoder-pool.js';
 
 // AudioFrameBuffer
-export { AudioFrameBuffer } from './audio-frame-buffer.js';
+export { AudioFrameBuffer, type AudioFrameBufferOptions } from './audio-frame-buffer.js';
 
 // Hardware
 export { HardwareContext, type BaseCodecName, type HardwareOptions } from './hardware.js';

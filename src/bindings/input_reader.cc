@@ -294,8 +294,9 @@ void InputReader::Untrack(Napi::Env env) {
 
 void InputReader::CallJs(Napi::Env env, Napi::Function, InputReader* reader, Completion* completion) {
   if (env == nullptr) {
-    // env torn down: the finalizer takes care of the reader itself
-    reader->Discard(completion);
+    // env torn down: Node drains the queue after the finalizer has already
+    // freed the reader, so only the completion may be touched
+    Discard(completion);
     return;
   }
   if (completion->release) {
@@ -308,6 +309,19 @@ void InputReader::CallJs(Napi::Env env, Napi::Function, InputReader* reader, Com
 }
 
 void InputReader::Finalize(Napi::Env, void*, InputReader* reader) {
+  bool stopped;
+  {
+    std::lock_guard<std::mutex> lock(reader->mutex_);
+    stopped = reader->stop_;
+  }
+  // Env teardown finalizes the TSFN of a reader nobody stopped. Its owner is
+  // still alive then (~FormatContext stops the reader first) but is finalized
+  // right after this: it must forget the reader, or its StopReader() runs on
+  // freed memory and aborts the process.
+  if (!stopped) {
+    InputReader* expected = reader;
+    reader->owner_->reader_.compare_exchange_strong(expected, nullptr);
+  }
   delete reader;
 }
 

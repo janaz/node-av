@@ -456,6 +456,7 @@ Napi::Value Frame::FromBuffer(const Napi::CallbackInfo& info) {
 
 Napi::Value Frame::ToBuffer(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  Napi::Value output = info.Length() > 0 ? info[0] : env.Undefined();
 
   if (!frame_) {
     Napi::Error::New(env, "Frame not allocated").ThrowAsJavaScriptException();
@@ -489,8 +490,10 @@ Napi::Value Frame::ToBuffer(const Napi::CallbackInfo& info) {
       return env.Undefined();
     }
 
-    // Allocate buffer
-    Napi::Buffer<uint8_t> buffer = Napi::Buffer<uint8_t>::New(env, buffer_size);
+    Napi::Buffer<uint8_t> buffer;
+    if (!ResolveOutputBuffer(env, output, static_cast<size_t>(buffer_size), buffer)) {
+      return env.Undefined();
+    }
     uint8_t* buffer_data = buffer.Data();
 
     if (!buffer_data) {
@@ -515,7 +518,7 @@ Napi::Value Frame::ToBuffer(const Napi::CallbackInfo& info) {
       return env.Undefined();
     }
 
-    return buffer;
+    return ExactBufferView(env, buffer, static_cast<size_t>(buffer_size));
   }
   // Handle audio frames
   else if (frame_->nb_samples > 0) {
@@ -538,8 +541,10 @@ Napi::Value Frame::ToBuffer(const Napi::CallbackInfo& info) {
       buffer_size = frame_->nb_samples * channels * bytes_per_sample;
     }
 
-    // Allocate buffer
-    Napi::Buffer<uint8_t> buffer = Napi::Buffer<uint8_t>::New(env, buffer_size);
+    Napi::Buffer<uint8_t> buffer;
+    if (!ResolveOutputBuffer(env, output, static_cast<size_t>(buffer_size), buffer)) {
+      return env.Undefined();
+    }
     uint8_t* buffer_data = buffer.Data();
 
     if (!buffer_data) {
@@ -563,7 +568,7 @@ Napi::Value Frame::ToBuffer(const Napi::CallbackInfo& info) {
       memcpy(buffer_data, frame_->data[0], buffer_size);
     }
 
-    return buffer;
+    return ExactBufferView(env, buffer, static_cast<size_t>(buffer_size));
   }
 
   // Neither video nor audio frame

@@ -1346,9 +1346,13 @@ export class Frame implements Disposable, NativeWrapper<NativeFrame> {
    * For audio frames, handles both planar and interleaved formats.
    * Cannot be used with hardware frames - use hwframeTransferData first.
    *
-   * @returns Buffer containing frame data
+   * @param output - Optional Buffer to copy into instead of allocating one; it must hold at least the frame's size and must not overlap the frame's data
+   *
+   * @returns Buffer containing frame data (a view of `output` when given)
    *
    * @throws {Error} If frame is not allocated, has no data, or is a hardware frame
+   *
+   * @throws {TypeError} If `output` is not a Buffer or is smaller than the frame data
    *
    * @example Video frame to buffer
    * ```typescript
@@ -1388,8 +1392,12 @@ export class Frame implements Disposable, NativeWrapper<NativeFrame> {
    * @see {@link isHwFrame} To check if frame is hardware
    * @see {@link data} To access individual planes
    */
-  toBuffer(): Buffer {
-    return this.native.toBuffer();
+  toBuffer(output?: Buffer): Buffer {
+    // The native side accepts any Uint8Array, but the result would then not be a Buffer
+    if (output !== undefined && !Buffer.isBuffer(output)) {
+      throw new TypeError('output must be a Buffer');
+    }
+    return this.native.toBuffer(output);
   }
 
   /**

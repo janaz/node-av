@@ -25,6 +25,24 @@ extern "C" {
 
 namespace ffmpeg {
 
+thread_local napi_env rational_factory_env = nullptr;
+thread_local napi_ref rational_factory = nullptr;
+
+void InitRationalFactory(Napi::Env env) {
+  napi_value source;
+  napi_value factory;
+  napi_ref ref;
+  if (napi_create_string_utf8(env, "(function (num, den) { return { num, den }; })", NAPI_AUTO_LENGTH, &source) != napi_ok ||
+      napi_run_script(env, source, &factory) != napi_ok || napi_create_reference(env, factory, 1, &ref) != napi_ok) {
+    // RationalToJS falls back to native objects
+    napi_value error;
+    napi_get_and_clear_last_exception(env, &error);
+    return;
+  }
+  rational_factory = ref;
+  rational_factory_env = env;
+}
+
 Napi::Object Utilities::Init(Napi::Env env, Napi::Object exports) {
   // Sample format utilities
   exports.Set("avGetBytesPerSample", Napi::Function::New(env, GetBytesPerSample));

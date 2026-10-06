@@ -91,6 +91,8 @@ FormatContext::FormatContext(const Napi::CallbackInfo& info)
 }
 
 FormatContext::~FormatContext() {
+  // A reader parked in a custom-IO callback waits for this thread's event loop
+  AbortCustomIO();
   StopReader();
 
   // Clean up if user forgot to call freeContext()
@@ -203,10 +205,11 @@ Napi::Value FormatContext::FreeContext(const Napi::CallbackInfo& info) {
   }
 
   // The owner thread must be gone before the context is freed; stopping it
-  // interrupts a parked read, which is the one abort freeContext() performs
-  if (!StopReaderSync(env)) {
-    return env.Undefined();
-  }
+  // interrupts a parked read, which is the one abort freeContext() performs.
+  // A read parked in a custom-IO callback waits for this thread's event loop,
+  // so its callbacks fail first or the join would deadlock.
+  AbortCustomIO();
+  StopReader();
 
   // Freeing while a worker still uses the context on the threadpool would be
   // a use-after-free; wait bounded, then error instead of crashing. Blocked
@@ -895,6 +898,7 @@ void FormatContext::SetPb(const Napi::CallbackInfo& info, const Napi::Value& val
   
   if (value.IsNull() || value.IsUndefined()) {
     ctx->pb = nullptr;
+    custom_io_abort_.reset();
     return;
   }
   
@@ -902,6 +906,10 @@ void FormatContext::SetPb(const Napi::CallbackInfo& info, const Napi::Value& val
   if (io) {
     // Set the custom IO context
     ctx->pb = io->Get();
+
+    // Close paths end a callback-backed input's callbacks (see AbortCustomIO);
+    // an output keeps them to flush and write its trailer
+    custom_io_abort_ = (!is_output_ && io->callback_data_) ? io->callback_data_->abort_state : nullptr;
 
     // AVFMT_FLAG_CUSTOM_IO marks a pb that libavformat must never close for us
     // (avformat_close_input() would otherwise avio_closep() it). Only
@@ -1065,6 +1073,8 @@ int FormatContext::InterruptCallback(void* opaque) {
 
 Napi::Value FormatContext::Interrupt(const Napi::CallbackInfo& info) {
   RequestInterrupt();
+  // The flag alone never reaches a read parked in a custom-IO callback
+  AbortCustomIO();
   return info.Env().Undefined();
 }
 
@@ -1079,6 +1089,13 @@ void FormatContext::RequestInterrupt() {
 }
 
 void FormatContext::StopReader() {
+  // closeInput()'s worker and a sync close/free on the main thread can stop
+  // concurrently. The one that finds reader_ already taken must not return
+  // before the reader thread is joined: it frees ctx_ next, and the reader may
+  // still be inside av_read_frame() (it holds no ctx_mutex_). Joining under the
+  // lock cannot deadlock on the main thread: every close path fails a parked
+  // custom-IO callback (AbortCustomIO) before it gets here.
+  std::lock_guard<std::mutex> lock(reader_stop_mutex_);
   InputReader* reader = reader_.exchange(nullptr);
   if (!reader) {
     return;
@@ -1086,13 +1103,8 @@ void FormatContext::StopReader() {
   reader->Stop();
 }
 
-bool FormatContext::StopReaderSync(Napi::Env env) {
-  if (reader_ && ctx_ && (ctx_->flags & AVFMT_FLAG_CUSTOM_IO)) {
-    Napi::Error::New(env, "FormatContext has an active async reader on custom IO - use closeInput() instead of a sync close/free").ThrowAsJavaScriptException();
-    return false;
-  }
-  StopReader();
-  return true;
+void FormatContext::AbortCustomIO() {
+  IOContext::AbortCallbacks(custom_io_abort_);
 }
 
 Napi::Promise FormatContext::RunOnInput(Napi::Env env, std::vector<Napi::Object> pins, std::function<int()> work, bool flushQueue) {

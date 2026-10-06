@@ -41,7 +41,27 @@ static AVPixelFormat ParseOutputFormat(const std::string& s, AVPixelFormat fallb
   return fallback;
 }
 
-bool Scaler::PrepareJob(Napi::Env env, const Napi::CallbackInfo& info, ScaleJob& job) {
+// x86 sws runs slower on unaligned planes or rows (yuv2yuvX drops to SSE2) and its
+// rgba writers need padded rows (at a packed stride yuv2rgb skips a row's last
+// pixels when the width is no multiple of 8): those keep the staging frame
+static bool PackedLayoutAligned(uint8_t* dst, AVPixelFormat fmt, int width, int height) {
+  if (width % 16 != 0) {
+    return false;
+  }
+  uint8_t* planes[4];
+  int linesizes[4];
+  if (av_image_fill_arrays(planes, linesizes, dst, fmt, width, height, 1) < 0) {
+    return false;
+  }
+  for (int i = 0; i < 4; i++) {
+    if (planes[i] && ((reinterpret_cast<uintptr_t>(planes[i]) | static_cast<uintptr_t>(linesizes[i])) & 15) != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool Scaler::PrepareJob(Napi::Env env, const Napi::CallbackInfo& info, ScaleJob& job, Napi::Buffer<uint8_t>& dst) {
   // runs on the JS thread before this job registers itself, so idle means no
   // Execute() can still touch a retired frame/context
   DrainRetired();
@@ -122,27 +142,39 @@ bool Scaler::PrepareJob(Napi::Env env, const Napi::CallbackInfo& info, ScaleJob&
     return false;
   }
 
-  AVFrame* outFrame = effective;
-  AVFrame* scaled = nullptr;
-  SwsContext* sws = nullptr;
-
   const bool needsWork = (dstW != srcW || dstH != srcH || dstFmt != srcFmt);
-  if (needsWork) {
-    scaled = GetOrCreateFrame(dstW, dstH, dstFmt);
-    sws = scaled ? GetOrCreateSwsContext(srcW, srcH, srcFmt, dstW, dstH, dstFmt) : nullptr;
-    if (!scaled || !sws) {
-      if (cropped) av_frame_free(&cropped);
-      Napi::Error::New(env, "Failed to allocate scaling context").ThrowAsJavaScriptException();
-      return false;
-    }
-    outFrame = scaled;
-  }
 
-  int outSize = av_image_get_buffer_size(static_cast<AVPixelFormat>(outFrame->format), outFrame->width, outFrame->height, 1);
+  int outSize = av_image_get_buffer_size(dstFmt, dstW, dstH, 1);
   if (outSize <= 0) {
     if (cropped) av_frame_free(&cropped);
     Napi::Error::New(env, "Failed to compute output buffer size").ThrowAsJavaScriptException();
     return false;
+  }
+
+  Napi::Value output = options.Has("output") ? options.Get("output") : env.Undefined();
+  if (!ResolveOutputBuffer(env, output, static_cast<size_t>(outSize), dst)) {
+    if (cropped) av_frame_free(&cropped);
+    return false;
+  }
+
+  AVFrame* outFrame = effective;
+  AVFrame* scaled = nullptr;
+  SwsContext* sws = nullptr;
+
+  if (needsWork) {
+    sws = GetOrCreateSwsContext(srcW, srcH, srcFmt, dstW, dstH, dstFmt);
+    const bool direct = sws && PackedLayoutAligned(dst.Data(), dstFmt, dstW, dstH);
+    if (sws && !direct) {
+      scaled = GetOrCreateFrame(dstW, dstH, dstFmt);
+    }
+    if (!sws || (!direct && !scaled)) {
+      if (cropped) av_frame_free(&cropped);
+      Napi::Error::New(env, "Failed to allocate scaling context").ThrowAsJavaScriptException();
+      return false;
+    }
+    if (scaled) {
+      outFrame = scaled;
+    }
   }
 
   job.effective = effective;
@@ -151,18 +183,32 @@ bool Scaler::PrepareJob(Napi::Env env, const Napi::CallbackInfo& info, ScaleJob&
   job.sws = sws;
   job.outFrame = outFrame;
   job.srcH = srcH;
+  job.dstW = dstW;
+  job.dstH = dstH;
+  job.dstFmt = dstFmt;
   job.outSize = outSize;
   return true;
 }
 
 int Scaler::RunJob(const ScaleJob& job, uint8_t* dst) {
-  if (job.sws && job.scaled) {
+  if (job.sws && !job.scaled) {
+    // sws writes the packed layout itself, no staging frame and no second pass
+    uint8_t* planes[4];
+    int linesizes[4];
+    int ret = av_image_fill_arrays(planes, linesizes, dst, job.dstFmt, job.dstW, job.dstH, 1);
+    if (ret < 0) {
+      return ret;
+    }
+    ret = sws_scale(job.sws, job.effective->data, job.effective->linesize, 0, job.srcH, planes, linesizes);
+    return ret < 0 ? ret : 0;
+  }
+  if (job.sws) {
     int ret = sws_scale(job.sws, job.effective->data, job.effective->linesize, 0, job.srcH, job.scaled->data, job.scaled->linesize);
     if (ret < 0) {
       return ret;
     }
   }
-  // Pack the output frame into a tightly-aligned buffer (alignment 1).
+  // staging frame or pure crop: pack it into the buffer (alignment 1)
   av_image_copy_to_buffer(dst, job.outSize, (const uint8_t* const*)job.outFrame->data, job.outFrame->linesize,
                           static_cast<AVPixelFormat>(job.outFrame->format), job.outFrame->width, job.outFrame->height, 1);
   return 0;

@@ -65,7 +65,30 @@ inline AVRational JSToRational(const Napi::Object& obj) {
   return r;
 }
 
+// JS function (num, den) => ({ num, den }) of the env that loaded the addon on
+// this thread, set by InitRationalFactory() (utilities.cc). Never deleted: the
+// env releases its references when it is torn down.
+extern thread_local napi_env rational_factory_env;
+extern thread_local napi_ref rational_factory;
+
+// Compiles the factory RationalToJS builds its objects with. If that fails,
+// RationalToJS keeps creating native objects.
+void InitRationalFactory(Napi::Env env);
+
 inline Napi::Object RationalToJS(const Napi::Env& env, const AVRational& r) {
+  // A JS object literal is far cheaper than a native object with two named
+  // properties: about 100 instead of 260 ns per rational getter.
+  // Compare raw handles: under C++20 MSVC finds napi_env == Napi::Env ambiguous
+  // (built-in comparison vs. the reversed BasicEnv::operator==)
+  if (rational_factory_env == static_cast<napi_env>(env)) {
+    napi_value factory;
+    napi_value argv[2];
+    napi_value result;
+    if (napi_get_reference_value(env, rational_factory, &factory) == napi_ok && napi_create_int32(env, r.num, &argv[0]) == napi_ok &&
+        napi_create_int32(env, r.den, &argv[1]) == napi_ok && napi_call_function(env, env.Undefined(), factory, 2, argv, &result) == napi_ok) {
+      return Napi::Object(env, result);
+    }
+  }
   Napi::Object obj = Napi::Object::New(env);
   obj.Set("num", Napi::Number::New(env, r.num));
   obj.Set("den", Napi::Number::New(env, r.den));
@@ -85,6 +108,36 @@ inline bool CanCallIntoJs(Napi::Env env) {
   }
   napi_value probe;
   return napi_get_named_property(env, global, "undefined", &probe) == napi_ok;
+}
+
+// The caller's output buffer when given (it must hold at least `size` bytes),
+// otherwise a new one; throws a TypeError and returns false for an unusable output
+inline bool ResolveOutputBuffer(Napi::Env env, const Napi::Value& output, size_t size, Napi::Buffer<uint8_t>& dst) {
+  if (output.IsEmpty() || output.IsUndefined() || output.IsNull()) {
+    dst = Napi::Buffer<uint8_t>::New(env, size);
+    return true;
+  }
+  // IsBuffer() is true for every ArrayBufferView, a DataView or wider typed array would break Length() and subarray()
+  if (!output.IsTypedArray() || output.As<Napi::TypedArray>().TypedArrayType() != napi_uint8_array) {
+    Napi::TypeError::New(env, "output must be a Buffer").ThrowAsJavaScriptException();
+    return false;
+  }
+  dst = output.As<Napi::Buffer<uint8_t>>();
+  if (dst.Length() < size) {
+    Napi::TypeError::New(env, "output holds " + std::to_string(dst.Length()) + " bytes, " + std::to_string(size) + " are needed")
+        .ThrowAsJavaScriptException();
+    return false;
+  }
+  return true;
+}
+
+// dst itself when it has exactly `size` bytes, otherwise a view of its first `size` bytes
+inline Napi::Value ExactBufferView(Napi::Env env, Napi::Buffer<uint8_t> dst, size_t size) {
+  if (dst.Length() == size) {
+    return dst;
+  }
+  Napi::Function subarray = dst.Get("subarray").As<Napi::Function>();
+  return subarray.Call(dst, {Napi::Number::New(env, 0), Napi::Number::New(env, static_cast<double>(size))});
 }
 
 template<typename T>

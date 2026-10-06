@@ -59,7 +59,7 @@ public:
       deferred_.Reject(Napi::Error::New(Env(), std::string("sws_scale failed: ") + errbuf).Value());
       return;
     }
-    deferred_.Resolve(buf_ref_.Value());
+    deferred_.Resolve(ExactBufferView(Env(), buf_ref_.Value().As<Napi::Buffer<uint8_t>>(), static_cast<size_t>(job_.outSize)));
   }
 
   void OnError(const Napi::Error& e) override {
@@ -100,7 +100,8 @@ Napi::Value Scaler::ProcessAsync(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
 
   ScaleJob job;
-  if (!PrepareJob(env, info, job)) {
+  Napi::Buffer<uint8_t> outBuffer;
+  if (!PrepareJob(env, info, job, outBuffer)) {
     // PrepareJob has thrown a JS exception for invalid input.
     return env.Undefined();
   }
@@ -108,7 +109,6 @@ Napi::Value Scaler::ProcessAsync(const Napi::CallbackInfo& info) {
   // PrepareJob validated the source frame, so the unwrap cannot fail here.
   Frame* srcFrame = Napi::ObjectWrap<Frame>::Unwrap(info[0].As<Napi::Object>());
 
-  Napi::Buffer<uint8_t> outBuffer = Napi::Buffer<uint8_t>::New(env, job.outSize);
   auto* worker = new ScalerProcessWorker(env, info.This().As<Napi::Object>(), this, info[0].As<Napi::Object>(), srcFrame, job, outBuffer);
   Napi::Promise promise = worker->GetPromise();
   worker->Queue();

@@ -99,6 +99,7 @@ typedef struct RTSPState {
 namespace ffmpeg {
 
 class InputReader;
+struct IOExitState;
 
 class FormatContext : public Napi::ObjectWrap<FormatContext> {
 public:
@@ -120,15 +121,27 @@ private:
 
   // Owner thread of an input context, started by the first async readFrame()
   // and the only thread touching ctx_ from then on (see input_reader.h).
-  // Frees itself after Stop(); null while no reader is active. Atomic
-  // because the async close path clears it from a threadpool worker.
+  // Frees itself after Stop(), or at env teardown, which also clears this;
+  // null while no reader is active. Atomic because the async close path
+  // clears it from a threadpool worker.
   std::atomic<InputReader*> reader_{nullptr};
 
+  // Serializes StopReader(): a caller that loses the exchange on reader_ must
+  // still wait until the winner has joined the reader thread
+  std::mutex reader_stop_mutex_;
+
   void StopReader();
-  // Sync variant for the main thread: a reader parked in a custom-IO callback
-  // needs the event loop to unwind, joining it here would deadlock, so that
-  // case throws and the caller has to use closeInput() instead
-  bool StopReaderSync(Napi::Env env);
+
+  // Abort state of the callback-backed IOContext set as pb of this input; null
+  // otherwise. Main thread only.
+  std::shared_ptr<IOExitState> custom_io_abort_;
+
+  // Main thread: fails the pending and later callbacks of a callback-backed pb
+  // with AVERROR_EXIT. FFmpeg never polls the interrupt callback while a custom
+  // read waits for its JS promise, and that promise settles only once the
+  // source delivers, so a read, seek or probe parked on a stalled source would
+  // otherwise keep every close path waiting for it.
+  void AbortCustomIO();
   // Input-side async work: a command on the owner thread when one is active,
   // otherwise a threadpool worker under ctx_mutex_
   Napi::Promise RunOnInput(Napi::Env env, std::vector<Napi::Object> pins, std::function<int()> work, bool flushQueue);

@@ -99,14 +99,19 @@ public:
   struct ScaleJob {
     AVFrame* effective = nullptr;
     AVFrame* cropped = nullptr;
+    // pooled staging frame, only set when sws cannot write the packed output directly
     AVFrame* scaled = nullptr;
     SwsContext* sws = nullptr;
     AVFrame* outFrame = nullptr;
     int srcH = 0;
+    int dstW = 0;
+    int dstH = 0;
+    AVPixelFormat dstFmt = AV_PIX_FMT_NONE;
     int outSize = 0;
   };
 
-  bool PrepareJob(Napi::Env env, const Napi::CallbackInfo& info, ScaleJob& job);
+  // dst becomes options.output when given (at least outSize bytes), otherwise a new buffer of outSize bytes
+  bool PrepareJob(Napi::Env env, const Napi::CallbackInfo& info, ScaleJob& job, Napi::Buffer<uint8_t>& dst);
 
   static int RunJob(const ScaleJob& job, uint8_t* dst);
 };
