@@ -1089,6 +1089,13 @@ void FormatContext::RequestInterrupt() {
 }
 
 void FormatContext::StopReader() {
+  // closeInput()'s worker and a sync close/free on the main thread can stop
+  // concurrently. The one that finds reader_ already taken must not return
+  // before the reader thread is joined: it frees ctx_ next, and the reader may
+  // still be inside av_read_frame() (it holds no ctx_mutex_). Joining under the
+  // lock cannot deadlock on the main thread: every close path fails a parked
+  // custom-IO callback (AbortCustomIO) before it gets here.
+  std::lock_guard<std::mutex> lock(reader_stop_mutex_);
   InputReader* reader = reader_.exchange(nullptr);
   if (!reader) {
     return;

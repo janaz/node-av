@@ -126,6 +126,10 @@ private:
   // clears it from a threadpool worker.
   std::atomic<InputReader*> reader_{nullptr};
 
+  // Serializes StopReader(): a caller that loses the exchange on reader_ must
+  // still wait until the winner has joined the reader thread
+  std::mutex reader_stop_mutex_;
+
   void StopReader();
 
   // Abort state of the callback-backed IOContext set as pb of this input; null
