@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [6.2.0-beta.26] - 2026-10-04
+## [6.2.0-beta.26] - 2026-10-06
 
 ### Added
 
@@ -18,11 +18,13 @@ All notable changes to this project will be documented in this file.
 - **`dtsForwardThreshold` on `Muxer` and `FMP4Stream`** (seconds, `0` = off). A packet whose DTS runs further ahead of real time than this fails the write before it reaches libavformat; real gaps pass because real time passed with them. Off by default in `Muxer`.
 - **`maxPacketAge` on `FMP4Stream`** (seconds, `0` = off). A packet held in the muxer longer than this, measured in real time, ends the session, so broken or missing timestamps can no longer pile up packets without output until memory runs out.
 - **`audioFrameBuffer` option on `Encoder`** (`AudioFrameBufferOptions`, also accepted by `AudioFrameBuffer.create()`). `maxGapFill` (seconds, default 1) is the largest input gap filled with silence; `timestamps: 'samples'` counts the output from 0 as before. Real-time RTP outputs should use `maxGapFill: 0`, as `RTPStream` does.
+- **`output` option on `Scaler.toBuffer()`/`toBufferSync()` and `Frame.toBuffer()`.** The result is written into the caller's `Buffer` instead of a new one; the returned buffer is a view of its first bytes.
 
 ### Performance
 
 - **`Muxer` writes packets with less overhead.** The timestamp fixup reads each timestamp once and per-stream state once per stream instead of from native code on every access; remuxing is 7–14 % faster with identical output.
 - **Rational getters are about 2.5× faster** (`Frame.timeBase`, `Stream.timeBase`, `CodecContext.framerate`, …): the `{ num, den }` object is created in JS instead of natively.
+- **`Scaler` writes scaled output directly into the result buffer** when the packed layout allows it, skipping the staging copy.
 
 ### Changed
 
