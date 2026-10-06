@@ -385,6 +385,9 @@ describe('Encoder', () => {
 
       const ret = frame.getBuffer();
       assert.equal(ret, 0, 'Should allocate frame buffer');
+      for (const plane of frame.data ?? []) {
+        plane.fill(0);
+      }
 
       // Encode frame and drain packets using helper
       for await (using _packet of encodeFrame(encoder, frame)) {
@@ -411,6 +414,9 @@ describe('Encoder', () => {
 
       const ret = frame.getBuffer();
       assert.equal(ret, 0, 'Should allocate frame buffer');
+      for (const plane of frame.data ?? []) {
+        plane.fill(0);
+      }
 
       // Encode frame and drain packets using sync helper
       for (using _packet of encodeFrameSync(encoder, frame)) {
@@ -609,6 +615,10 @@ describe('Encoder', () => {
           frame.pts = BigInt(2 * rate + i * 1000);
           frame.timeBase = new Rational(1, rate);
           assert.equal(frame.getBuffer(), 0, 'Should allocate frame buffer');
+          // getBuffer() leaves the samples uninitialized; garbage NaN/Inf makes aac reject frames
+          for (const plane of frame.data ?? []) {
+            plane.fill(0);
+          }
           for (const p of await encoder.encodeAll(frame)) {
             pts.push(p.pts);
             p.free();
