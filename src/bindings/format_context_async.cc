@@ -394,7 +394,9 @@ Napi::Value FormatContext::OpenOutputAsync(const Napi::CallbackInfo& info) {
 
     // Check if we need to open the file (not NOFILE format)
     if (!(ctx->oformat->flags & AVFMT_NOFILE)) {
-      return avio_open(&ctx->pb, ctx->url, AVIO_FLAG_WRITE);
+      // With the context's interrupt callback, as the ffmpeg CLI does: lets
+      // interrupt() and process exit abort a blocking network output
+      return avio_open2(&ctx->pb, ctx->url, AVIO_FLAG_WRITE, &ctx->interrupt_callback, nullptr);
     }
     return 0;
   });

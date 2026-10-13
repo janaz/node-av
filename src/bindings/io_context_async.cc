@@ -105,7 +105,8 @@ Napi::Value IOContext::Open2Async(const Napi::CallbackInfo& info) {
   IOContext* self = this;
   return PromiseWorker::Run(env, &async_ops_, {info.This().As<Napi::Object>()}, [self, url, flags]() {
     AVIOContext* avio_ctx = nullptr;
-    int ret = avio_open2(&avio_ctx, url.c_str(), flags, nullptr, nullptr);
+    AVIOInterruptCB int_cb = {ExitInterruptCallback, nullptr};
+    int ret = avio_open2(&avio_ctx, url.c_str(), flags, &int_cb, nullptr);
     if (ret >= 0) {
       // Free old context if exists
       if (self->ctx_) {

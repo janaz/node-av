@@ -149,6 +149,14 @@ private:
   // round-trips of this env (of every env when the main thread exits)
   static Napi::Value MarkExiting(const Napi::CallbackInfo& info);
 
+  // True once the main thread's 'exit' event ran: process.exit() joins the
+  // threadpool next, so FFmpeg I/O blocked there on a stalled peer must unwind
+  static bool ProcessExiting();
+
+  // AVIO interrupt callback for contexts no one else can interrupt: fires only
+  // once the process exits
+  static int ExitInterruptCallback(void* opaque);
+
   Napi::Value AllocContext(const Napi::CallbackInfo& info);
   Napi::Value AllocContextWithCallbacks(const Napi::CallbackInfo& info);
   Napi::Value Open2Async(const Napi::CallbackInfo& info);

@@ -1060,6 +1060,13 @@ void FormatContext::FreeStreamOptions(std::vector<AVDictionary*>& options) {
 }
 
 int FormatContext::InterruptCallback(void* opaque) {
+  // process.exit() joins the threadpool after 'exit': an open, read or write
+  // stuck on a stalled network peer there would hold the exit until its
+  // timeout, and an open in flight has no handle to interrupt() it yet
+  if (IOContext::ProcessExiting()) {
+    return 1;
+  }
+
   // The opaque pointer might be invalid if FormatContext was destroyed
   if (!opaque) {
     return 0;

@@ -510,7 +510,7 @@ Napi::Value FormatContext::OpenOutputSync(const Napi::CallbackInfo& info) {
   }
 
   // Direct synchronous call
-  int ret = avio_open(&ctx_->pb, ctx_->url, AVIO_FLAG_WRITE);
+  int ret = avio_open2(&ctx_->pb, ctx_->url, AVIO_FLAG_WRITE, &ctx_->interrupt_callback, nullptr);
 
   return Napi::Number::New(env, ret);
 }

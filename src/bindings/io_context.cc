@@ -729,6 +729,14 @@ Napi::Value IOContext::MarkExiting(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+bool IOContext::ProcessExiting() {
+  return g_process_exiting.load(std::memory_order_acquire);
+}
+
+int IOContext::ExitInterruptCallback(void* /*opaque*/) {
+  return ProcessExiting() ? 1 : 0;
+}
+
 bool IOContext::GuardOps(Napi::Env env) {
   if (async_ops_.Active() == 0) {
     return true;

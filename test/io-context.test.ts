@@ -1112,6 +1112,26 @@ describe('IOContext', () => {
       });
     }
 
+    it('should not block process.exit() while a network open is stalled', { timeout: 30000 }, async () => {
+      // avformat_open_input() runs on the threadpool, which process.exit() joins;
+      // with a peer that never answers it would hold the exit until its timeout
+      const result = await runScript(`
+        const net = await import('node:net');
+        const { Demuxer } = await import(${JSON.stringify(srcUrl)});
+        const server = net.createServer(() => {}).listen(0, '127.0.0.1');
+        await new Promise((resolve) => server.once('listening', resolve));
+        const url = 'rtsp://127.0.0.1:' + server.address().port + '/stalled';
+        void Demuxer.open(url, { options: { rtsp_transport: 'tcp', timeout: 60000000 } }).catch(() => {});
+        setTimeout(() => {
+          console.log('exiting');
+          process.exit(0);
+        }, 300);
+      `);
+      assert.equal(result.hung, false, `process.exit() waited for the stalled open (stderr: ${result.stderr})`);
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /exiting/);
+    });
+
     it('should let worker.terminate() finish while a callback is parked in the worker', { timeout: 30000 }, async () => {
       const workerScript = `
         const { register } = await import(${JSON.stringify(tsxApi)});

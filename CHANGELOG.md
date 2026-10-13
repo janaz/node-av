@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [6.2.0-beta.26] - 2026-10-06
+## [6.2.0-beta.27] - 2026-10-06
 
 ### Added
 
@@ -94,6 +94,7 @@ All notable changes to this project will be documented in this file.
 - **Ending a process or worker no longer aborts or hangs** while a `Demuxer` is still reading or a callback-backed `IOContext` is still allocated.
 - **Closing a `Demuxer` no longer hangs on a stalled custom-IO source** (`Readable` or `IOInputCallbacks`). Closing or interrupting fails the pending read, seek or probe with `AVERROR_EXIT`, and the context does not call its callbacks again; `closeSync()` no longer throws on an active reader.
 - **`FormatContext.closeInputSync(true)` no longer crashes while `openInput()` is still running.**
+- **`process.exit()` no longer waits for stalled network I/O.** An open, read or write blocked on a peer that stopped answering (e.g. a `Demuxer.open()` reconnect in flight) held the exit until its socket timeout; it now aborts with `AVERROR_EXIT` once the process exits. Outputs opened with `FormatContext.openOutput()` now also honor `interrupt()`.
 
 ## [6.1.1] - 2026-07-06
 
