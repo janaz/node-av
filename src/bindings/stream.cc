@@ -83,6 +83,8 @@ Napi::Value Stream::GetCodecpar(const Napi::CallbackInfo& info) {
   // Set the internal pointer without transferring ownership
   // The user can read/write through this wrapper, and changes will affect the stream directly
   codecParams->SetParameters(stream_->codecpar, false); // false = not owned
+  // freed with the stream, so it borrows from the stream's format context
+  codecParams->BorrowFrom(BorrowedFrom());
   
   return codecParamsObj;
 }
@@ -356,6 +358,8 @@ Napi::Value Stream::GetParser(const Napi::CallbackInfo& info) {
 
   if (parser) {
     parser->SetParserContext(parser_ctx, false); // false = not owned
+    // freed with the stream, so it borrows from the stream's format context
+    parser->BorrowFrom(BorrowedFrom());
   }
 
   return parserObj;

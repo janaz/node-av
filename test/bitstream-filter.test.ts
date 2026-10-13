@@ -4,8 +4,10 @@ import { describe, it } from 'node:test';
 import {
   AV_CODEC_ID_AAC,
   AV_CODEC_ID_H264,
+  AV_CODEC_ID_NONE,
   AVERROR_EAGAIN,
   AVERROR_EOF,
+  AVMEDIA_TYPE_UNKNOWN,
   AVMEDIA_TYPE_VIDEO,
   BitStreamFilter,
   BitStreamFilterContext,
@@ -128,6 +130,26 @@ describe('BitStreamFilter', () => {
       assert.ok(ctx.outputTimeBase, 'Should have output time base');
 
       ctx.free();
+    });
+
+    it('should leave its codec parameters reading defaults once freed', () => {
+      // They point into the filter context: after free() they must not read freed memory
+      const filter = BitStreamFilter.getByName('null');
+      assert.ok(filter);
+      const ctx = new BitStreamFilterContext();
+      ctx.alloc(filter);
+      const parIn = ctx.inputCodecParameters!;
+      parIn.codecType = AVMEDIA_TYPE_VIDEO;
+      parIn.codecId = AV_CODEC_ID_H264;
+      ctx.init();
+      const parOut = ctx.outputCodecParameters!;
+      assert.equal(parOut.codecId, AV_CODEC_ID_H264);
+
+      ctx.free();
+      for (const par of [parIn, parOut]) {
+        assert.equal(par.codecType, AVMEDIA_TYPE_UNKNOWN);
+        assert.equal(par.codecId, AV_CODEC_ID_NONE);
+      }
     });
   });
 

@@ -466,6 +466,10 @@ Napi::Value FormatContext::CloseInputAsync(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
+  // Here, not in the worker: the wrappers are read on this thread, so after
+  // this no JS access can reach the context the worker frees
+  borrowers_->InvalidateAll();
+
   FormatContext* self = this;
   return PromiseWorker::Run(
       env, &async_ops_, {info.This().As<Napi::Object>()},
@@ -557,6 +561,9 @@ Napi::Value FormatContext::DisposeAsync(const Napi::CallbackInfo& info) {
     if (!GuardAsyncOps(env, async_ops_, "FormatContext")) {
       return env.Undefined();
     }
+
+    // On this thread, before the worker frees the context (see CloseInputAsync)
+    borrowers_->InvalidateAll();
 
     FormatContext* self = this;
     return PromiseWorker::Run(

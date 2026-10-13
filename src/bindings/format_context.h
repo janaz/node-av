@@ -9,6 +9,7 @@
 #include <shared_mutex>
 #include <vector>
 #include "common.h"
+#include "borrow_registry.h"
 #include "promise_worker.h"
 
 extern "C" {
@@ -118,6 +119,11 @@ private:
 
   AVFormatContext* ctx_ = nullptr;
   bool is_output_ = false;
+
+  // The Stream wrappers handed to JS, and the codecpar/parser wrappers they
+  // hand out, point into ctx_: invalidated on the JS thread before every free
+  // of it, so a wrapper that outlives the context reads defaults
+  std::shared_ptr<BorrowRegistry> borrowers_ = std::make_shared<BorrowRegistry>();
 
   // Owner thread of an input context, started by the first async readFrame()
   // and the only thread touching ctx_ from then on (see input_reader.h).

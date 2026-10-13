@@ -97,6 +97,8 @@ FormatContext::~FormatContext() {
 
   // Clean up if user forgot to call freeContext()
   if (ctx_) {
+    borrowers_->InvalidateAll();
+
     // Clear the interrupt callback opaque
     ctx_->interrupt_callback.opaque = nullptr;
 
@@ -236,6 +238,8 @@ Napi::Value FormatContext::FreeContext(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
+  borrowers_->InvalidateAll();
+
   // Clear the interrupt callback opaque pointer
   ctx->interrupt_callback.opaque = nullptr;
 
@@ -286,7 +290,7 @@ Napi::Value FormatContext::NewStream(const Napi::CallbackInfo& info) {
   // Wrap AVStream and return it
   Napi::Object streamObj = Stream::constructor.New({});
   Stream* streamWrapper = UnwrapNativeObject<Stream>(env, streamObj, "Stream");
-  streamWrapper->Set(stream);
+  streamWrapper->Set(stream, borrowers_);
   
   return streamObj;
 }
@@ -592,7 +596,7 @@ Napi::Value FormatContext::GetStreams(const Napi::CallbackInfo& info) {
     // Wrap AVStream and add to array
     Napi::Object streamObj = Stream::constructor.New({});
     Stream* streamWrapper = UnwrapNativeObject<Stream>(env, streamObj, "Stream");
-    streamWrapper->Set(ctx->streams[i]);
+    streamWrapper->Set(ctx->streams[i], borrowers_);
     streams[i] = streamObj;
   }
   

@@ -41,6 +41,7 @@ BitStreamFilterContext::BitStreamFilterContext(const Napi::CallbackInfo& info)
 }
 
 BitStreamFilterContext::~BitStreamFilterContext() {
+  borrowers_->InvalidateAll();
   av_bsf_free(&context_);
 }
 
@@ -104,6 +105,7 @@ Napi::Value BitStreamFilterContext::Free(const Napi::CallbackInfo& info) {
     }
   }
 
+  borrowers_->InvalidateAll();
   av_bsf_free(&context_);
   is_initialized_ = false;
   return env.Undefined();
@@ -143,6 +145,7 @@ Napi::Value BitStreamFilterContext::GetInputCodecParameters(const Napi::Callback
   
   // Set the internal pointer without transferring ownership
   codecParams->SetParameters(context_->par_in, false); // false = not owned
+  codecParams->BorrowFrom(borrowers_);
   
   return codecParamsObj;
 }
@@ -161,6 +164,7 @@ Napi::Value BitStreamFilterContext::GetOutputCodecParameters(const Napi::Callbac
   
   // Set the internal pointer without transferring ownership
   codecParams->SetParameters(context_->par_out, false); // false = not owned
+  codecParams->BorrowFrom(borrowers_);
   
   return codecParamsObj;
 }

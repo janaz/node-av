@@ -75,6 +75,7 @@ export class BitStreamFilterContext extends OptionMember<NativeBitStreamFilterCo
    *
    * Parameters describing the input stream format.
    * These are automatically configured from the input packets in most cases.
+   * Reads defaults once the context is freed.
    *
    * Direct mapping to AVBSFContext->par_in.
    */
@@ -95,6 +96,7 @@ export class BitStreamFilterContext extends OptionMember<NativeBitStreamFilterCo
    *
    * Parameters describing the output stream format after filtering.
    * These reflect any changes made by the bitstream filter.
+   * Reads defaults once the context is freed.
    *
    * Direct mapping to AVBSFContext->par_out.
    */

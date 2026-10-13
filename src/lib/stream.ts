@@ -15,6 +15,10 @@ import type { NativeStream, NativeWrapper } from './native-types.js';
  * metadata, and disposition flags. Each stream in a file has a unique index and may
  * contain packets of compressed data.
  *
+ * A stream belongs to its format context. Once that context is closed or freed, the
+ * stream and its codecpar read their defaults (e.g. index -1) and ignore writes;
+ * copy what must outlive the context first.
+ *
  * Direct mapping to FFmpeg's AVStream.
  *
  * @example
@@ -94,6 +98,7 @@ export class Stream implements NativeWrapper<NativeStream> {
    *
    * Contains essential codec configuration for this stream.
    * Used to initialize decoders and describe stream properties.
+   * Reads defaults once the format context is closed or freed.
    *
    * Direct mapping to AVStream->codecpar.
    */

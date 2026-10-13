@@ -1,4 +1,5 @@
 import assert from 'node:assert';
+import { spawn } from 'node:child_process';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 
 import {
@@ -13,13 +14,21 @@ import {
   AVMEDIA_TYPE_VIDEO,
   AVSTREAM_EVENT_FLAG_METADATA_UPDATED,
   AVSTREAM_EVENT_FLAG_NEW_PACKETS,
+  AV_CODEC_ID_NONE,
+  AVMEDIA_TYPE_UNKNOWN,
   CodecParameters,
+  Demuxer,
   Dictionary,
   FormatContext,
   Rational,
 } from '../src/index.js';
 
 import type { AVStreamEventFlag, Stream } from '../src/index.js';
+import { getInputFile, prepareTestEnvironment } from './index.js';
+
+prepareTestEnvironment();
+
+const inputFile = getInputFile('video.mp4');
 
 describe('Stream', () => {
   let ctx: FormatContext;
@@ -306,23 +315,6 @@ describe('Stream', () => {
   });
 
   describe('Resource Management', () => {
-    it('should not crash when context is freed', () => {
-      // Set some properties
-      stream.codecpar.codecType = AVMEDIA_TYPE_VIDEO;
-      stream.codecpar.width = 1920;
-      stream.codecpar.height = 1080;
-      stream.id = 42;
-
-      // Free the context
-      ctx.freeContext();
-      ctx = null as any;
-
-      // Stream reference still exists but underlying AVStream is freed
-      // Accessing stream properties after context is freed would be undefined behavior
-      // So we just verify that freeing the context doesn't crash
-      assert.ok(true);
-    });
-
     it('should handle streams with different time bases', () => {
       const stream2 = ctx.newStream(null);
 
@@ -338,6 +330,127 @@ describe('Stream', () => {
       assert.equal(tb1.den, 25);
       assert.equal(tb2.num, 1);
       assert.equal(tb2.den, 48000);
+    });
+  });
+
+  describe('After its format context is freed', () => {
+    // A Stream and the codecpar it hands out point into the AVFormatContext. Once that
+    // is freed they must read defaults, not freed memory (an access violation on Windows).
+    const assertDetached = (detached: Stream, par: CodecParameters): void => {
+      assert.equal(detached.index, -1);
+      assert.equal(detached.id, 0);
+      assert.deepEqual({ ...detached.timeBase }, { num: 0, den: 1 });
+      assert.equal(detached.duration, 0n);
+      assert.equal(detached.metadata, null);
+      assert.equal(detached.parser, null);
+      assert.equal(par.codecType, AVMEDIA_TYPE_UNKNOWN);
+      assert.equal(par.codecId, AV_CODEC_ID_NONE);
+      assert.equal(par.width, 0);
+      assert.equal(par.extradata, null);
+      // writes go nowhere
+      detached.id = 7;
+      par.width = 640;
+      assert.equal(detached.id, 0);
+      assert.equal(par.width, 0);
+    };
+
+    const openInput = async (): Promise<FormatContext> => {
+      const input = new FormatContext();
+      assert.equal(await input.openInput(inputFile, null, null), 0);
+      assert.ok((await input.findStreamInfo(null)) >= 0);
+      return input;
+    };
+
+    it('reads defaults after freeContext() of an output context', () => {
+      const output = new FormatContext();
+      output.allocOutputContext2(null, 'mp4', 'test.mp4');
+      const detached = output.newStream(null);
+      detached.id = 42;
+      detached.codecpar.width = 1920;
+      const par = detached.codecpar;
+      output.freeContext();
+      assertDetached(detached, par);
+    });
+
+    it('reads defaults after an output context is disposed asynchronously', async () => {
+      const output = new FormatContext();
+      output.allocOutputContext2(null, 'mp4', 'test.mp4');
+      const detached = output.newStream(null);
+      const par = detached.codecpar;
+      await output[Symbol.asyncDispose]();
+      assertDetached(detached, par);
+    });
+
+    it('reads defaults after closeInput()', async () => {
+      const input = await openInput();
+      const detached = input.streams[0];
+      const par = detached.codecpar;
+      assert.equal(detached.index, 0);
+      assert.ok(par.width > 0);
+      await input.closeInput();
+      assertDetached(detached, par);
+    });
+
+    it('reads defaults after closeInputSync()', async () => {
+      const input = await openInput();
+      const detached = input.streams[0];
+      const par = detached.codecpar;
+      input.closeInputSync();
+      assertDetached(detached, par);
+    });
+
+    it('reads defaults after the Demuxer that returned it closed', async () => {
+      const demuxer = await Demuxer.open(inputFile);
+      const video = demuxer.video()!;
+      const par = video.codecpar;
+      assert.ok(par.width > 0);
+      await demuxer.close();
+      assertDetached(video, par);
+    });
+
+    it('keeps parameters it copied after the context is freed', async () => {
+      const input = await openInput();
+      const copy = new CodecParameters();
+      copy.alloc();
+      input.streams[0].codecpar.copy(copy);
+      await input.closeInput();
+      assert.ok(copy.width > 0);
+      copy.free();
+    });
+
+    it('survives garbage collection of either side first', { timeout: 30000 }, async () => {
+      const script = `
+        const { FormatContext } = await import(${JSON.stringify(new URL('../src/index.ts', import.meta.url).href)});
+        const settle = () => new Promise((resolve) => setImmediate(resolve));
+        // context collected while its stream and codecpar live on
+        let ctx = new FormatContext();
+        ctx.allocOutputContext2(null, 'mp4', 'a.mp4');
+        const stream = ctx.newStream(null);
+        const par = stream.codecpar;
+        par.width = 320;
+        ctx = null;
+        for (let i = 0; i < 5; i++) { globalThis.gc(); await settle(); }
+        console.log('after context gc', stream.index, par.width);
+        // streams collected while their context lives on, then freed
+        const kept = new FormatContext();
+        kept.allocOutputContext2(null, 'mp4', 'b.mp4');
+        for (let i = 0; i < 100; i++) kept.newStream(null).codecpar;
+        for (let i = 0; i < 5; i++) { globalThis.gc(); await settle(); }
+        kept.freeContext();
+        console.log('done');
+      `;
+      const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+        const child = spawn(process.execPath, ['--expose-gc', '--import', import.meta.resolve('tsx'), '--input-type=module', '-e', script], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
+        child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
+        child.on('close', (code) => resolve({ code, stdout, stderr }));
+      });
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /after context gc -1 0\ndone/);
     });
   });
 

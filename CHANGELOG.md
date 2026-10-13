@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [6.2.0-beta.27] - 2026-10-06
+## [6.2.0-beta.28] - 2026-10-13
 
 ### Added
 
@@ -95,6 +95,7 @@ All notable changes to this project will be documented in this file.
 - **Closing a `Demuxer` no longer hangs on a stalled custom-IO source** (`Readable` or `IOInputCallbacks`). Closing or interrupting fails the pending read, seek or probe with `AVERROR_EXIT`, and the context does not call its callbacks again; `closeSync()` no longer throws on an active reader.
 - **`FormatContext.closeInputSync(true)` no longer crashes while `openInput()` is still running.**
 - **`process.exit()` no longer waits for stalled network I/O.** An open, read or write blocked on a peer that stopped answering (e.g. a `Demuxer.open()` reconnect in flight) held the exit until its socket timeout; it now aborts with `AVERROR_EXIT` once the process exits. Outputs opened with `FormatContext.openOutput()` now also honor `interrupt()`.
+- **Streams no longer read freed memory after their input or output is closed.** A `Stream`, its `codecpar` and `parser`, and a `BitStreamFilterContext`'s `inputCodecParameters`/`outputCodecParameters` pointed into memory the owning context frees; reading them afterwards (e.g. `stream.index` in a callback still running after `Demuxer.close()`) could crash the process on Windows. They now read their defaults (`index` -1) and ignore writes once the owner is closed or freed.
 
 ## [6.1.1] - 2026-07-06
 

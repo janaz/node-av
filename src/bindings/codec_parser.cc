@@ -43,7 +43,15 @@ Napi::Value CodecParser::InitParser(const Napi::CallbackInfo& info) {
   }
   
   int codec_id = info[0].As<Napi::Number>().Int32Value();
-  
+
+  // A new parser is our own: close a previous one we own and stop tracking a
+  // stream's parser
+  if (parser_ctx_ && owns_parser_) {
+    av_parser_close(parser_ctx_);
+  }
+  owns_parser_ = true;
+  StopBorrowing();
+
   parser_ctx_ = av_parser_init(codec_id);
   if (!parser_ctx_) {
     Napi::Error::New(env, "Failed to initialize parser").ThrowAsJavaScriptException();
@@ -153,6 +161,8 @@ void CodecParser::SetParserContext(AVCodecParserContext* parser_ctx, bool owns) 
   }
   parser_ctx_ = parser_ctx;
   owns_parser_ = owns;
+  // a borrowing caller registers with the owner after this
+  StopBorrowing();
 }
 
 Napi::Value CodecParser::GetRepeatPict(const Napi::CallbackInfo& info) {

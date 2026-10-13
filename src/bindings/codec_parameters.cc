@@ -106,6 +106,7 @@ Napi::Value CodecParameters::Alloc(const Napi::CallbackInfo& info) {
 
   params_ = params;
   is_owned_ = true;  // When we alloc, we own it
+  StopBorrowing();
   return env.Undefined();
 }
 

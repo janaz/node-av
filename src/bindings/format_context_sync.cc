@@ -438,6 +438,8 @@ Napi::Value FormatContext::CloseInputSync(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
+  borrowers_->InvalidateAll();
+
   // Detach a caller-owned pb only now: until the guard above waited for it, an
   // open failed by the abort may still be freeing ctx_ on its threadpool thread
   if (detachPb) {
