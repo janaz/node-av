@@ -55,11 +55,14 @@ async function openShiftedInput(file: string, shiftSeconds: number, after = 10, 
   const input = await Demuxer.open(getInputFile(file));
   const video = input.video()!;
   const shift = BigInt(Math.round((shiftSeconds * video.timeBase.den) / video.timeBase.num));
+  // Read once: a failed session closes the input while a packet is still in flight here,
+  // and a Stream must not be touched after its input closed
+  const videoStreamIndex = video.index;
   const packets = input.packets.bind(input) as (index?: number) => AsyncGenerator<Packet | null>;
   let seen = 0;
   const shifted = async function* (index?: number): AsyncGenerator<Packet | null> {
     for await (const packet of packets(index)) {
-      if (packet?.streamIndex === video.index && seen++ >= after && seen <= after + count) {
+      if (packet?.streamIndex === videoStreamIndex && seen++ >= after && seen <= after + count) {
         if (packet.dts !== AV_NOPTS_VALUE) packet.dts += shift;
         if (packet.pts !== AV_NOPTS_VALUE) packet.pts += shift;
       }
@@ -91,8 +94,9 @@ interface StallShape {
  */
 async function openPacedInput(file: string, shape: StallShape, speed = 4): Promise<Demuxer> {
   const input = await Demuxer.open(getInputFile(file));
-  const video = input.video()!;
-  const audio = input.audio();
+  // Read once: a failed session closes the input while a packet is still in flight here,
+  // and a Stream must not be touched after its input closed (packets carry their time base)
+  const videoStreamIndex = input.video()!.index;
   const packets = input.packets.bind(input) as (index?: number) => AsyncGenerator<Packet | null>;
   let start = Date.now();
   let videoIndex = 0;
@@ -100,9 +104,8 @@ async function openPacedInput(file: string, shape: StallShape, speed = 4): Promi
   const paced = async function* (index?: number): AsyncGenerator<Packet | null> {
     for await (const packet of packets(index)) {
       if (packet) {
-        const stream = packet.streamIndex === video.index ? video : audio;
         const ts = packet.dts !== AV_NOPTS_VALUE ? packet.dts : packet.pts;
-        const seconds = stream && ts !== AV_NOPTS_VALUE ? (Number(ts) * stream.timeBase.num) / stream.timeBase.den : 0;
+        const seconds = ts !== AV_NOPTS_VALUE ? (Number(ts) * packet.timeBase.num) / packet.timeBase.den : 0;
         if (shape.pause && !paused && seconds >= shape.from) {
           paused = true;
           await new Promise((resolve) => setTimeout(resolve, shape.pause));
@@ -111,7 +114,7 @@ async function openPacedInput(file: string, shape: StallShape, speed = 4): Promi
         const wait = start + (seconds * 1000) / speed - Date.now();
         if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
         if (seconds >= shape.from) {
-          if (packet.streamIndex === video.index) {
+          if (packet.streamIndex === videoStreamIndex) {
             shape.video?.(packet, videoIndex++);
           } else if (shape.silenceAudio) {
             packet.free();
@@ -1017,7 +1020,7 @@ describe('FMP4Stream', () => {
         it(`leaves no sample spanning ${jump} that the forward check rejects (${label})`, async () => {
           // Read in real time (4x) so both streams reach the jump together, as from a live source.
           const shift = (packet: Packet): void => {
-            const tb = input.streams[packet.streamIndex].timeBase;
+            const tb = packet.timeBase;
             const ticks = BigInt(Math.round((1800 * tb.den) / tb.num));
             packet.dts += ticks;
             packet.pts += ticks;
@@ -1142,7 +1145,7 @@ describe('FMP4Stream', () => {
           const input = await openPacedInput(file, {
             from,
             video: (packet: Packet) => {
-              const shift = 1800n * BigInt(input.video()!.timeBase.den);
+              const shift = 1800n * BigInt(packet.timeBase.den);
               packet.dts += shift;
               packet.pts += shift;
             },
