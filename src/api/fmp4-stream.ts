@@ -7,9 +7,10 @@ import {
   AV_CODEC_ID_OPUS,
   AV_HWDEVICE_TYPE_NONE,
   AV_PIX_FMT_YUV420P,
+  AV_SAMPLE_FMT_FLT,
   AV_SAMPLE_FMT_FLTP,
 } from '../constants/constants.js';
-import { FF_ENCODER_AAC, FF_ENCODER_LIBX264 } from '../constants/encoders.js';
+import { FF_ENCODER_AAC, FF_ENCODER_LIBOPUS, FF_ENCODER_LIBX264 } from '../constants/encoders.js';
 import { Codec } from '../lib/codec.js';
 import { Rational } from '../lib/rational.js';
 import { avGetCodecString, avGetMediaTypeString, avGetPixFmtName } from '../lib/utilities.js';
@@ -382,7 +383,8 @@ const MIN_FRAGMENT_GOP = 0.5;
  * High-level fMP4 streaming with automatic codec detection and transcoding.
  *
  * Provides fragmented MP4 streaming for clients.
- * Automatically transcodes video to H.264 and audio to AAC if not supported by client.
+ * Automatically transcodes video to H.264 and audio to AAC (Opus when the client
+ * lists Opus but not AAC) if not supported by client.
  * Client sends supported codecs, server transcodes accordingly.
  * Essential component for building adaptive streaming servers.
  *
@@ -683,7 +685,7 @@ export class FMP4Stream {
         parts.push(FMP4_CODECS.H264);
       }
       if (this.source.audio) {
-        parts.push(FMP4_CODECS.AAC);
+        parts.push(this.audioTranscodeTarget());
       }
       return parts.join(',');
     }
@@ -730,8 +732,7 @@ export class FMP4Stream {
       const needsAudioTranscode = !this.isAudioCodecSupported(audioCodecId);
 
       if (needsAudioTranscode) {
-        // Transcoding to AAC
-        audioCodec = FMP4_CODECS.AAC;
+        audioCodec = this.audioTranscodeTarget();
       } else if (audioCodecId === AV_CODEC_ID_AAC) {
         // AAC - use fixed codec string
         audioCodec = FMP4_CODECS.AAC;
@@ -806,7 +807,7 @@ export class FMP4Stream {
    * Begins the media processing pipeline, reading packets from input,
    * transcoding based on supported codecs, and generating fMP4 chunks.
    * Video transcodes to H.264 if H.264/H.265 not supported.
-   * Audio transcodes to AAC if AAC/FLAC/Opus not supported.
+   * Audio transcodes to AAC (Opus when only Opus is listed) if the input codec is not supported.
    * This method returns immediately after starting the pipeline.
    *
    * @returns Promise that resolves when pipeline is started
@@ -992,20 +993,11 @@ export class FMP4Stream {
     const needsAudioTranscode = audioStream && !this.isAudioCodecSupported(audioStream.codecpar.codecId);
 
     if (needsAudioTranscode) {
-      // Transcode to AAC
       this.audioDecoder = await Decoder.create(audioStream, {
         exitOnError: false,
       });
 
-      const targetSampleRate = 44100;
-      const filterChain = FilterPreset.chain().aformat(AV_SAMPLE_FMT_FLTP, targetSampleRate, 'stereo').build();
-      this.audioFilter = FilterAPI.create(filterChain);
-
-      this.audioEncoder = await Encoder.create(FF_ENCODER_AAC, {
-        decoder: this.audioDecoder,
-        filter: this.audioFilter,
-        options: this.options.audio.encoderOptions,
-      });
+      await this.createAudioEncoder(this.audioDecoder, audioStream.codecpar.channels);
       this.throwIfStopRequested();
     }
 
@@ -1294,15 +1286,8 @@ export class FMP4Stream {
       });
     }
 
-    // Audio encoder (AAC), resampling via aformat like the demuxer path.
     if (source.audio) {
-      const filterChain = FilterPreset.chain().aformat(AV_SAMPLE_FMT_FLTP, 44100, 'stereo').build();
-      this.audioFilter = FilterAPI.create(filterChain);
-
-      this.audioEncoder = await Encoder.create(FF_ENCODER_AAC, {
-        filter: this.audioFilter,
-        options: this.options.audio.encoderOptions,
-      });
+      await this.createAudioEncoder();
     }
     this.throwIfStopRequested();
 
@@ -1618,6 +1603,52 @@ export class FMP4Stream {
     }
 
     return false;
+  }
+
+  /**
+   * Codec that unsupported audio is transcoded to.
+   *
+   * @returns Opus when the client lists Opus but not AAC, otherwise AAC
+   *
+   * @internal
+   */
+  private audioTranscodeTarget(): typeof FMP4_CODECS.AAC | typeof FMP4_CODECS.OPUS {
+    return this.supportedCodecs.has(FMP4_CODECS.OPUS) && !this.supportedCodecs.has(FMP4_CODECS.AAC) ? FMP4_CODECS.OPUS : FMP4_CODECS.AAC;
+  }
+
+  /**
+   * Create the audio filter and encoder for the transcode target.
+   *
+   * AAC is resampled to 44.1 kHz stereo. Opus is resampled to 48 kHz, the only
+   * rate it transmits, keeps mono input mono and uses 20 ms frames.
+   *
+   * @param decoder - Input audio decoder, absent for a frame source
+   *
+   * @param channels - Input channel count, 0 when unknown
+   *
+   * @internal
+   */
+  private async createAudioEncoder(decoder?: Decoder, channels = 0): Promise<void> {
+    if (this.audioTranscodeTarget() === FMP4_CODECS.OPUS) {
+      this.audioFilter = FilterAPI.create(
+        FilterPreset.chain()
+          .aformat(AV_SAMPLE_FMT_FLT, 48000, channels === 1 ? 'mono' : 'stereo')
+          .build(),
+      );
+      this.audioEncoder = await Encoder.create(FF_ENCODER_LIBOPUS, {
+        decoder,
+        filter: this.audioFilter,
+        options: { frame_duration: 20, ...this.options.audio.encoderOptions },
+      });
+      return;
+    }
+
+    this.audioFilter = FilterAPI.create(FilterPreset.chain().aformat(AV_SAMPLE_FMT_FLTP, 44100, 'stereo').build());
+    this.audioEncoder = await Encoder.create(FF_ENCODER_AAC, {
+      decoder,
+      filter: this.audioFilter,
+      options: this.options.audio.encoderOptions,
+    });
   }
 
   /**

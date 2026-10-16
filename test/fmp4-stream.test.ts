@@ -3,7 +3,7 @@ import { existsSync, unlinkSync, writeFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
 
 import { PacketAgeWatchdog } from '../src/api/utilities/packet-age-watchdog.js';
-import { AV_NOPTS_VALUE, Demuxer, FMP4Stream, FormatContext } from '../src/index.js';
+import { AV_CODEC_ID_OPUS, AV_NOPTS_VALUE, Demuxer, FMP4Stream, FormatContext } from '../src/index.js';
 import { getInputFile, getOutputFile, prepareTestEnvironment, stallingFrameSource, syntheticVideoFrame } from './index.js';
 
 import type { Encoder, FMP4Data, FMP4StreamOptions, Frame, MediaFrameSource, MP4Box, Packet } from '../src/index.js';
@@ -893,6 +893,44 @@ describe('FMP4Stream', () => {
       ] as const) {
         assert.equal(await gopOf(getInputFile('hevc-short.mp4'), options), fileGop, `transcoded input, fragDuration ${label}`);
         assert.equal(await gopOf({ video: frames() }, options), framesGop, `frame source, fragDuration ${label}`);
+      }
+    });
+  });
+
+  describe('audio transcode target', () => {
+    it('transcodes to Opus at 48 kHz when the client lists Opus but not AAC', async () => {
+      const outputFile = getOutputFile('fmp4-opus.mp4');
+      const chunks: Buffer[] = [];
+      const closed = Promise.withResolvers<void>();
+
+      const stream = FMP4Stream.create(inputFile, {
+        supportedCodecs: 'avc1,opus', // AAC source -> Opus
+        onData: (data) => chunks.push(Buffer.from(data)),
+        onClose: (error) => (error ? closed.reject(error) : closed.resolve()),
+      });
+
+      await stream.start();
+      assert.equal(stream.getCodecString().split(',').at(-1), 'opus');
+      await withTimeout(closed.promise, 30000);
+      await stream.stop();
+
+      writeFileSync(outputFile, Buffer.concat(chunks));
+
+      try {
+        await using media = await Demuxer.open(outputFile);
+        const audioStream = media.audio();
+        assert.ok(audioStream, 'transcoded output has an audio stream');
+        assert.equal(audioStream.codecpar.codecId, AV_CODEC_ID_OPUS);
+        assert.equal(audioStream.codecpar.sampleRate, 48000);
+        assert.equal(audioStream.codecpar.channels, 2, 'stereo input stays stereo');
+
+        let packets = 0;
+        for await (using packet of media.packets(audioStream.index)) {
+          if (packet) packets++;
+        }
+        assert.ok(packets > 0, 'output carries Opus packets');
+      } finally {
+        if (existsSync(outputFile)) unlinkSync(outputFile);
       }
     });
   });
