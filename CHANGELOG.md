@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [6.2.0-beta.28] - 2026-10-13
+## [6.2.0-beta.30] - 2026-10-16
 
 ### Added
 
@@ -19,6 +19,7 @@ All notable changes to this project will be documented in this file.
 - **`maxPacketAge` on `FMP4Stream`** (seconds, `0` = off). A packet held in the muxer longer than this, measured in real time, ends the session, so broken or missing timestamps can no longer pile up packets without output until memory runs out.
 - **`audioFrameBuffer` option on `Encoder`** (`AudioFrameBufferOptions`, also accepted by `AudioFrameBuffer.create()`). `maxGapFill` (seconds, default 1) is the largest input gap filled with silence; `timestamps: 'samples'` counts the output from 0 as before. Real-time RTP outputs should use `maxGapFill: 0`, as `RTPStream` does.
 - **`output` option on `Scaler.toBuffer()`/`toBufferSync()` and `Frame.toBuffer()`.** The result is written into the caller's `Buffer` instead of a new one; the returned buffer is a view of its first bytes.
+- **`FMP4Stream` transcodes audio to Opus when the client lists Opus but not AAC.** Unsupported input audio is encoded with libopus at 48 kHz in 20 ms frames, mono input stays mono, and `getCodecString()` reports `opus`. With AAC in `supportedCodecs` the target stays AAC as before.
 
 ### Performance
 
