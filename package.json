@@ -139,17 +139,6 @@
     "werift": "^0.25.1",
     "ws": "^8.22.0"
   },
-  "overrides": {
-    "werift": {
-      "@shinyoshiaki/binary-data": "npm:@seydx/binary-data@0.6.2"
-    },
-    "werift-dtls": {
-      "@shinyoshiaki/binary-data": "npm:@seydx/binary-data@0.6.2"
-    },
-    "werift-sctp": {
-      "@shinyoshiaki/binary-data": "npm:@seydx/binary-data@0.6.2"
-    }
-  },
   "bugs": {
     "url": "https://github.com/seydx/node-av/issues"
   },
