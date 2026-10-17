@@ -15,6 +15,8 @@ extern "C" {
 
 namespace ffmpeg {
 
+class FormatContext;
+
 // Exit state ending callback round-trips: one per JS environment (main thread
 // or worker), shared by the callback-backed IOContexts created in it, and one
 // per IOContext for its own callbacks (see CallbackData::abort_state)
@@ -87,6 +89,14 @@ private:
 
   AVIOContext* ctx_ = nullptr;
   AsyncOpCounter async_ops_;
+
+  // The FormatContext using ctx_ as its pb (see FormatContext::pb_io_)
+  FormatContext* pb_of_ = nullptr;
+
+  // Before ctx_ is closed or freed here: clears the pb of the FormatContext
+  // using it, as avio_closep(&ofmt->pb) does in C; false with a pending
+  // exception while that context still reads or writes through it
+  bool DetachFromFormat(Napi::Env env);
   // Custom I/O callback support
   struct CallbackData {
     IOContext* io_context;

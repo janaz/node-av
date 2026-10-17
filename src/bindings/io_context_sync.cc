@@ -128,7 +128,7 @@ Napi::Value IOContext::ClosepSync(const Napi::CallbackInfo& info) {
   }
 
   // Closing while an async op still uses the context would be a use-after-free
-  if (!GuardOps(env)) {
+  if (!GuardOps(env) || !DetachFromFormat(env)) {
     return env.Undefined();
   }
 

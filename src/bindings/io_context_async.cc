@@ -123,7 +123,7 @@ Napi::Value IOContext::ClosepAsync(const Napi::CallbackInfo& info) {
 
   // closep frees the AVIOContext - wait for in-flight async operations first
   // (or error immediately when one is parked on a JS callback)
-  if (!GuardOps(env)) {
+  if (!GuardOps(env) || !DetachFromFormat(env)) {
     return env.Undefined();
   }
 

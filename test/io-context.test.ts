@@ -1804,4 +1804,110 @@ describe('IOContext', () => {
       io.freeContext();
     });
   });
+
+  describe('As the pb of an output FormatContext', () => {
+    // An open2() context set as pb is held by both wrappers, and either may close it:
+    // closep() as avio_closep(&ofmt->pb) does in C, or closing/freeing the output.
+    // Whichever closes it first must clear the other's copy, or it is freed twice.
+    const attach = async (): Promise<{ io: IOContext; ctx: FormatContext }> => {
+      const ctx = new FormatContext();
+      ctx.allocOutputContext2(null, 'mpegts', tempOutputFile);
+      const io = new IOContext();
+      assert.equal(await io.open2(tempOutputFile, AVIO_FLAG_WRITE), 0);
+      ctx.pb = io;
+      await io.write(Buffer.alloc(1024, 1));
+      return { io, ctx };
+    };
+
+    it('closes it once when closep() comes first, as in C', async () => {
+      const { io, ctx } = await attach();
+      assert.equal(await io.closep(), 0);
+      ctx.freeContext();
+      assert.equal(statSync(tempOutputFile).size, 1024);
+    });
+
+    it('closes it once when the output is freed first', async () => {
+      const { io, ctx } = await attach();
+      ctx.freeContext();
+      assert.equal(await io.closep(), 0);
+      assert.equal(statSync(tempOutputFile).size, 1024);
+    });
+
+    it('closes it once after closeOutput()', async () => {
+      const { io, ctx } = await attach();
+      await ctx.closeOutput();
+      assert.equal(io.closepSync(), 0);
+      ctx.freeContext();
+      assert.equal(statSync(tempOutputFile).size, 1024);
+    });
+
+    it('closes it once after closeOutputSync()', async () => {
+      const { io, ctx } = await attach();
+      ctx.closeOutputSync();
+      assert.equal(await io.closep(), 0);
+      ctx.freeContext();
+    });
+
+    it('closes it once after an async dispose of the output', async () => {
+      const { io, ctx } = await attach();
+      await ctx[Symbol.asyncDispose]();
+      assert.equal(await io.closep(), 0);
+    });
+
+    it('closes it once when the output is only finalized at exit', { timeout: 30000 }, async () => {
+      // examples/transcode.ts: closep() and no freeContext(), so the context is freed at teardown
+      const script = `
+        const { FormatContext, IOContext, AVIO_FLAG_WRITE } = await import(${JSON.stringify(new URL('../src/index.ts', import.meta.url).href)});
+        const ctx = new FormatContext();
+        ctx.allocOutputContext2(null, 'mpegts', ${JSON.stringify(tempOutputFile)});
+        const io = new IOContext();
+        await io.open2(${JSON.stringify(tempOutputFile)}, AVIO_FLAG_WRITE);
+        ctx.pb = io;
+        await io.closep();
+        globalThis.keep = ctx;
+        console.log('done');
+      `;
+      const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+        const child = spawn(process.execPath, ['--import', import.meta.resolve('tsx'), '--input-type=module', '-e', script], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
+        child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
+        child.on('close', (code) => resolve({ code, stdout, stderr }));
+      });
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /done/);
+    });
+
+    it('cannot be the pb of two output contexts at once', async () => {
+      const { io, ctx } = await attach();
+      const other = new FormatContext();
+      other.allocOutputContext2(null, 'mpegts', tempOutputFile);
+      assert.throws(() => (other.pb = io), /already the pb of another FormatContext/);
+      ctx.freeContext();
+      // freed with the first context's pb: attaching it again is harmless
+      other.pb = io;
+      other.freeContext();
+      assert.equal(await io.closep(), 0);
+    });
+
+    it('leaves a callback-backed pb to its IOContext on closeOutput()', async () => {
+      let written = 0;
+      const io = new IOContext();
+      io.allocContextWithCallbacks(4096, 1, null, (buffer: Buffer) => {
+        written += buffer.length;
+      });
+      const ctx = new FormatContext();
+      ctx.allocOutputContext2(null, 'mpegts', null);
+      ctx.pb = io;
+      await io.write(Buffer.alloc(1024, 1));
+      await ctx.closeOutput();
+      await io.flush();
+      assert.equal(written, 1024);
+      io.freeContext();
+      ctx.freeContext();
+    });
+  });
 });
