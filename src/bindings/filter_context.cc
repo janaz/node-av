@@ -72,6 +72,15 @@ FilterContext::~FilterContext() {
   }
 }
 
+void FilterContext::SetUnowned(AVFilterContext* ctx) {
+  if (ctx_) {
+    avfilter_free(ctx_);
+  }
+  ctx_ = nullptr;
+  unowned_ctx_ = ctx;
+  BorrowFrom(ctx ? FilterGraph::BorrowersOf(ctx->graph) : nullptr);
+}
+
 Napi::Value FilterContext::Init(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   
@@ -194,6 +203,7 @@ Napi::Value FilterContext::Free(const Napi::CallbackInfo& info) {
     ctx_ = nullptr;
   }
   unowned_ctx_ = nullptr;
+  StopBorrowing();
 
   return env.Undefined();
 }
@@ -590,7 +600,7 @@ Napi::Value FilterContext::GetGraph(const Napi::CallbackInfo& info) {
   }
   
   // Wrap the existing AVFilterGraph in a FilterGraph object
-  // Note: We don't own this graph, it's managed by the filter context
+  // Note: We don't own this graph, the FilterGraph that allocated it does
   Napi::Object graphObj = FilterGraph::constructor.New({});
   FilterGraph* graph = Napi::ObjectWrap<FilterGraph>::Unwrap(graphObj);
   graph->SetUnowned(ctx->graph); // We don't own it

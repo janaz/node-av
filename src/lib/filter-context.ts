@@ -17,6 +17,9 @@ import type { ChannelLayout, IRational } from './types.js';
  * and input/output pads. Supports both software and hardware filtering operations.
  * Essential for building complex filter chains for audio/video processing.
  *
+ * A filter context belongs to its filter graph. Once that graph is freed, the context
+ * reads its defaults (e.g. name null), ignores writes and its frame operations fail.
+ *
  * Direct mapping to FFmpeg's AVFilterContext.
  *
  * @example

@@ -1,7 +1,9 @@
 import assert from 'node:assert';
+import { spawn } from 'node:child_process';
 import { describe, it } from 'node:test';
 
 import {
+  AVERROR_EINVAL,
   AV_CHANNEL_LAYOUT_5POINT1_BACK,
   AV_CHANNEL_LAYOUT_STEREO,
   AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
@@ -1643,6 +1645,163 @@ describe('FilterContext', () => {
       assert.equal(initRet, 0, 'Should initialize with minimal parameters');
 
       graph.free();
+    });
+  });
+
+  describe('After its filter graph is freed', () => {
+    // A FilterContext points into the AVFilterGraph that owns it. Once that is freed it
+    // must read defaults and fail its operations, not touch freed memory.
+    const buildGraph = (): { graph: FilterGraph; src: FilterContext; sink: FilterContext } => {
+      const graph = new FilterGraph();
+      graph.alloc();
+      const src = graph.createFilter(Filter.getByName('buffer')!, 'in', 'video_size=64x64:pix_fmt=0:time_base=1/25:pixel_aspect=1/1')!;
+      const sink = graph.createFilter(Filter.getByName('buffersink')!, 'out')!;
+      assert.equal(src.link(0, sink, 0), 0);
+      assert.equal(graph.configSync(), 0);
+      return { graph, src, sink };
+    };
+
+    const videoFrame = (): Frame => {
+      const frame = new Frame();
+      frame.alloc();
+      frame.width = 64;
+      frame.height = 64;
+      frame.format = AV_PIX_FMT_YUV420P;
+      frame.pts = 0n;
+      assert.equal(frame.getBuffer(), 0);
+      return frame;
+    };
+
+    const assertDetached = (ctx: FilterContext): void => {
+      assert.equal(ctx.name, null);
+      assert.equal(ctx.filter, null);
+      assert.equal(ctx.graph, null);
+      assert.equal(ctx.nbInputs, 0);
+      assert.equal(ctx.nbOutputs, 0);
+      // writes go nowhere
+      ctx.name = 'renamed';
+      assert.equal(ctx.name, null);
+    };
+
+    it('reads defaults after graph.free()', () => {
+      const { graph, src, sink } = buildGraph();
+      const looked = graph.getFilter('out')!;
+      const listed = graph.filters!;
+      const owner = src.graph!;
+      assert.equal(listed.length, 2);
+      graph.free();
+      for (const ctx of [src, sink, looked, ...listed]) {
+        assertDetached(ctx);
+      }
+      assert.equal(owner.nbFilters, 0);
+    });
+
+    it('reads defaults after graph.alloc() replaced the graph', () => {
+      const { graph, src } = buildGraph();
+      graph.alloc();
+      assertDetached(src);
+      graph.free();
+    });
+
+    it('fails its frame operations instead of using the freed graph', async () => {
+      const { graph, src, sink } = buildGraph();
+      graph.free();
+      const frame = videoFrame();
+      assert.throws(() => src.buffersrcAddFrameSync(frame), /not initialized/);
+      assert.throws(() => sink.buffersinkGetFrameSync(frame), /not initialized/);
+      assert.throws(() => sink.buffersinkGetWidth(), /not initialized/);
+      assert.equal(await src.buffersrcAddFrame(frame), AVERROR_EINVAL);
+      assert.equal(await sink.buffersinkGetFrame(frame), AVERROR_EINVAL);
+      frame.free();
+    });
+
+    it('lets in-flight frame operations finish before the graph is freed', async () => {
+      const out = new Frame();
+      out.alloc();
+      for (let i = 0; i < 20; i++) {
+        // free() waits for the worker, so it still runs on the intact graph
+        const first = buildGraph();
+        const queued = videoFrame();
+        const added = first.src.buffersrcAddFrame(queued);
+        first.graph.free();
+        assert.equal(await added, 0);
+        queued.free();
+
+        const second = buildGraph();
+        const pushed = videoFrame();
+        assert.equal(second.src.buffersrcAddFrameSync(pushed), 0);
+        pushed.free();
+        const got = second.sink.buffersinkGetFrame(out);
+        second.graph.free();
+        assert.equal(await got, 0);
+        assert.equal(out.width, 64);
+        out.unref();
+      }
+      out.free();
+    });
+
+    it('frees a segment whose graph was freed', () => {
+      const graph = new FilterGraph();
+      graph.alloc();
+      const segment = graph.segmentParse('scale=320:240,hflip')!;
+      graph.free();
+      assert.throws(() => segment.createFilters(), /Segment is null/);
+      segment.free();
+    });
+
+    it('survives garbage collection of either side first', { timeout: 30000 }, async () => {
+      const script = `
+        const { Filter, FilterGraph, Frame, AV_PIX_FMT_YUV420P } = await import(${JSON.stringify(new URL('../src/index.ts', import.meta.url).href)});
+        const settle = () => new Promise((resolve) => setImmediate(resolve));
+        const collect = async () => { for (let i = 0; i < 5; i++) { globalThis.gc(); await settle(); } };
+        const build = () => {
+          const graph = new FilterGraph();
+          graph.alloc();
+          const src = graph.createFilter(Filter.getByName('buffer'), 'in', 'video_size=64x64:pix_fmt=0:time_base=1/25:pixel_aspect=1/1');
+          const sink = graph.createFilter(Filter.getByName('buffersink'), 'out');
+          src.link(0, sink, 0);
+          graph.configSync();
+          return { graph, src, sink };
+        };
+        const frame = new Frame();
+        frame.alloc();
+        frame.width = 64; frame.height = 64; frame.format = AV_PIX_FMT_YUV420P;
+        frame.getBuffer();
+        // graph collected while its filter contexts live on
+        let { src, sink } = build();
+        await collect();
+        let threw = false;
+        try { src.buffersrcAddFrameSync(frame); } catch { threw = true; }
+        console.log('after graph gc', src.name, sink.nbInputs, threw);
+        // graph collected while a buffersink worker runs on one of them
+        ({ src, sink } = build());
+        src.buffersrcAddFrameSync(frame);
+        const out = new Frame();
+        out.alloc();
+        const pending = sink.buffersinkGetFrame(out);
+        globalThis.gc();
+        await pending;
+        await collect();
+        // filter contexts collected while their graph lives on, then freed
+        const kept = new FilterGraph();
+        kept.alloc();
+        for (let i = 0; i < 100; i++) kept.createFilter(Filter.getByName('null'), 'n' + i);
+        await collect();
+        kept.free();
+        console.log('done');
+      `;
+      const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+        const child = spawn(process.execPath, ['--expose-gc', '--import', import.meta.resolve('tsx'), '--input-type=module', '-e', script], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
+        child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
+        child.on('close', (code) => resolve({ code, stdout, stderr }));
+      });
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /after graph gc null 0 true\ndone/);
     });
   });
 });

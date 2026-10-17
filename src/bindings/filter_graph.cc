@@ -56,7 +56,37 @@ FilterGraph::FilterGraph(const Napi::CallbackInfo& info)
 }
 
 FilterGraph::~FilterGraph() {
-  avfilter_graph_free(&graph_);
+  // Its filter contexts can outlive this object and still run a
+  // buffersrc/buffersink worker on the graph
+  borrowers_->BorrowerOps().WaitIdle();
+  FreeGraph();
+}
+
+void FilterGraph::SetUnowned(AVFilterGraph* graph) {
+  FreeGraph();
+  unowned_graph_ = graph;
+  BorrowFrom(BorrowersOf(graph));
+}
+
+std::shared_ptr<BorrowRegistry> FilterGraph::BorrowersOf(const AVFilterGraph* graph) {
+  if (!graph || !graph->opaque) {
+    return nullptr;
+  }
+  return static_cast<FilterGraph*>(graph->opaque)->borrowers_;
+}
+
+bool FilterGraph::GuardWorkers(Napi::Env env) {
+  // config/requestOldest on the graph itself, buffersrc/buffersink on its
+  // filter contexts
+  return GuardAsyncOps(env, async_ops_, "FilterGraph") &&
+         GuardAsyncOps(env, borrowers_->BorrowerOps(), "FilterGraph");
+}
+
+void FilterGraph::FreeGraph() {
+  if (graph_) {
+    borrowers_->InvalidateAll();
+    avfilter_graph_free(&graph_);
+  }
 }
 
 Napi::Value FilterGraph::Alloc(const Napi::CallbackInfo& info) {
@@ -64,19 +94,24 @@ Napi::Value FilterGraph::Alloc(const Napi::CallbackInfo& info) {
 
   // Replacing the graph frees the old one - wait for in-flight async
   // operations first
-  if (graph_ && !GuardAsyncOps(env, async_ops_, "FilterGraph")) {
+  if (graph_ && !GuardWorkers(env)) {
     return env.Undefined();
   }
 
-  avfilter_graph_free(&graph_);
+  FreeGraph();
 
   graph_ = avfilter_graph_alloc();
   unowned_graph_ = nullptr;
+  StopBorrowing();
 
   if (!graph_) {
     Napi::Error::New(env, "Failed to allocate filter graph").ThrowAsJavaScriptException();
     return env.Undefined();
   }
+
+  // Lets wrappers of its filters find this owner (libavfilter never touches
+  // opaque)
+  graph_->opaque = this;
 
   return env.Undefined();
 }
@@ -84,16 +119,18 @@ Napi::Value FilterGraph::Alloc(const Napi::CallbackInfo& info) {
 Napi::Value FilterGraph::Free(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
 
-  if (graph_ || unowned_graph_) {
-    // Freeing (or detaching) while a config/requestOldest worker still uses
-    // the graph on the threadpool would be a use-after-free; wait bounded,
-    // then error instead of crashing
-    if (!GuardAsyncOps(env, async_ops_, "FilterGraph")) {
-      return env.Undefined();
-    }
+  // Freeing (or detaching) while a worker still uses the graph on the
+  // threadpool would be a use-after-free; wait bounded, then error instead of
+  // crashing
+  if (graph_ && !GuardWorkers(env)) {
+    return env.Undefined();
   }
-  avfilter_graph_free(&graph_);
+  if (unowned_graph_ && !GuardAsyncOps(env, async_ops_, "FilterGraph")) {
+    return env.Undefined();
+  }
+  FreeGraph();
   unowned_graph_ = nullptr;
+  StopBorrowing();
 
   return env.Undefined();
 }

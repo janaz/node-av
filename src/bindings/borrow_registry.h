@@ -4,19 +4,23 @@
 #include <memory>
 #include <unordered_set>
 
+#include "promise_worker.h"
+
 namespace ffmpeg {
 
 class BorrowRegistry;
 
 // A wrapper pointing into memory another native object owns: a Stream into
 // its AVFormatContext, a CodecParameters into a stream's or bitstream filter's
-// codecpar. The JS object can outlive that memory, so the owner invalidates
-// its borrowers before freeing it, and they read their defaults afterwards
-// instead of freed memory.
+// codecpar, a FilterContext into its AVFilterGraph. The JS object can outlive
+// that memory, so the owner invalidates its borrowers before freeing it, and
+// they read their defaults afterwards instead of freed memory.
 //
 // JS thread only: borrowers are created, used and finalized there, and owners
 // invalidate them there before the memory is freed (also before handing it to
-// a worker that frees it), so neither side needs a lock.
+// a worker that frees it), so neither side needs a lock. Threadpool work a
+// borrower runs on that memory holds the registry's BorrowerOps(), which the
+// owner waits for first.
 class Borrower {
 public:
   Borrower() = default;
@@ -59,9 +63,14 @@ public:
     }
   }
 
+  // Held by borrowers' threadpool work on the owner's memory; the owner waits
+  // for it before invalidating them and freeing that memory
+  AsyncOpCounter& BorrowerOps() { return borrower_ops_; }
+
 private:
   friend class Borrower;
   std::unordered_set<Borrower*> borrowers_;
+  AsyncOpCounter borrower_ops_;
 };
 
 inline Borrower::~Borrower() {

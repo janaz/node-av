@@ -30,8 +30,15 @@ FilterGraphSegment::~FilterGraphSegment() {
   avfilter_graph_segment_free(&segment_);
 }
 
+void FilterGraphSegment::SetSegment(AVFilterGraphSegment* segment) {
+  avfilter_graph_segment_free(&segment_);
+  segment_ = segment;
+  BorrowFrom(segment ? FilterGraph::BorrowersOf(segment->graph) : nullptr);
+}
+
 Napi::Value FilterGraphSegment::Free(const Napi::CallbackInfo& info) {
   avfilter_graph_segment_free(&segment_);
+  StopBorrowing();
   return info.Env().Undefined();
 }
 

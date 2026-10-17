@@ -27,9 +27,14 @@ public:
     if (frame && frameVal.IsObject()) {
       frame_ref_.Reset(frameVal.As<Napi::Object>(), 1);
     }
-    // Mark the context and the frame busy so free()/unref() waits instead of
-    // pulling memory out from under the operation (see promise_worker.h)
+    // Mark the context, the graph owning it and the frame busy so
+    // free()/unref() waits instead of pulling memory out from under the
+    // operation (see promise_worker.h)
     ctx_->async_ops_.Begin();
+    graph_borrowers_ = ctx_->BorrowedFrom();
+    if (graph_borrowers_) {
+      graph_borrowers_->BorrowerOps().Begin();
+    }
     if (frame_) {
       frame_->async_ops_.Begin();
     }
@@ -78,6 +83,9 @@ private:
     }
     ops_ended_ = true;
     ctx_->async_ops_.End();
+    if (graph_borrowers_) {
+      graph_borrowers_->BorrowerOps().End();
+    }
     if (frame_) {
       frame_->async_ops_.End();
     }
@@ -86,6 +94,7 @@ private:
   Napi::ObjectReference ctx_ref_;
   Napi::ObjectReference frame_ref_;
   FilterContext* ctx_;
+  std::shared_ptr<BorrowRegistry> graph_borrowers_;
   Frame* frame_;
   int flags_;
   int ret_;
@@ -105,9 +114,14 @@ public:
     // Hold references to prevent GC during async operation
     ctx_ref_.Reset(ctxObj, 1);
     frame_ref_.Reset(frameObj, 1);
-    // Mark the context and the frame busy so free()/unref() waits instead of
-    // pulling memory out from under the operation (see promise_worker.h)
+    // Mark the context, the graph owning it and the frame busy so
+    // free()/unref() waits instead of pulling memory out from under the
+    // operation (see promise_worker.h)
     ctx_->async_ops_.Begin();
+    graph_borrowers_ = ctx_->BorrowedFrom();
+    if (graph_borrowers_) {
+      graph_borrowers_->BorrowerOps().Begin();
+    }
     frame_->async_ops_.Begin();
   }
 
@@ -160,12 +174,16 @@ private:
     }
     ops_ended_ = true;
     ctx_->async_ops_.End();
+    if (graph_borrowers_) {
+      graph_borrowers_->BorrowerOps().End();
+    }
     frame_->async_ops_.End();
   }
 
   Napi::ObjectReference ctx_ref_;
   Napi::ObjectReference frame_ref_;
   FilterContext* ctx_;
+  std::shared_ptr<BorrowRegistry> graph_borrowers_;
   Frame* frame_;
   int ret_;
   bool ops_ended_ = false;

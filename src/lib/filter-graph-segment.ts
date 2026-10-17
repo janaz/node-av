@@ -8,6 +8,7 @@ import type { NativeFilterGraphSegment } from './native-types.js';
  * This allows filter contexts to be configured after creation but before initialization.
  * The workflow involves parsing the filter description, creating filter instances,
  * applying options, and finally initializing and linking the filters.
+ * Freeing the graph it was parsed into also frees the segment.
  *
  * Direct mapping to FFmpeg's AVFilterGraphSegment.
  *
