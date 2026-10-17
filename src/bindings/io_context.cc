@@ -317,26 +317,35 @@ IOContext::IOContext(const Napi::CallbackInfo& info)
 }
 
 IOContext::~IOContext() {
-  // The FormatContext keeps using ctx_ and closes it when it closes its pb
+  // Never freed or closed explicitly (e.g. the input of a demuxer dropped
+  // without close()). Free ctx_ here unless the FormatContext using it as its
+  // pb closes it (an output's pb opened with open2()). Threadpool work still
+  // using it keeps it alive instead, as freeing it then would be a
+  // use-after-free; nothing can start new work from inside a finalizer.
+  bool format_closes = pb_of_ && pb_of_->ctx_ && pb_of_->ctx_->pb == ctx_ && pb_of_->ClosesPb();
+  bool busy = async_ops_.Active() > 0 || (pb_of_ && (pb_of_->reader_ || pb_of_->async_ops_.Active() > 0));
+  bool frees = ctx_ && !format_closes && !busy;
   if (pb_of_) {
+    if (frees && pb_of_->ctx_ && pb_of_->ctx_->pb == ctx_) {
+      pb_of_->ctx_->pb = nullptr;
+    }
     pb_of_->pb_io_ = nullptr;
     pb_of_ = nullptr;
   }
 
-  // Clean up callbacks first
+  // Opened with avio_open2(): its opaque is the protocol handle to close
+  bool opened = ctx_ && !callback_data_ && ctx_->opaque;
   CleanupCallbacks();
-  
-  // Don't automatically free anything in destructor
-  // The user must explicitly call freeContext() or closep()
-  // This prevents double-free when FormatContext cleans up
-  
-  // if (ctx_) {
-  //   #ifdef DEBUG
-  //   fprintf(stderr, "WARNING: IOContext destructor called with non-null ctx_. Call freeContext() or closep() explicitly.\n");
-  //   #endif
-  // }
-  
-  // Clear pointer without freeing
+
+  if (frees) {
+    if (opened) {
+      avio_closep(&ctx_);
+    } else {
+      // avio_context_free does not free the I/O buffer
+      av_free(ctx_->buffer);
+      avio_context_free(&ctx_);
+    }
+  }
   ctx_ = nullptr;
 }
 

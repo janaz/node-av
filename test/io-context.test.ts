@@ -1910,4 +1910,57 @@ describe('IOContext', () => {
       ctx.freeContext();
     });
   });
+
+  describe('When never freed or closed', () => {
+    it('frees it once it is garbage collected, alone or together with its output', { timeout: 30000 }, async () => {
+      const script = `
+        const { FormatContext, IOContext, AVIO_FLAG_WRITE } = await import(${JSON.stringify(new URL('../src/index.ts', import.meta.url).href)});
+        const { statSync } = await import('node:fs');
+        const file = ${JSON.stringify(tempOutputFile)};
+        const settle = async () => {
+          for (let i = 0; i < 8; i++) { globalThis.gc(); await new Promise((resolve) => setImmediate(resolve)); }
+        };
+        // Alone: closed (and so flushed) when collected
+        await (async () => {
+          const io = new IOContext();
+          await io.open2(file, AVIO_FLAG_WRITE);
+          await io.write(Buffer.alloc(1000, 1));
+        })();
+        await settle();
+        console.log('alone', statSync(file).size);
+        // As a pb: collected with its output in either order, closed by whichever owns it
+        for (let i = 0; i < 20; i++) {
+          (() => {
+            const ctx = new FormatContext();
+            ctx.allocOutputContext2(null, 'mpegts', file);
+            const io = new IOContext();
+            io.open2Sync(file, AVIO_FLAG_WRITE);
+            ctx.pb = io;
+            io.writeSync(Buffer.alloc(1024, 1));
+          })();
+          (() => {
+            const ctx = new FormatContext();
+            ctx.allocOutputContext2(null, 'mpegts', null);
+            const io = new IOContext();
+            io.allocContextWithCallbacks(4096, 1, null, (buffer) => buffer.length);
+            ctx.pb = io;
+          })();
+        }
+        await settle();
+        console.log('pb', statSync(file).size);
+      `;
+      const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+        const child = spawn(process.execPath, ['--expose-gc', '--import', import.meta.resolve('tsx'), '--input-type=module', '-e', script], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
+        child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
+        child.on('close', (code) => resolve({ code, stdout, stderr }));
+      });
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /alone 1000\npb 1024/);
+    });
+  });
 });
