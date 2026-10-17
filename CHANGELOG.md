@@ -103,6 +103,7 @@ All notable changes to this project will be documented in this file.
 - **`FilterInOut` nodes no longer use freed memory once the head of their list is freed.** Nodes reached through `next` and lists appended to another read their defaults (`name` null) and ignore writes afterwards.
 - **An `IOContext` opened with `open2()` and set as an output's `pb` is closed exactly once.** Both the `IOContext` and the `FormatContext` closed it, so `closep()` followed by `freeContext()` (the order of FFmpeg's `transcode.c`, and of `examples/transcode.ts`) or the reverse freed it twice and crashed the process. Whichever closes it first now clears the other's copy: `closep()` also clears the context's `pb`, as `avio_closep(&ctx->pb)` does in C. An `IOContext` can be the `pb` of only one `FormatContext` at a time; assigning it to a second one throws.
 - **`closeOutput()` leaves a callback-backed `pb` to its `IOContext`**, as `closeOutputSync()` already did. It closed it with `avio_closep()`, which treats the callback opaque as a protocol handle.
+- **A `Demuxer` opened from a `Readable` and dropped without `close()` no longer leaks its I/O context.** The demuxer itself was garbage collected, but the `IOContext` reading the stream stayed reachable through its own read callback, together with the stream and its buffered data ([#372](https://github.com/seydx/node-av/issues/372)).
 
 ## [6.1.1] - 2026-07-06
 

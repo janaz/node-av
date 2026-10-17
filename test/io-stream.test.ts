@@ -1,4 +1,5 @@
 import assert from 'node:assert';
+import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { Readable, Writable } from 'node:stream';
 import { describe, it } from 'node:test';
@@ -135,6 +136,35 @@ describe('IOStream', () => {
       assert.equal(readable.listenerCount('end'), 0, 'end listener should be removed');
       assert.equal(readable.listenerCount('error'), 0, 'error listener should be removed');
       assert.equal(readable.listenerCount('close'), 0, 'close listener should be removed');
+    });
+
+    it('should let an I/O context that is never freed be garbage collected', { timeout: 30000 }, async () => {
+      // E.g. a demuxer dropped without close(): neither the native callbacks nor
+      // the stream's listeners may keep the I/O context alive
+      const script = `
+        const { IOStream } = await import(${JSON.stringify(new URL('../src/index.ts', import.meta.url).href)});
+        const { Readable } = await import('node:stream');
+        const settle = () => new Promise((resolve) => setImmediate(resolve));
+        let collected = false;
+        const registry = new FinalizationRegistry(() => (collected = true));
+        const readable = new Readable({ read() {} });
+        readable.push(Buffer.from('0123456789'));
+        registry.register(IOStream.create(readable), 'io');
+        for (let i = 0; i < 10 && !collected; i++) { globalThis.gc(); await settle(); }
+        console.log('collected', collected);
+      `;
+      const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+        const child = spawn(process.execPath, ['--expose-gc', '--import', import.meta.resolve('tsx'), '--input-type=module', '-e', script], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
+        child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
+        child.on('close', (code) => resolve({ code, stdout, stderr }));
+      });
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /collected true/);
     });
   });
 
