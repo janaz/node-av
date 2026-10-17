@@ -121,7 +121,7 @@
     "cpy-cli": "^7.0.0",
     "cross-env": "^10.1.0",
     "eslint": "9.39.2",
-    "eslint-plugin-jsdoc": "^65.3.6",
+    "eslint-plugin-jsdoc": "^65.3.11",
     "globals": "^17.13.0",
     "node-addon-api": "^8.9.2",
     "node-gyp": "^13.1.0",
@@ -136,7 +136,7 @@
     "typescript-eslint": "^8.71.2",
     "updates": "^19.2.1",
     "vitepress": "^2.0.0-alpha.20",
-    "werift": "^0.25.0",
+    "werift": "^0.25.1",
     "ws": "^8.22.0"
   },
   "overrides": {
