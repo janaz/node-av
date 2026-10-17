@@ -101,8 +101,10 @@ Napi::Value FilterGraphSegment::Apply(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  AVFilterInOut* inputs = inputs_obj->Get();
-  AVFilterInOut* outputs = outputs_obj->Get();
+  // Pure out-parameters: the unlinked pads come back as new lists the caller
+  // owns and must free
+  AVFilterInOut* inputs = nullptr;
+  AVFilterInOut* outputs = nullptr;
 
   int flags = 0;
   if (info.Length() > 2 && info[2].IsNumber()) {
@@ -111,9 +113,8 @@ Napi::Value FilterGraphSegment::Apply(const Napi::CallbackInfo& info) {
 
   int ret = avfilter_graph_segment_apply(segment_, flags, &inputs, &outputs);
 
-  // Update the FilterInOut objects with potentially modified pointers
-  inputs_obj->SetUnowned(inputs);
-  outputs_obj->SetUnowned(outputs);
+  inputs_obj->SetOwned(inputs);
+  outputs_obj->SetOwned(outputs);
 
   return Napi::Number::New(env, ret);
 }

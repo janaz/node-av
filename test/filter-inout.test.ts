@@ -1,4 +1,5 @@
 import assert from 'node:assert';
+import { spawn } from 'node:child_process';
 import { describe, it } from 'node:test';
 
 import { Filter, FilterContext, FilterGraph, FilterInOut } from '../src/lib/index.js';
@@ -620,6 +621,147 @@ describe('FilterInOut', () => {
 
       head?.free();
       graph.free();
+    });
+  });
+
+  describe('Ownership', () => {
+    // A wrapper from `next`, or a list appended to another, points into the list its head
+    // owns. Once the head frees it, those wrappers must read defaults, not freed memory.
+    const node = (name: string): FilterInOut => {
+      const inout = new FilterInOut();
+      inout.alloc();
+      inout.name = name;
+      return inout;
+    };
+
+    const assertDetached = (inout: FilterInOut): void => {
+      assert.equal(inout.name, null);
+      assert.equal(inout.next, null);
+      assert.equal(inout.filterCtx, null);
+      assert.equal(inout.padIdx, 0);
+      // writes go nowhere
+      inout.name = 'renamed';
+      assert.equal(inout.name, null);
+    };
+
+    it('leaves next elements reading defaults once the head is freed', () => {
+      const head = node('a');
+      head.next = node('b');
+      head.next.next = node('c');
+      const second = head.next;
+      const third = second.next!;
+      assert.equal(third.name, 'c');
+      head.free();
+      assertDetached(second);
+      assertDetached(third);
+    });
+
+    it('leaves next elements reading defaults once the head is reallocated', () => {
+      const head = node('a');
+      head.next = node('b');
+      const second = head.next;
+      head.alloc();
+      assertDetached(second);
+      head.free();
+    });
+
+    it('hands wrappers into an appended list over to the new head', () => {
+      const tail = node('b');
+      tail.next = node('c');
+      const third = tail.next;
+      const head = node('a');
+      head.next = tail;
+      assert.equal(head.count(), 3);
+      head.free();
+      assertDetached(tail);
+      assertDetached(third);
+    });
+
+    it('frees the lists segment.apply() returns', () => {
+      const graph = new FilterGraph();
+      graph.alloc();
+      const segment = graph.segmentParse('[a][b]overlay[c]')!;
+      const inputs = new FilterInOut();
+      const outputs = new FilterInOut();
+      assert.equal(segment.apply(inputs, outputs), 0);
+      const second = inputs.next!;
+      assert.equal(second.name, 'b');
+      assert.equal(outputs.name, 'c');
+      inputs.free();
+      outputs.free();
+      assertDetached(second);
+      segment.free();
+      graph.free();
+    });
+
+    const overlayGraph = (): { graph: FilterGraph; inputs: FilterInOut; outputs: FilterInOut } => {
+      const graph = new FilterGraph();
+      graph.alloc();
+      const args = 'video_size=64x64:pix_fmt=0:time_base=1/25:pixel_aspect=1/1';
+      const src0 = graph.createFilter(Filter.getByName('buffer')!, 'src0', args)!;
+      const src1 = graph.createFilter(Filter.getByName('buffer')!, 'src1', args)!;
+      const sink = graph.createFilter(Filter.getByName('buffersink')!, 'sink')!;
+      // the open outputs of the existing filters feed the parsed chain's inputs
+      const outputs = FilterInOut.createList([
+        { name: 'in0', filterCtx: src0, padIdx: 0 },
+        { name: 'in1', filterCtx: src1, padIdx: 0 },
+      ])!;
+      const inputs = FilterInOut.createList([{ name: 'out', filterCtx: sink, padIdx: 0 }])!;
+      return { graph, inputs, outputs };
+    };
+
+    it('passes whole lists to parsePtr() and keeps them', () => {
+      const { graph, inputs, outputs } = overlayGraph();
+      assert.equal(graph.parsePtr('[in0][in1]overlay[out]', inputs, outputs), 0);
+      assert.equal(graph.configSync(), 0);
+      assert.equal(outputs.name, 'in0');
+      assert.equal(outputs.next?.name, 'in1');
+      inputs.free();
+      outputs.free();
+      graph.free();
+    });
+
+    it('keeps the lists passed to parse()', () => {
+      const { graph, inputs, outputs } = overlayGraph();
+      assert.equal(graph.parse('[in0][in1]overlay[out]', inputs, outputs), 0);
+      assert.equal(graph.configSync(), 0);
+      assert.equal(outputs.next?.name, 'in1');
+      inputs.free();
+      outputs.free();
+      graph.free();
+    });
+
+    it('survives garbage collection of the head first', { timeout: 30000 }, async () => {
+      const script = `
+        const { FilterInOut } = await import(${JSON.stringify(new URL('../src/index.ts', import.meta.url).href)});
+        const settle = () => new Promise((resolve) => setImmediate(resolve));
+        const build = () => {
+          const head = new FilterInOut();
+          head.alloc();
+          head.name = 'a';
+          const tail = new FilterInOut();
+          tail.alloc();
+          tail.name = 'b';
+          head.next = tail;
+          return head.next;
+        };
+        const second = build();
+        for (let i = 0; i < 5; i++) { globalThis.gc(); await settle(); }
+        console.log('after head gc', second.name);
+        console.log('done');
+      `;
+      const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+        const child = spawn(process.execPath, ['--expose-gc', '--import', import.meta.resolve('tsx'), '--input-type=module', '-e', script], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
+        child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
+        child.on('close', (code) => resolve({ code, stdout, stderr }));
+      });
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /after head gc null\ndone/);
     });
   });
 });

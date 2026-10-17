@@ -11,6 +11,10 @@ import type { NativeFilterInOut, NativeWrapper } from './native-types.js';
  * label for connecting filters together. Used internally by avfilter_graph_parse()
  * to track unlinked filter pads during graph construction.
  *
+ * The head of a list owns all of its nodes, including lists appended through
+ * `next`. Once the head is freed, the other nodes read their defaults (e.g. name
+ * null) and ignore writes.
+ *
  * Direct mapping to FFmpeg's AVFilterInOut.
  *
  * @example

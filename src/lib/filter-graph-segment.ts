@@ -100,9 +100,9 @@ export class FilterGraphSegment implements Disposable {
    *
    * Direct mapping to avfilter_graph_segment_apply().
    *
-   * @param inputs - Input filter pads
+   * @param inputs - Receives the unlinked input pads; free it when done
    *
-   * @param outputs - Output filter pads
+   * @param outputs - Receives the unlinked output pads; free it when done
    *
    * @param flags - Apply flags (default: 0)
    *

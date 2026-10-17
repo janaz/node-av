@@ -248,6 +248,13 @@ Napi::Value FilterGraph::GetFilter(const Napi::CallbackInfo& info) {
   return ctxObj;
 }
 
+// Copies the list a FilterInOut argument holds; anything else means no list
+static int CopyInOutArg(Napi::Env env, const Napi::Value& value, AVFilterInOut** copy) {
+  *copy = nullptr;
+  FilterInOut* inout = UnwrapNativeObject<FilterInOut>(env, value, "FilterInOut");
+  return inout ? FilterInOut::CopyList(inout->Get(), copy) : 0;
+}
+
 Napi::Value FilterGraph::Parse(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   
@@ -264,42 +271,21 @@ Napi::Value FilterGraph::Parse(const Napi::CallbackInfo& info) {
   
   std::string filters = info[0].As<Napi::String>().Utf8Value();
   
-  // Extract inputs and outputs FilterInOut objects
+  // avfilter_graph_parse() frees the lists it gets: hand it copies so the
+  // FilterInOut objects keep theirs
   AVFilterInOut* inputs = nullptr;
   AVFilterInOut* outputs = nullptr;
-  
-  if (!info[1].IsNull() && !info[1].IsUndefined()) {
-    FilterInOut* inObj = UnwrapNativeObject<FilterInOut>(env, info[1], "FilterInOut");
-    if (inObj) {
-      inputs = inObj->Get();
-    }
+  int ret = CopyInOutArg(env, info[1], &inputs);
+  if (ret >= 0) {
+    ret = CopyInOutArg(env, info[2], &outputs);
   }
-  
-  if (!info[2].IsNull() && !info[2].IsUndefined()) {
-    FilterInOut* outObj = UnwrapNativeObject<FilterInOut>(env, info[2], "FilterInOut");
-    if (outObj) {
-      outputs = outObj->Get();
-    }
+  if (ret < 0) {
+    avfilter_inout_free(&inputs);
+    return Napi::Number::New(env, ret);
   }
-  
-  int ret = avfilter_graph_parse(graph, filters.c_str(), inputs, outputs, nullptr);
-  
-  // avfilter_graph_parse consumes the FilterInOut structures
-  // Mark them as consumed so JavaScript won't try to free them again
-  if (!info[1].IsNull() && !info[1].IsUndefined()) {
-    FilterInOut* inObj = UnwrapNativeObject<FilterInOut>(env, info[1], "FilterInOut");
-    if (inObj) {
-      inObj->MarkAsConsumed();
-    }
-  }
-  
-  if (!info[2].IsNull() && !info[2].IsUndefined()) {
-    FilterInOut* outObj = UnwrapNativeObject<FilterInOut>(env, info[2], "FilterInOut");
-    if (outObj) {
-      outObj->MarkAsConsumed();
-    }
-  }
-  
+
+  ret = avfilter_graph_parse(graph, filters.c_str(), inputs, outputs, nullptr);
+
   return Napi::Number::New(env, ret);
 }
 
@@ -348,52 +334,18 @@ Napi::Value FilterGraph::ParsePtr(const Napi::CallbackInfo& info) {
   std::string filters = info[0].As<Napi::String>().Utf8Value();
   const char* filter_ptr = filters.c_str();
   
+  // avfilter_graph_parse_ptr() consumes the lists it gets and returns the
+  // unlinked rest: hand it copies of the whole lists so the FilterInOut
+  // objects keep theirs
   AVFilterInOut* inputs = nullptr;
   AVFilterInOut* outputs = nullptr;
-  
-  // If FilterInOut objects are provided, create copies since avfilter_graph_parse_ptr 
-  // will take ownership and free them
-  if (info.Length() >= 3) {
-    // Get the inputs FilterInOut
-    if (!info[1].IsNull() && !info[1].IsUndefined()) {
-      FilterInOut* inObj = UnwrapNativeObject<FilterInOut>(env, info[1], "FilterInOut");
-      if (inObj && inObj->Get()) {
-        // Create a copy since avfilter_graph_parse_ptr will consume it
-        AVFilterInOut* orig = inObj->Get();
-        inputs = avfilter_inout_alloc();
-        if (inputs) {
-          inputs->name = orig->name ? av_strdup(orig->name) : nullptr;
-          inputs->filter_ctx = orig->filter_ctx;
-          inputs->pad_idx = orig->pad_idx;
-          inputs->next = nullptr; // Don't copy the chain for now
-        }
-        // Mark the original as consumed since we've taken its data
-        inObj->MarkAsConsumed();
-      }
-    }
-    
-    // Get the outputs FilterInOut
-    if (!info[2].IsNull() && !info[2].IsUndefined()) {
-      FilterInOut* outObj = UnwrapNativeObject<FilterInOut>(env, info[2], "FilterInOut");
-      if (outObj && outObj->Get()) {
-        // Create a copy since avfilter_graph_parse_ptr will consume it
-        AVFilterInOut* orig = outObj->Get();
-        outputs = avfilter_inout_alloc();
-        if (outputs) {
-          outputs->name = orig->name ? av_strdup(orig->name) : nullptr;
-          outputs->filter_ctx = orig->filter_ctx;
-          outputs->pad_idx = orig->pad_idx;
-          outputs->next = nullptr; // Don't copy the chain for now
-        }
-        // Mark the original as consumed since we've taken its data
-        outObj->MarkAsConsumed();
-      }
-    }
+  int ret = CopyInOutArg(env, info[1], &inputs);
+  if (ret >= 0) {
+    ret = CopyInOutArg(env, info[2], &outputs);
   }
-  
-  // Call avfilter_graph_parse_ptr with pointers to the pointers
-  // This function will modify/free the inputs and outputs pointers
-  int ret = avfilter_graph_parse_ptr(graph, filter_ptr, &inputs, &outputs, nullptr);
+  if (ret >= 0) {
+    ret = avfilter_graph_parse_ptr(graph, filter_ptr, &inputs, &outputs, nullptr);
+  }
   
   // Clean up any remaining structures (in case of error or unconnected pads)
   avfilter_inout_free(&inputs);

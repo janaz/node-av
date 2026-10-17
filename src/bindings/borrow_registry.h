@@ -12,9 +12,10 @@ class BorrowRegistry;
 
 // A wrapper pointing into memory another native object owns: a Stream into
 // its AVFormatContext, a CodecParameters into a stream's or bitstream filter's
-// codecpar, a FilterContext into its AVFilterGraph. The JS object can outlive
-// that memory, so the owner invalidates its borrowers before freeing it, and
-// they read their defaults afterwards instead of freed memory.
+// codecpar, a FilterContext into its AVFilterGraph, a FilterInOut into the
+// list another FilterInOut owns. The JS object can outlive that memory, so the
+// owner invalidates its borrowers before freeing it, and they read their
+// defaults afterwards instead of freed memory.
 //
 // JS thread only: borrowers are created, used and finalized there, and owners
 // invalidate them there before the memory is freed (also before handing it to
@@ -60,6 +61,19 @@ public:
     for (Borrower* borrower : borrowers) {
       borrower->registry_.reset();
       borrower->Invalidate();
+    }
+  }
+
+  // Hands every current borrower over to `owner` when the memory they point
+  // into changes hands (e.g. a FilterInOut list appended to another)
+  void MoveTo(const std::shared_ptr<BorrowRegistry>& owner) {
+    std::unordered_set<Borrower*> borrowers;
+    borrowers.swap(borrowers_);
+    for (Borrower* borrower : borrowers) {
+      borrower->registry_ = owner;
+      if (owner) {
+        owner->borrowers_.insert(borrower);
+      }
     }
   }
 

@@ -419,8 +419,9 @@ async function init_filter(fctx: FilteringContext, dec_ctx: CodecContext, enc_ct
   fctx.filter_graph = filter_graph;
 
   function goto_end() {
-    // parsePtr consumes inputs and outputs, so we don't need to free them
-    // The bindings already handle the cleanup internally
+    // parsePtr works on copies of the lists, so ours are still ours to free
+    inputs.free();
+    outputs.free();
   }
 
   goto_end();
