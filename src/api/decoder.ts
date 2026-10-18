@@ -422,10 +422,10 @@ export class Decoder implements Disposable {
       ) {
         // First argument is a codec
         explicitCodec = optionsOrCodec;
-        options = maybeOptions ?? {};
+        options = { ...maybeOptions };
       } else {
-        // First argument is options
-        options = optionsOrCodec;
+        // First argument is options (copied: create() fills in defaults)
+        options = { ...optionsOrCodec };
       }
     }
 
@@ -616,10 +616,10 @@ export class Decoder implements Disposable {
       ) {
         // First argument is a codec
         explicitCodec = optionsOrCodec;
-        options = maybeOptions ?? {};
+        options = { ...maybeOptions };
       } else {
-        // First argument is options
-        options = optionsOrCodec;
+        // First argument is options (copied: create() fills in defaults)
+        options = { ...optionsOrCodec };
       }
     }
 

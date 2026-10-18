@@ -1400,6 +1400,19 @@ describe('Encoder', () => {
     });
   });
 
+  describe('options object', () => {
+    it('should leave the options object it was given unchanged', async () => {
+      const options = { gopSize: 30 };
+      const audio = await Encoder.create(FF_ENCODER_AAC, options);
+      const video = Encoder.createSync(FF_ENCODER_LIBX264, options);
+      // bitrate used to be written back as a default, so the audio encoder's
+      // 128k ended up in the video encoder
+      assert.deepEqual(options, { gopSize: 30 });
+      video.close();
+      audio.close();
+    });
+  });
+
   describe('frame rate', () => {
     it("should take the stream's guessed frame rate when the decoder has none", { timeout: 60000 }, async () => {
       // VP9 carries no frame rate in its bitstream: the decoder reports 0/1, the

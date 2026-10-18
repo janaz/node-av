@@ -263,12 +263,9 @@ export class RTPStream {
 
     this.signal = options.signal;
 
-    options.supportedVideoCodecs = options.supportedVideoCodecs?.filter(Boolean);
-    options.supportedAudioCodecs = options.supportedAudioCodecs?.filter(Boolean);
-
     // If no supported codecs specified, empty set means ALL codecs are supported (passthrough only)
-    this.supportedVideoCodecs = new Set(options.supportedVideoCodecs && options.supportedVideoCodecs.length > 0 ? options.supportedVideoCodecs : []);
-    this.supportedAudioCodecs = new Set(options.supportedAudioCodecs && options.supportedAudioCodecs.length > 0 ? options.supportedAudioCodecs : []);
+    this.supportedVideoCodecs = new Set(options.supportedVideoCodecs?.filter(Boolean));
+    this.supportedAudioCodecs = new Set(options.supportedAudioCodecs?.filter(Boolean));
 
     this.options = {
       onVideoPacket: options.onVideoPacket ?? (() => {}),

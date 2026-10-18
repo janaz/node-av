@@ -501,6 +501,9 @@ export class Encoder implements Disposable {
    * @see {@link createSync} For synchronous version
    */
   static async create<const C extends FFEncoderCodec | AVCodecID | Codec>(encoderCodec: C, options: EncoderOptions<C> = {}): Promise<Encoder> {
+    // Copied: defaults (e.g. bitrate) are filled in below
+    options = { ...options };
+
     let codec: Codec | null = null;
 
     if (encoderCodec instanceof Codec) {
@@ -638,6 +641,9 @@ export class Encoder implements Disposable {
    * @see {@link create} For async version
    */
   static createSync<const C extends FFEncoderCodec | AVCodecID | Codec>(encoderCodec: C, options: EncoderOptions<C> = {}): Encoder {
+    // Copied: defaults (e.g. bitrate) are filled in below
+    options = { ...options };
+
     let codec: Codec | null = null;
 
     if (encoderCodec instanceof Codec) {

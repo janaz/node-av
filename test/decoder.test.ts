@@ -1402,4 +1402,32 @@ describe('Decoder', () => {
       await media2.close();
     });
   });
+
+  describe('options object', () => {
+    it('should leave the options object it was given unchanged', async () => {
+      const media = await Demuxer.open(inputFile);
+      const options = { threadCount: 2 };
+      const decoder = await Decoder.create(media.video()!, options);
+      const audioDecoder = Decoder.createSync(media.audio()!, options);
+      // exitOnError used to be written back as a default
+      assert.deepEqual(options, { threadCount: 2 });
+      audioDecoder.close();
+      decoder.close();
+      await media.close();
+    });
+
+    it('should keep hardware in a shared options object for the next decoder', { skip: !HardwareContext.auto() && 'No hardware context available' }, async () => {
+      const media = await Demuxer.open(inputFile);
+      using hw = HardwareContext.auto()!;
+      const options = { hardware: hw };
+      // A software (audio) decoder used to clear options.hardware
+      const audioDecoder = await Decoder.create(media.audio()!, options);
+      assert.equal(options.hardware, hw);
+      const videoDecoder = await Decoder.create(media.video()!, options);
+      assert.equal(options.hardware, hw);
+      videoDecoder.close();
+      audioDecoder.close();
+      await media.close();
+    });
+  });
 });
