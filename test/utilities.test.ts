@@ -1187,9 +1187,9 @@ describe('Utilities', () => {
   describe('avGuessFrameRate', () => {
     it("should guess a stream's frame rate where the codec reports none", async () => {
       // VP9 carries no frame rate in its bitstream; the WebM stream timing does
-      const media = await Demuxer.open(getInputFile('bbb-4k-vp9.webm'));
+      const media = await Demuxer.open(getInputFile('video-vp9.webm'));
       const video = media.video()!;
-      assert.deepEqual({ ...avGuessFrameRate(video) }, { num: 60, den: 1 });
+      assert.deepEqual({ ...avGuessFrameRate(video) }, { num: 30, den: 1 });
       await media.close();
       // and reads 0/1 once the stream's format context is gone
       assert.deepEqual({ ...avGuessFrameRate(video) }, { num: 0, den: 1 });

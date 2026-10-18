@@ -1417,29 +1417,25 @@ describe('Encoder', () => {
   });
 
   describe('frame rate', () => {
-    it("should take the stream's guessed frame rate when the decoder has none", { timeout: 60000 }, async () => {
+    it("should take the stream's guessed frame rate when the decoder has none", async () => {
       // VP9 carries no frame rate in its bitstream: the decoder reports 0/1, the
-      // WebM stream 60 fps. Without a framerate the encoder would fall back to
+      // WebM stream 30 fps. Without a framerate the encoder would fall back to
       // the frames' 1/1000 time base and read it as 1000 fps
-      await using media = await Demuxer.open(getInputFile('bbb-4k-vp9.webm'));
+      await using media = await Demuxer.open(getInputFile('video-vp9.webm'));
       const video = media.video()!;
       using decoder = await Decoder.create(video);
       assert.equal(decoder.getCodecContext()!.framerate.num, 0);
       using encoder = await Encoder.create(FF_ENCODER_LIBX264, { decoder, options: { preset: 'ultrafast' } });
 
-      for await (using packet of media.packets(video.index)) {
-        if (!packet) break;
-        const frames = await decoder.decodeAll(packet);
-        for (const frame of frames) {
-          (await encoder.encodeAll(frame)).forEach((p) => p.free());
-          frame.free();
-        }
-        if (frames.length > 0) break;
+      for await (using frame of decoder.frames(media.packets(video.index))) {
+        if (!frame) continue;
+        (await encoder.encodeAll(frame)).forEach((p) => p.free());
+        break;
       }
 
       const ctx = encoder.getCodecContext()!;
-      assert.deepEqual({ ...ctx.framerate }, { num: 60, den: 1 });
-      assert.deepEqual({ ...ctx.timeBase }, { num: 1, den: 60 });
+      assert.deepEqual({ ...ctx.framerate }, { num: 30, den: 1 });
+      assert.deepEqual({ ...ctx.timeBase }, { num: 1, den: 30 });
     });
   });
 
