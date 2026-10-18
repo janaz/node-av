@@ -1467,6 +1467,44 @@ describe('Muxer', () => {
     });
   });
 
+  describe('stream copy codec tags', () => {
+    const remux = async (input: string, extension: string): Promise<string> => {
+      await using demuxer = await Demuxer.open(getInputFile(input));
+      const outputFile = getTempFile(extension);
+      await using output = await Muxer.open(outputFile);
+      const indices = new Map(demuxer.streams.map((stream) => [stream.index, output.addStream(stream)]));
+      let written = 0;
+      for await (using packet of demuxer.packets()) {
+        if (!packet) break;
+        await output.writePacket(packet, indices.get(packet.streamIndex)!);
+        if (++written >= 30) break;
+      }
+      return outputFile;
+    };
+
+    const tagsOf = async (file: string): Promise<string[]> => {
+      await using demuxer = await Demuxer.open(file);
+      return demuxer.streams.map((stream) => stream.codecpar.codecTagString ?? '');
+    };
+
+    it('should drop source tags the output format does not accept (mp4 to Matroska)', async () => {
+      // mp4's 'mp4a' used to fail the Matroska header with "Invalid data"
+      const outputFile = await remux('demux.mp4', 'mkv');
+      await using demuxer = await Demuxer.open(outputFile);
+      assert.equal(demuxer.streams.length, 2);
+      assert.ok(demuxer.video());
+      assert.ok(demuxer.audio());
+      await cleanup();
+    });
+
+    it('should keep source tags the output format accepts', async () => {
+      assert.deepEqual(await tagsOf(await remux('demux.mp4', 'mov')), ['avc1', 'mp4a']);
+      // hvc1 is not mp4's default HEVC tag (hev1 is), so it must survive as the source's
+      assert.deepEqual(await tagsOf(await remux('hevc-short.mp4', 'mp4')), ['hvc1', 'mp4a']);
+      await cleanup();
+    });
+  });
+
   describe('Integration', () => {
     it('should transcode video with Demuxer/Output (async)', async () => {
       const input = await Demuxer.open(inputFile);

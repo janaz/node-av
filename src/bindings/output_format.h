@@ -36,6 +36,9 @@ private:
   Napi::Value GetVideoCodec(const Napi::CallbackInfo& info);
   Napi::Value GetSubtitleCodec(const Napi::CallbackInfo& info);
   Napi::Value GetFlags(const Napi::CallbackInfo& info);
+
+  Napi::Value GetCodecTag(const Napi::CallbackInfo& info);
+  Napi::Value GetCodecId(const Napi::CallbackInfo& info);
 };
 
 } // namespace ffmpeg

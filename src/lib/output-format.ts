@@ -216,6 +216,54 @@ export class OutputFormat implements NativeWrapper<NativeOutputFormat> {
   }
 
   /**
+   * Get the codec tag this format stores for a codec.
+   *
+   * Looks the codec up in the format's codec tag table.
+   *
+   * Direct mapping to av_codec_get_tag2() on AVOutputFormat->codec_tag.
+   *
+   * @param codecId - Codec to look up
+   *
+   * @returns The tag (FourCC), or null if the format has no tag for this codec
+   *
+   * @example
+   * ```typescript
+   * import { AV_CODEC_ID_H264 } from 'node-av/constants';
+   *
+   * const mp4 = OutputFormat.guessFormat('mp4', null, null);
+   * console.log(mp4?.getCodecTag(AV_CODEC_ID_H264)); // 0x31637661 ('avc1')
+   * ```
+   *
+   * @see {@link getCodecId} For the reverse lookup
+   */
+  getCodecTag(codecId: AVCodecID): number | null {
+    return this.native.getCodecTag(codecId);
+  }
+
+  /**
+   * Get the codec a codec tag stands for in this format.
+   *
+   * Looks the tag up in the format's codec tag table.
+   *
+   * Direct mapping to av_codec_get_id() on AVOutputFormat->codec_tag.
+   *
+   * @param tag - Codec tag (FourCC)
+   *
+   * @returns The codec, or AV_CODEC_ID_NONE if the format does not know the tag
+   *
+   * @example
+   * ```typescript
+   * const mkv = OutputFormat.guessFormat('matroska', null, null);
+   * const id = mkv?.getCodecId(stream.codecpar.codecTag);
+   * ```
+   *
+   * @see {@link getCodecTag} For the reverse lookup
+   */
+  getCodecId(tag: number): AVCodecID {
+    return this.native.getCodecId(tag);
+  }
+
+  /**
    * Get the underlying native OutputFormat object.
    *
    * @returns The native OutputFormat binding object

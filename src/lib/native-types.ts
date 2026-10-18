@@ -483,6 +483,9 @@ export interface NativeOutputFormat {
   readonly videoCodec: AVCodecID;
   readonly subtitleCodec: AVCodecID;
   readonly flags: AVFormatFlag;
+
+  getCodecTag(codecId: AVCodecID): number | null;
+  getCodecId(tag: number): AVCodecID;
 }
 
 /**

@@ -1124,6 +1124,15 @@ export class Muxer implements AsyncDisposable, Disposable {
       const ret = stream.codecpar.copy(outStream.codecpar);
       FFmpegError.throwIfError(ret, 'Failed to copy codec parameters');
 
+      // Keep the source codec tag only where the output format accepts it, as
+      // FFmpeg CLI's streamcopy_init() does; otherwise let the muxer pick one.
+      // E.g. mp4's 'mp4a' for AAC fails the Matroska header as invalid data.
+      const oformat = this.formatContext.oformat;
+      const { codecTag, codecId } = outStream.codecpar;
+      if (codecTag && oformat && oformat.getCodecId(codecTag) !== codecId && oformat.getCodecTag(codecId) !== null) {
+        outStream.codecpar.codecTag = 0;
+      }
+
       // Set the timebases
       const sourceTimeBase = stream.timeBase;
 

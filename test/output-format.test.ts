@@ -1,7 +1,18 @@
 import assert from 'node:assert';
 import { describe, it } from 'node:test';
 
-import { AVFMT_GLOBALHEADER, AVFMT_NOFILE, AVFMT_NOTIMESTAMPS, AVFMT_VARIABLE_FPS, FormatContext, OutputFormat } from '../src/index.js';
+import {
+  AV_CODEC_ID_AAC,
+  AV_CODEC_ID_H264,
+  AV_CODEC_ID_HEVC,
+  AV_CODEC_ID_NONE,
+  AVFMT_GLOBALHEADER,
+  AVFMT_NOFILE,
+  AVFMT_NOTIMESTAMPS,
+  AVFMT_VARIABLE_FPS,
+  FormatContext,
+  OutputFormat,
+} from '../src/index.js';
 
 describe('OutputFormat', () => {
   describe('Static Methods', () => {
@@ -450,6 +461,35 @@ describe('OutputFormat', () => {
 
       // Name should remain unchanged
       assert.equal(format.name, originalName);
+    });
+  });
+
+  describe('Codec Tags', () => {
+    const fourcc = (tag: string): number => Buffer.from(tag, 'ascii').readUInt32LE(0);
+
+    it('should look up the tag a format stores for a codec', () => {
+      const mp4 = OutputFormat.guessFormat('mp4', null, null)!;
+      assert.equal(mp4.getCodecTag(AV_CODEC_ID_H264), fourcc('avc1'));
+      assert.equal(mp4.getCodecTag(AV_CODEC_ID_AAC), fourcc('mp4a'));
+    });
+
+    it('should look up the codec a tag stands for', () => {
+      const mp4 = OutputFormat.guessFormat('mp4', null, null)!;
+      assert.equal(mp4.getCodecId(fourcc('hvc1')), AV_CODEC_ID_HEVC);
+      assert.equal(mp4.getCodecId(fourcc('zzzz')), AV_CODEC_ID_NONE);
+    });
+
+    it('should tell tags of another format apart', () => {
+      // Matroska stores AAC under its WAVE tag, so an MP4 'mp4a' tag is foreign there
+      const mkv = OutputFormat.guessFormat('matroska', null, null)!;
+      assert.equal(mkv.getCodecTag(AV_CODEC_ID_AAC), 0x00ff);
+      assert.equal(mkv.getCodecId(fourcc('mp4a')), AV_CODEC_ID_NONE);
+    });
+
+    it('should report formats without a tag table', () => {
+      const ts = OutputFormat.guessFormat('mpegts', null, null)!;
+      assert.equal(ts.getCodecTag(AV_CODEC_ID_H264), null);
+      assert.equal(ts.getCodecId(fourcc('avc1')), AV_CODEC_ID_NONE);
     });
   });
 });
