@@ -23,6 +23,7 @@ import { HardwareContext } from './hardware.js';
 import { Muxer } from './muxer.js';
 import { consumeStreamInParallel, interruptibleFrameSource, pipeline, PipelineControlImpl } from './pipeline.js';
 import { pickSupportedPixelFormat } from './utilities/codec-format.js';
+import { configureLiveDecoderThreading } from './utilities/live-decoding.js';
 import { resolveScaleSize } from './utilities/scale-size.js';
 import { PacketAgeWatchdog } from './utilities/packet-age-watchdog.js';
 
@@ -427,6 +428,7 @@ export class FMP4Stream {
   private options: Required<Omit<FMP4StreamOptions, 'signal'>>;
   private inputUrl: string | null;
   private inputOptions: DemuxerOptions;
+  private liveInput: boolean;
   private input?: Demuxer;
   private source?: MediaFrameSource;
   private output?: Muxer;
@@ -478,6 +480,7 @@ export class FMP4Stream {
    */
   private constructor(input: string | Demuxer | MediaFrameSource, options: FMP4StreamOptions) {
     const isLiveInput = typeof input === 'string' && /^(rtsps?|rtmp(?:e|s|t|te|ts)?|s?rtp|udp|srt|tcp|tls|sctp):/i.test(input);
+    this.liveInput = isLiveInput;
     const dtsBackwardThreshold = options.dtsBackwardThreshold ?? 10;
     // Only a source read in real time pairs a gap with the matching wait.
     const dtsForwardThreshold = options.dtsForwardThreshold ?? (isLiveInput ? 10 : 0);
@@ -942,6 +945,9 @@ export class FMP4Stream {
       this.videoDecoder = await Decoder.create(videoStream, {
         hardware: this.hardwareContext,
         exitOnError: false,
+        // Frame threading holds back one frame per thread before the first output;
+        // files keep the full thread count for throughput
+        ...(this.liveInput ? { configure: configureLiveDecoderThreading } : {}),
         ...(decoderScale ? { rescale: { ...resolveScaleSize(currentWidth, currentHeight, targetWidth, targetHeight), pixelFormat: softwareScaleFormat } } : {}),
       });
       this.throwIfStopRequested();

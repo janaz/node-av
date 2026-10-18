@@ -16,6 +16,7 @@ import { HardwareContext } from './hardware.js';
 import { Muxer } from './muxer.js';
 import { interruptibleFrameSource, pipeline } from './pipeline.js';
 import { pickSupportedLayout, pickSupportedPixelFormat, pickSupportedRate, pickSupportedSampleFormat } from './utilities/codec-format.js';
+import { configureLiveDecoderThreading } from './utilities/live-decoding.js';
 import { resolveScaleSize } from './utilities/scale-size.js';
 
 import type { AVCodecID, AVHWDeviceType, AVPixelFormat, AVSampleFormat, FFAudioEncoder, FFHWDeviceType, FFVideoEncoder } from '../constants/index.js';
@@ -576,6 +577,8 @@ export class RTPStream {
       this.videoDecoder = await Decoder.create(videoStream, {
         exitOnError: false,
         hardware: this.hardwareContext,
+        // Frame threading holds back one frame per thread before the first output
+        configure: configureLiveDecoderThreading,
         ...(decoderScale ? { rescale: { ...resolveScaleSize(currentWidth, currentHeight, targetWidth, targetHeight), pixelFormat: softwareScaleFormat } } : {}),
       });
 

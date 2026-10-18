@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 import { Decoder } from '../src/api/decoder.js';
 import { Demuxer } from '../src/api/demuxer.js';
 import { HardwareContext } from '../src/api/hardware.js';
+import { configureLiveDecoderThreading } from '../src/api/utilities/live-decoding.js';
 import {
   AV_CODEC_FLAG_COPY_OPAQUE,
   AV_CODEC_ID_H264,
@@ -12,6 +13,7 @@ import {
   AV_PIX_FMT_YUV420P,
   AV_PIX_FMT_YUV444P,
   AV_SAMPLE_FMT_FLTP,
+  FF_THREAD_SLICE,
 } from '../src/constants/constants.js';
 import { AV_CHANNEL_LAYOUT_MONO } from '../src/constants/channel-layouts.js';
 import { FF_DECODER_AAC, FF_DECODER_H264 } from '../src/constants/decoders.js';
@@ -1500,6 +1502,50 @@ describe('Decoder', () => {
           }
         }
       });
+      decoder.close();
+      await media.close();
+    });
+  });
+
+  describe('live threading', () => {
+    // Packets sent until the first frame comes out
+    const firstFrameAfter = async (decoder: Decoder, media: Demuxer, streamIndex: number): Promise<number> => {
+      let sent = 0;
+      for await (using packet of media.packets(streamIndex)) {
+        if (!packet) break;
+        sent++;
+        await decoder.decode(packet);
+        using frame = await decoder.receive();
+        if (frame) {
+          return sent;
+        }
+      }
+      return -1;
+    };
+
+    it('should cap frame threads for software decoding', async () => {
+      const media = await Demuxer.open(getInputFile('bunny-30s.mp4'));
+      const video = media.video()!;
+      const decoder = await Decoder.create(video, { configure: configureLiveDecoderThreading });
+      const threads = decoder.getCodecContext()!.threadCount;
+      assert.ok(threads >= 1 && threads <= 4, `Expected 1-4 threads, got ${threads}`);
+      // One frame held back per extra thread, instead of up to 16
+      const sent = await firstFrameAfter(decoder, media, video.index);
+      assert.ok(sent > 0 && sent <= threads + 2, `First frame after ${sent} packets with ${threads} threads`);
+      decoder.close();
+      await media.close();
+    });
+
+    it('should use slice threading for hardware decoding', { skip: !HardwareContext.auto() && 'No hardware context available' }, async () => {
+      using hw = HardwareContext.auto()!;
+      const media = await Demuxer.open(getInputFile('bunny-30s.mp4'));
+      const video = media.video()!;
+      const decoder = await Decoder.create(video, { hardware: hw, configure: configureLiveDecoderThreading });
+      if (decoder.isHardware()) {
+        assert.equal(decoder.getCodecContext()!.threadType, FF_THREAD_SLICE);
+        const sent = await firstFrameAfter(decoder, media, video.index);
+        assert.ok(sent > 0 && sent <= 4, `First frame after ${sent} packets`);
+      }
       decoder.close();
       await media.close();
     });
