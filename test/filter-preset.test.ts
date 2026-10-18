@@ -1,7 +1,18 @@
 import { strictEqual } from 'node:assert';
 import { describe, it } from 'node:test';
 
-import { AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV444P, AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_S16, FilterPreset } from '../src/index.js';
+import {
+  AV_HWDEVICE_TYPE_D3D11VA,
+  AV_HWDEVICE_TYPE_MEDIACODEC,
+  AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+  AV_PIX_FMT_YUV420P,
+  AV_PIX_FMT_YUV444P,
+  AV_SAMPLE_FMT_FLTP,
+  AV_SAMPLE_FMT_S16,
+  FilterPreset,
+} from '../src/index.js';
+
+import type { HardwareContext } from '../src/index.js';
 
 describe('FilterPreset', () => {
   describe('chain()', () => {
@@ -176,6 +187,29 @@ describe('FilterPreset', () => {
 
     it('should handle filter with no options', () => {
       strictEqual(FilterPreset.chain().custom('simplefilter').build(), 'simplefilter');
+    });
+  });
+
+  describe('supports', () => {
+    // Only the device type decides which filters a chain can use
+    const fakeHardware = (deviceType: number, deviceTypeName: string): HardwareContext => ({ deviceType, deviceTypeName }) as unknown as HardwareContext;
+
+    it('should support everything in software', () => {
+      strictEqual(FilterPreset.chain().supports('scale'), true);
+      strictEqual(FilterPreset.chain().supports('deinterlace'), true);
+    });
+
+    it('should report hardware without a scaler', () => {
+      for (const [type, name] of [
+        [AV_HWDEVICE_TYPE_D3D11VA, 'd3d11va'],
+        [AV_HWDEVICE_TYPE_MEDIACODEC, 'mediacodec'],
+      ] as const) {
+        const chain = FilterPreset.chain(fakeHardware(type, name));
+        strictEqual(chain.supports('scale'), false);
+        // the skipped operation it reports
+        strictEqual(chain.scale(1280, 720).build(), '');
+      }
+      strictEqual(FilterPreset.chain(fakeHardware(AV_HWDEVICE_TYPE_VIDEOTOOLBOX, 'videotoolbox')).supports('scale'), true);
     });
   });
 });

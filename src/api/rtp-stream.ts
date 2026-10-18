@@ -16,6 +16,7 @@ import { HardwareContext } from './hardware.js';
 import { Muxer } from './muxer.js';
 import { interruptibleFrameSource, pipeline } from './pipeline.js';
 import { pickSupportedLayout, pickSupportedPixelFormat, pickSupportedRate, pickSupportedSampleFormat } from './utilities/codec-format.js';
+import { resolveScaleSize } from './utilities/scale-size.js';
 
 import type { AVCodecID, AVHWDeviceType, AVPixelFormat, AVSampleFormat, FFAudioEncoder, FFHWDeviceType, FFVideoEncoder } from '../constants/index.js';
 import type { CodecContext } from '../lib/codec-context.js';
@@ -523,11 +524,6 @@ export class RTPStream {
         this.hardwareContext = HardwareContext.create(this.options.hardware.deviceType, this.options.hardware.device, this.options.hardware.options);
       }
 
-      this.videoDecoder = await Decoder.create(videoStream, {
-        exitOnError: false,
-        hardware: this.hardwareContext,
-      });
-
       // Determine if we need filters by comparing with current stream properties
       const currentWidth = videoStream.codecpar.width;
       const currentHeight = videoStream.codecpar.height;
@@ -556,14 +552,41 @@ export class RTPStream {
         throw new Error(`No encoder found for codec ID ${targetCodecId}`);
       }
 
+      const targetWidth = this.options.video.width ?? -1;
+      const targetHeight = this.options.video.height ?? -1;
+
+      // Software scaling leaves the graph output format unconstrained, so swscale keeps the
+      // source format on both sides of the scale. Packed formats like yuyv422 can't be scaled
+      // in place (yuyv422 -> yuyv422 fails with ENOSYS), and the encoder wouldn't accept them
+      // anyway. Pin the output to yuv420p so the graph negotiates a real conversion: it is the
+      // one format every browser/player can decode over WebRTC (unlike e.g. the 4:2:2 High
+      // profile that a least-loss pick would choose for a yuyv422 source). Fall back to a
+      // codec-supported format only if the encoder genuinely can't take yuv420p. Hardware chains
+      // negotiate their format through the frames context instead.
+      const encoderFormats = encoderCodec.pixelFormats;
+      const softwareScaleFormat =
+        !encoderFormats || encoderFormats.includes(AV_PIX_FMT_YUV420P)
+          ? AV_PIX_FMT_YUV420P
+          : pickSupportedPixelFormat(videoStream.codecpar.format as AVPixelFormat, encoderFormats);
+
+      // Hardware without a scaler (e.g. D3D11VA, MediaCodec) would skip the scale filter and
+      // keep the source size; scale on the CPU in the decoder instead, once frames left the GPU
+      const decoderScale = needsScale && !!this.hardwareContext && !FilterPreset.chain(this.hardwareContext).supports('scale');
+
+      this.videoDecoder = await Decoder.create(videoStream, {
+        exitOnError: false,
+        hardware: this.hardwareContext,
+        ...(decoderScale ? { rescale: { ...resolveScaleSize(currentWidth, currentHeight, targetWidth, targetHeight), pixelFormat: softwareScaleFormat } } : {}),
+      });
+
+      const filterScale = needsScale && !decoderScale;
+
       // Create filter chain only if needed
-      if (needsScale || needsFps) {
+      if (filterScale || needsFps) {
         const filterChain = FilterPreset.chain(this.hardwareContext);
 
         // Add scale filter if dimensions differ
-        if (needsScale) {
-          const targetWidth = this.options.video.width ?? -1;
-          const targetHeight = this.options.video.height ?? -1;
+        if (filterScale) {
           filterChain.scale(targetWidth, targetHeight);
         }
 
@@ -572,19 +595,8 @@ export class RTPStream {
           filterChain.filter('fps', { fps: this.options.video.fps! });
         }
 
-        // Software scaling leaves the graph output format unconstrained, so swscale keeps the
-        // source format on both sides of the scale. Packed formats like yuyv422 can't be scaled
-        // in place (yuyv422 -> yuyv422 fails with ENOSYS), and the encoder wouldn't accept them
-        // anyway. Pin the output to yuv420p so the graph negotiates a real conversion: it is the
-        // one format every browser/player can decode over WebRTC (unlike e.g. the 4:2:2 High
-        // profile that a least-loss pick would choose for a yuyv422 source). Fall back to a
-        // codec-supported format only if the encoder genuinely can't take yuv420p. Hardware chains
-        // negotiate their format through the frames context instead.
-        if (needsScale && !this.hardwareContext) {
-          const formats = encoderCodec.pixelFormats;
-          const targetFmt =
-            !formats || formats.includes(AV_PIX_FMT_YUV420P) ? AV_PIX_FMT_YUV420P : pickSupportedPixelFormat(videoStream.codecpar.format as AVPixelFormat, formats);
-          const targetFmtName = avGetPixFmtName(targetFmt);
+        if (filterScale && !this.hardwareContext) {
+          const targetFmtName = avGetPixFmtName(softwareScaleFormat);
           if (targetFmtName) {
             filterChain.filter('format', { pix_fmts: targetFmtName });
           }

@@ -146,6 +146,31 @@ export class FilterPreset {
   }
 
   /**
+   * Checks if an operation is available for this chain's hardware.
+   *
+   * Operations the hardware has no filter for (e.g. scaling on D3D11VA or
+   * MediaCodec) are skipped when added, so check first where skipping would be
+   * wrong and fall back to software, e.g. by scaling in the decoder.
+   *
+   * @param operation - Operation to check
+   *
+   * @returns True if the operation is applied; always true without hardware
+   *
+   * @example
+   * ```typescript
+   * const chain = FilterPreset.chain(hw);
+   * if (chain.supports('scale')) {
+   *   chain.scale(1280, 720);
+   * } else {
+   *   // e.g. Decoder.create(stream, { hardware: hw, rescale: { width: 1280, height: 720 } })
+   * }
+   * ```
+   */
+  supports(operation: keyof FilterSupport): boolean {
+    return this.support[operation];
+  }
+
+  /**
    * Adds a custom filter string to the chain.
    *
    * @param filter - Custom filter string
@@ -240,7 +265,7 @@ export class FilterPreset {
    *
    * @param options - Additional scaling options (e.g., flags for algorithm)
    *
-   * @returns This instance for chaining
+   * @returns This instance for chaining (unchanged if the hardware has no scaler, see {@link supports})
    *
    * @example
    * ```typescript
@@ -301,6 +326,8 @@ export class FilterPreset {
   /**
    * Adds a GPU format conversion filter without scaling.
    * Only available for hardware contexts. Uses hardware-specific scale filter with format parameter.
+   * Skipped without hardware; on hardware without a scaler (see {@link supports}) the
+   * graph fails to build.
    *
    * @param format - Target pixel format (e.g., 'nv12', 'p010')
    *
