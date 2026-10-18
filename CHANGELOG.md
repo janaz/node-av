@@ -20,6 +20,9 @@ All notable changes to this project will be documented in this file.
 - **`audioFrameBuffer` option on `Encoder`** (`AudioFrameBufferOptions`, also accepted by `AudioFrameBuffer.create()`). `maxGapFill` (seconds, default 1) is the largest input gap filled with silence; `timestamps: 'samples'` counts the output from 0 as before. Real-time RTP outputs should use `maxGapFill: 0`, as `RTPStream` does.
 - **`output` option on `Scaler.toBuffer()`/`toBufferSync()` and `Frame.toBuffer()`.** The result is written into the caller's `Buffer` instead of a new one; the returned buffer is a view of its first bytes.
 - **`FMP4Stream` transcodes audio to Opus when the client lists Opus but not AAC.** Unsupported input audio is encoded with libopus at 48 kHz in 20 ms frames, mono input stays mono, and `getCodecString()` reports `opus`. With AAC in `supportedCodecs` the target stays AAC as before.
+- **`Decoder.decodeErrors`** counts the packets and frames that failed to decode, like the ffmpeg CLI's decode error count; useful with `exitOnError: false`, where these errors are skipped.
+- **`FilterPreset.supports(operation)`** tells whether a chain's hardware has a filter for an operation (e.g. `scale` on D3D11VA or MediaCodec), since the builder methods skip unsupported ones and leave the chain unchanged.
+- **`OutputFormat.getCodecTag()`/`getCodecId()`** look up a format's codec tag table (`av_codec_get_tag2`, `av_codec_get_id`), and **`avGuessFrameRate(stream)`** wraps `av_guess_frame_rate`.
 
 ### Performance
 
@@ -51,6 +54,10 @@ All notable changes to this project will be documented in this file.
 - **`FMP4Stream` drops buffered output when a session fails.** No `onData` follows the error and no trailer is written, so a failed session no longer ends with a fragment placed after a timestamp jump. `stop()` and a clean end still emit everything.
 - **Exceptions thrown by `onClose` in `FMP4Stream` and `RTPStream` are logged with `console.error`** instead of propagating, and `onClose` fires exactly once per session (a throwing callback used to fire it twice and cause an unhandled rejection).
 - **Encoded audio keeps the input timing.** Fixed-frame-size encoders (AAC, Opus, MP3, …) and `autoResample` re-stamped their output from 0 by sample count, so audio that started late or had gaps drifted against the video. Frames now carry their first input sample's timestamp; gaps up to 1 s are filled with silence, overlaps up to 1 s are dropped and larger jumps restart the timeline (`audioFrameBuffer: { timestamps: 'samples' }` restores the old behavior).
+- **Decoders with `exitOnError: false` pass corrupt frames on** with their `decodeErrorFlags`/`AV_FRAME_FLAG_CORRUPT` set instead of dropping them, as the ffmpeg CLI does; with `exitOnError: true` they still throw.
+- **Audio encoders use the codec's default bitrate** when none is set, as the ffmpeg CLI does, instead of a fixed 128 kbit/s: G.726 encodes the standard 32 kbit/s instead of 40, G.723.1 opens at all, AAC gets 69 kbit/s per mono channel and Opus 64 (mono) or 96 kbit/s (stereo). Video keeps the 1 Mbit/s default.
+- **`RTPStream` and `FMP4Stream` start decoding live video sooner.** Frame threading held back one frame per thread (up to 16) before the first output, ~0.6 s at 25 fps. Hardware decoding now uses slice threading and software decoding at most 4 frame threads; `FMP4Stream` keeps the full thread count for file inputs.
+
 
 ### Fixed
 
@@ -105,6 +112,12 @@ All notable changes to this project will be documented in this file.
 - **`closeOutput()` leaves a callback-backed `pb` to its `IOContext`**, as `closeOutputSync()` already did. It closed it with `avio_closep()`, which treats the callback opaque as a protocol handle.
 - **A `Demuxer` opened from a `Readable` and dropped without `close()` no longer leaks its I/O context.** The demuxer itself was garbage collected, but the `IOContext` reading the stream stayed reachable through its own read callback, together with the stream and its buffered data ([#372](https://github.com/seydx/node-av/issues/372)).
 - **An `IOContext` that is never freed or closed is released once it is garbage collected.** Its finalizer freed nothing, so its I/O buffer leaked, and an `open2()` context also kept its file or connection open with unwritten data. It now frees it as `freeContext()` does, or closes it (flushing first) as `closep()` does, unless the output whose `pb` it is closes it or threadpool work still uses it.
+- **Stream copy into another container resets foreign codec tags** like the ffmpeg CLI. Remuxing MP4 into Matroska kept tags such as `mp4a`, which the Matroska muxer rejects; tags the target format knows for the codec (e.g. `hvc1` in MP4/MOV) are kept.
+- **Encoders created from a decoder without a frame rate guess it from the stream** (`av_guess_frame_rate`, e.g. VP9 in WebM). They used the stream time base (often 1/90000) instead, so libx264 picked level 6.2 and the rate control was off.
+- **Encoders keep video timestamps strictly increasing**, like the ffmpeg CLI's VFR sync. Frames that rounded onto the same tick of the encoder time base (e.g. a burst from a source timed by wallclock, at 1/25) reached the encoder with duplicate pts (x264: "non-strictly-monotonic PTS"); such a frame now moves to the next tick, or is dropped if it ends before it, and a keyframe requested on a dropped frame goes to the next one.
+- **`FMP4Stream` and `RTPStream` scale on hardware without a scaler.** On D3D11VA or MediaCodec the scale filter was skipped and the source size kept; the decoder now scales on the CPU after the frames leave the GPU.
+- **`Decoder.create()`/`Encoder.create()` (and the `Sync` variants) no longer modify the options object passed in**, so one object can be reused, e.g. a shared `hardware` option for an audio and a video decoder.
+- **`Muxer` encoders created lazily keep the input stream's metadata, disposition, side data and duration** when the input `Demuxer` is closed before the first packet; they were read from the closed stream and came out empty.
 
 ## [6.1.1] - 2026-07-06
 
