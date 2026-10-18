@@ -47,8 +47,10 @@ export interface DecoderOptions<C = unknown> {
   /**
    * Exit immediately on first decode error.
    *
-   * When enabled, the decoder will terminate on the first decode error.
-   * When disabled, errors are logged but decoding continues with next packet.
+   * When enabled, the decoder throws on the first decode error or corrupt frame.
+   * When disabled it continues like FFmpeg CLI: failed packets are skipped and
+   * counted in {@link Decoder.decodeErrors}, and corrupt frames are returned with
+   * `decodeErrorFlags` or `AV_FRAME_FLAG_CORRUPT` set, so callers can drop them.
    *
    * @default true
    */
@@ -289,6 +291,7 @@ export class Decoder implements Disposable {
   private initialized = true;
   private isClosed = false;
   private options: DecoderOptions;
+  private _decodeErrors = 0;
 
   // Frame tracking for PTS/duration estimation
   private lastFramePts = AV_NOPTS_VALUE;
@@ -777,6 +780,32 @@ export class Decoder implements Disposable {
   }
 
   /**
+   * Number of decode errors so far.
+   *
+   * Counts packets the decoder rejected, failed frame receives and frames that
+   * could not be transferred from the GPU, rescaled or cropped. With
+   * `exitOnError: false` these are skipped instead of thrown, so this is the way
+   * to notice them (e.g. a hardware decoder that keeps failing).
+   *
+   * Like FFmpeg CLI's decode error count. Corrupt frames are not counted; they are
+   * returned with `decodeErrorFlags` or `AV_FRAME_FLAG_CORRUPT` set.
+   *
+   * @returns Decode error count
+   *
+   * @example
+   * ```typescript
+   * const decoder = await Decoder.create(stream, { exitOnError: false });
+   * // ...
+   * if (decoder.decodeErrors > lastErrors) {
+   *   console.warn(`${decoder.decodeErrors - lastErrors} decode errors`);
+   * }
+   * ```
+   */
+  get decodeErrors(): number {
+    return this._decodeErrors;
+  }
+
+  /**
    * Check if decoder uses hardware acceleration.
    *
    * @returns true if hardware-accelerated
@@ -895,6 +924,7 @@ export class Decoder implements Disposable {
 
     // Handle send errors
     if (sendRet < 0 && sendRet !== AVERROR_EOF) {
+      this._decodeErrors++;
       if (this.options.exitOnError) {
         FFmpegError.throwIfError(sendRet, 'Failed to send packet to decoder');
       }
@@ -986,6 +1016,7 @@ export class Decoder implements Disposable {
 
     // Handle send errors
     if (sendRet < 0 && sendRet !== AVERROR_EOF) {
+      this._decodeErrors++;
       if (this.options.exitOnError) {
         FFmpegError.throwIfError(sendRet, 'Failed to send packet to decoder');
       }
@@ -1532,13 +1563,10 @@ export class Decoder implements Disposable {
       // Set frame time_base to decoder's packet timebase
       this.frame.timeBase = this.codecContext.pktTimebase;
 
-      // Check for corrupt frame
-      if (this.frame.decodeErrorFlags || this.frame.hasFlags(AV_FRAME_FLAG_CORRUPT)) {
-        if (this.options.exitOnError) {
-          throw new FFmpegError(AVERROR_INVALIDDATA);
-        }
-        // exitOnError=false: skip corrupt frame
-        return null;
+      // Corrupt frame: with exitOnError off it is passed on with its flags set,
+      // as FFmpeg CLI does (it only warns), so callers can decide to drop it
+      if (this.options.exitOnError && (this.frame.decodeErrorFlags || this.frame.hasFlags(AV_FRAME_FLAG_CORRUPT))) {
+        throw new FFmpegError(AVERROR_INVALIDDATA);
       }
 
       // Handles PTS assignment, duration estimation, and frame tracking
@@ -1581,6 +1609,7 @@ export class Decoder implements Disposable {
       return EOF;
     } else {
       // Error during receive
+      this._decodeErrors++;
       if (this.options.exitOnError) {
         FFmpegError.throwIfError(ret, 'Failed to receive frame');
       }
@@ -1654,12 +1683,8 @@ export class Decoder implements Disposable {
       this.frame.timeBase = this.codecContext.pktTimebase;
 
       // Check for corrupt frame
-      if (this.frame.decodeErrorFlags || this.frame.hasFlags(AV_FRAME_FLAG_CORRUPT)) {
-        if (this.options.exitOnError) {
-          throw new FFmpegError(AVERROR_INVALIDDATA);
-        }
-        // exitOnError=false: skip corrupt frame
-        return null;
+      if (this.options.exitOnError && (this.frame.decodeErrorFlags || this.frame.hasFlags(AV_FRAME_FLAG_CORRUPT))) {
+        throw new FFmpegError(AVERROR_INVALIDDATA);
       }
 
       // Process video frame
@@ -1704,6 +1729,7 @@ export class Decoder implements Disposable {
       return EOF;
     } else {
       // Error during receive
+      this._decodeErrors++;
       if (this.options.exitOnError) {
         FFmpegError.throwIfError(ret, 'Failed to receive frame');
       }
@@ -2108,6 +2134,7 @@ export class Decoder implements Disposable {
     if (this.options.applyCropping) {
       const ret = frame.applyCropping(1); // AV_FRAME_CROP_UNALIGNED = 1
       if (ret < 0) {
+        this._decodeErrors++;
         if (this.options.exitOnError) {
           FFmpegError.throwIfError(ret, 'Error applying decoder cropping');
         }
@@ -2447,6 +2474,7 @@ export class Decoder implements Disposable {
     const ret = frame.hwframeTransferDataSync(swFrame, 0);
     if (ret < 0) {
       swFrame.free();
+      this._decodeErrors++;
       if (this.options.exitOnError) {
         FFmpegError.throwIfError(ret, 'Failed to transfer hardware frame data');
       }
@@ -2459,6 +2487,7 @@ export class Decoder implements Disposable {
     swFrame.free();
 
     if (refRet < 0) {
+      this._decodeErrors++;
       if (this.options.exitOnError) {
         FFmpegError.throwIfError(refRet, 'Failed to reference software frame');
       }
@@ -2524,6 +2553,7 @@ export class Decoder implements Disposable {
     out.height = dstH;
     const ret = this.videoScaler.scaleFrameSync(out, frame);
     if (ret < 0) {
+      this._decodeErrors++;
       if (this.options.exitOnError) {
         FFmpegError.throwIfError(ret, 'Failed to rescale video frame');
       }

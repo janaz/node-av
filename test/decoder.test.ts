@@ -4,7 +4,15 @@ import { describe, it } from 'node:test';
 import { Decoder } from '../src/api/decoder.js';
 import { Demuxer } from '../src/api/demuxer.js';
 import { HardwareContext } from '../src/api/hardware.js';
-import { AV_CODEC_FLAG_COPY_OPAQUE, AV_CODEC_ID_H264, AV_PIX_FMT_RGB24, AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV444P, AV_SAMPLE_FMT_FLTP } from '../src/constants/constants.js';
+import {
+  AV_CODEC_FLAG_COPY_OPAQUE,
+  AV_CODEC_ID_H264,
+  AV_FRAME_FLAG_CORRUPT,
+  AV_PIX_FMT_RGB24,
+  AV_PIX_FMT_YUV420P,
+  AV_PIX_FMT_YUV444P,
+  AV_SAMPLE_FMT_FLTP,
+} from '../src/constants/constants.js';
 import { AV_CHANNEL_LAYOUT_MONO } from '../src/constants/channel-layouts.js';
 import { FF_DECODER_AAC, FF_DECODER_H264 } from '../src/constants/decoders.js';
 import { Codec, Packet } from '../src/lib/index.js';
@@ -1427,6 +1435,72 @@ describe('Decoder', () => {
       assert.equal(options.hardware, hw);
       videoDecoder.close();
       audioDecoder.close();
+      await media.close();
+    });
+  });
+
+  describe('error tolerance', () => {
+    it('should count decode errors instead of throwing when exitOnError is off', async () => {
+      const media = await Demuxer.open(inputFile);
+      const video = media.video()!;
+      // Single-threaded so the error surfaces on this packet, not a later one
+      const decoder = await Decoder.create(video, { exitOnError: false, threadCount: 1 });
+      const garbage = new Packet();
+      garbage.alloc();
+      garbage.data = Buffer.alloc(256, 0xff);
+      garbage.streamIndex = video.index;
+      assert.deepEqual(await decoder.decodeAll(garbage), []);
+      assert.ok(decoder.decodeErrors > 0, 'Should count the rejected packet');
+      garbage.free();
+      decoder.close();
+      await media.close();
+    });
+
+    it('should return corrupt frames with their flag set when exitOnError is off, like FFmpeg CLI', async () => {
+      const media = await Demuxer.open(getInputFile('test.mp4'));
+      const video = media.video()!;
+      // Starting after the keyframe, showall makes the decoder output the
+      // unrecoverable frames flagged as corrupt
+      const decoder = await Decoder.create(video, { exitOnError: false, options: { flags2: '+showall' } });
+      let skipped = false;
+      let corrupt = 0;
+      for await (using packet of media.packets(video.index)) {
+        if (!packet) break;
+        if (!skipped) {
+          skipped = true;
+          continue;
+        }
+        for (const frame of await decoder.decodeAll(packet)) {
+          if (frame.hasFlags(AV_FRAME_FLAG_CORRUPT) || frame.decodeErrorFlags) {
+            corrupt++;
+          }
+          frame.free();
+        }
+        if (corrupt >= 3) break;
+      }
+      assert.ok(corrupt >= 3, 'Corrupt frames must be passed on, not dropped');
+      decoder.close();
+      await media.close();
+    });
+
+    it('should throw on a corrupt frame when exitOnError is on', async () => {
+      const media = await Demuxer.open(getInputFile('test.mp4'));
+      const video = media.video()!;
+      const decoder = await Decoder.create(video, { options: { flags2: '+showall' } });
+      let skipped = false;
+      await assert.rejects(async () => {
+        for await (using packet of media.packets(video.index)) {
+          if (!packet) break;
+          if (!skipped) {
+            skipped = true;
+            continue;
+          }
+          for (const frame of await decoder.decodeAll(packet)) {
+            frame.free();
+          }
+        }
+      });
+      decoder.close();
       await media.close();
     });
   });
