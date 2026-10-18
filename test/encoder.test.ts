@@ -1461,4 +1461,63 @@ describe('Encoder', () => {
       assert.equal(encoder.getCodecContext()!.bitRate, 32000n);
     });
   });
+
+  describe('video timestamps', () => {
+    // Encodes 320x240 frames with the given pts (time base 1/25) and returns the packets
+    const encodeAt = async (encoder: Encoder, frames: { pts: bigint; key?: boolean }[]): Promise<{ pts: bigint; key: boolean }[]> => {
+      const out: { pts: bigint; key: boolean }[] = [];
+      const collect = (packets: Packet[]) => {
+        for (const packet of packets) {
+          out.push({ pts: packet.pts, key: packet.isKeyframe });
+          packet.free();
+        }
+      };
+      for (const { pts, key } of frames) {
+        using frame = new Frame();
+        frame.alloc();
+        frame.width = 320;
+        frame.height = 240;
+        frame.format = AV_PIX_FMT_YUV420P;
+        frame.getBuffer();
+        frame.pts = pts;
+        frame.timeBase = new Rational(1, 25);
+        if (key) {
+          frame.pictType = AV_PICTURE_TYPE_I;
+        }
+        collect(await encoder.encodeAll(frame));
+      }
+      for await (const packet of encoder.flushPackets()) {
+        collect([packet]);
+      }
+      return out.sort((a, b) => Number(a.pts - b.pts));
+    };
+
+    it('should keep pts strictly increasing like the ffmpeg CLI', async () => {
+      // A burst rounding onto one tick: the second frame still reaches tick 1,
+      // the next two end before tick 2 and are dropped
+      using encoder = await Encoder.create(FF_ENCODER_LIBX264, { options: { preset: 'ultrafast' } });
+      const packets = await encodeAt(
+        encoder,
+        [0n, 0n, 0n, 0n, 2n, 3n, 5n].map((pts) => ({ pts })),
+      );
+      assert.deepEqual(
+        packets.map((p) => p.pts),
+        [0n, 1n, 2n, 3n, 5n],
+      );
+    });
+
+    it('should move a requested keyframe on to the next frame when it is dropped', async () => {
+      using encoder = await Encoder.create(FF_ENCODER_LIBX264, { gopSize: 250, preserveFramePictType: true, options: { preset: 'ultrafast' } });
+      const packets = await encodeAt(encoder, [{ pts: 0n }, { pts: 1n }, { pts: 2n }, { pts: 1n, key: true }, { pts: 3n }]);
+      assert.deepEqual(
+        packets.map((p) => [p.pts, p.key]),
+        [
+          [0n, true],
+          [1n, false],
+          [2n, false],
+          [3n, true],
+        ],
+      );
+    });
+  });
 });

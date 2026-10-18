@@ -8,6 +8,7 @@ import {
   AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX,
   AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX,
   AV_NOPTS_VALUE,
+  AV_PICTURE_TYPE_I,
   AV_PICTURE_TYPE_NONE,
   AV_PIX_FMT_NONE,
   AV_PKT_FLAG_TRUSTED,
@@ -411,6 +412,8 @@ export class Encoder implements Disposable {
   private videoTargetFormat?: AVPixelFormat;
   private supportsParamChange?: boolean;
   private encoderChannels?: number;
+  private nextVideoPts?: bigint;
+  private droppedKeyframe = false;
 
   // Worker pattern for push-based processing
   private inputQueue: AsyncQueue<Frame>;
@@ -1001,6 +1004,10 @@ export class Encoder implements Disposable {
    * **Important**: This method only SENDS the frame to the encoder.
    * You must call {@link receive} separately (potentially multiple times) to get encoded packets.
    *
+   * Like FFmpeg CLI, a video frame whose timestamp lands on the previous frame's
+   * in the encoder time base moves to the next tick, and one that lies entirely
+   * before it is dropped, since encoders need strictly increasing timestamps.
+   *
    * Direct mapping to avcodec_send_frame().
    *
    * @param frame - Raw frame to send to encoder, or null to flush
@@ -1070,8 +1077,11 @@ export class Encoder implements Disposable {
     // Convert to the codec's format first (audio resample / video pixfmt).
     const input = this.audioResampler ? this.resampleAudio(frame) : this.videoScaler ? this.scaleVideo(frame) : frame;
 
-    // Prepare frame for encoding (set quality, validate channel count)
-    this.prepareFrameForEncoding(input);
+    // Prepare frame for encoding (timestamps, quality, channel count); a video
+    // frame that falls behind the previous one is dropped
+    if (!this.prepareFrameForEncoding(input)) {
+      return;
+    }
 
     const encode = async (newFrame: Frame) => {
       const sendRet = await this.codecContext.sendFrame(newFrame);
@@ -1100,6 +1110,10 @@ export class Encoder implements Disposable {
    *
    * **Important**: This method only SENDS the frame to the encoder.
    * You must call {@link receiveSync} separately (potentially multiple times) to get encoded packets.
+   *
+   * Like FFmpeg CLI, a video frame whose timestamp lands on the previous frame's
+   * in the encoder time base moves to the next tick, and one that lies entirely
+   * before it is dropped, since encoders need strictly increasing timestamps.
    *
    * Direct mapping to avcodec_send_frame().
    *
@@ -1152,8 +1166,9 @@ export class Encoder implements Disposable {
     // Convert to the codec's format first (audio resample / video pixfmt).
     const input = this.audioResampler ? this.resampleAudio(frame) : this.videoScaler ? this.scaleVideo(frame) : frame;
 
-    // Prepare frame for encoding (set quality, validate channel count)
-    this.prepareFrameForEncoding(input);
+    if (!this.prepareFrameForEncoding(input)) {
+      return;
+    }
 
     const encode = (newFrame: Frame) => {
       const sendRet = this.codecContext.sendFrameSync(newFrame);
@@ -2058,9 +2073,6 @@ export class Encoder implements Disposable {
 
         await this.initializePromise;
 
-        // Prepare frame for encoding (set quality, validate channel count)
-        this.prepareFrameForEncoding(frame);
-
         await this.encode(frame);
 
         // Receive packets
@@ -2759,18 +2771,21 @@ export class Encoder implements Disposable {
    * Prepare frame for encoding.
    *
    * Implements FFmpeg's frame_encode() pre-encoding logic:
-   * 1. Video: Sets frame.quality from encoder's globalQuality (like -qscale)
-   * 2. Audio: Validates channel count consistency for encoders without PARAM_CHANGE capability
+   * 1. Video: Keeps timestamps strictly increasing like the CLI's VFR sync
+   * 2. Video: Sets frame.quality from encoder's globalQuality (like -qscale)
+   * 3. Audio: Validates channel count consistency for encoders without PARAM_CHANGE capability
    *
    * This matches FFmpeg CLI behavior where these properties are automatically managed.
    *
    * @param frame - Frame to prepare for encoding
    *
+   * @returns False if the frame must be dropped
+   *
    * @throws {Error} If audio channel count changed and encoder doesn't support parameter changes
    *
    * @internal
    */
-  private prepareFrameForEncoding(frame: Frame): void {
+  private prepareFrameForEncoding(frame: Frame): boolean {
     // Clear pict_type - encoder will determine frame types based on its own settings.
     // Input stream's frame type hints are irrelevant when re-encoding. Opt out with
     // { preserveFramePictType: true } to force keyframes via frame.pictType = I.
@@ -2828,6 +2843,28 @@ export class Encoder implements Disposable {
 
     const codecType = this.codecContext.codecType;
     if (codecType === AVMEDIA_TYPE_VIDEO) {
+      // Encoders need strictly increasing pts, but frames arriving in a burst can
+      // round onto the same tick of the encoder time base (e.g. 1/25). Like FFmpeg
+      // CLI's VFR sync (video_sync_process): a frame that still reaches the next
+      // free tick moves there, one that ends before it is dropped.
+      if (frame.pts !== AV_NOPTS_VALUE) {
+        const nextPts = this.nextVideoPts;
+        if (nextPts !== undefined && frame.pts < nextPts) {
+          if (frame.pts + frameDuration < nextPts) {
+            // A requested keyframe goes to the next frame instead, as in the CLI
+            this.droppedKeyframe ||= frame.pictType === AV_PICTURE_TYPE_I;
+            return false;
+          }
+          frame.pts = nextPts;
+        }
+        this.nextVideoPts = frame.pts + 1n;
+      }
+
+      if (this.droppedKeyframe) {
+        frame.pictType = AV_PICTURE_TYPE_I;
+        this.droppedKeyframe = false;
+      }
+
       // Video: Set frame quality from encoder's global quality
       // Only set if encoder has globalQuality configured and frame doesn't already have quality set
       const globalQuality = this.codecContext.globalQuality;
@@ -2852,6 +2889,8 @@ export class Encoder implements Disposable {
         }
       }
     }
+
+    return true;
   }
 
   /**
