@@ -3,6 +3,7 @@ import { describe, it } from 'node:test';
 
 import {
   AVCOL_RANGE_JPEG,
+  AV_CHANNEL_LAYOUT_MONO,
   AV_CHANNEL_LAYOUT_STEREO,
   AV_CHANNEL_ORDER_UNSPEC,
   AV_NOPTS_VALUE,
@@ -15,7 +16,9 @@ import {
   Decoder,
   Demuxer,
   Encoder,
+  AV_SAMPLE_FMT_S16,
   FF_ENCODER_AAC,
+  FF_ENCODER_ADPCM_G726,
   FF_ENCODER_LIBMP3LAME,
   FF_ENCODER_LIBX264,
   FF_ENCODER_LIBX265,
@@ -1437,6 +1440,25 @@ describe('Encoder', () => {
       const ctx = encoder.getCodecContext()!;
       assert.deepEqual({ ...ctx.framerate }, { num: 60, den: 1 });
       assert.deepEqual({ ...ctx.timeBase }, { num: 1, den: 60 });
+    });
+  });
+
+  describe('audio bitrate', () => {
+    it("should leave the bitrate to the codec's default", async () => {
+      // G.726 derives its bits per sample from the bitrate: a fixed 128k default
+      // gave G.726-40 instead of the standard 32k
+      using encoder = await Encoder.create(FF_ENCODER_ADPCM_G726);
+      using frame = new Frame();
+      frame.alloc();
+      frame.format = AV_SAMPLE_FMT_S16;
+      frame.sampleRate = 8000;
+      frame.channelLayout = AV_CHANNEL_LAYOUT_MONO;
+      frame.nbSamples = 160;
+      frame.getBuffer();
+      frame.pts = 0n;
+      frame.timeBase = new Rational(1, 8000);
+      (await encoder.encodeAll(frame)).forEach((p) => p.free());
+      assert.equal(encoder.getCodecContext()!.bitRate, 32000n);
     });
   });
 });

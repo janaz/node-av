@@ -98,7 +98,7 @@ export interface EncoderOptions<C = unknown> {
    * Can be specified as number, bigint, or string with suffix (e.g., '5M', '128k').
    * Used for rate control in video and audio encoding.
    *
-   * @default 128k for audio, 1M for video
+   * @default The codec's default for audio, 1M for video
    *
    * @deprecated Use the {@link EncoderOptions.context} option instead, e.g. `context: { bitRate: '5M' }`.
    */
@@ -535,15 +535,16 @@ export class Encoder implements Disposable {
       codecContext.maxBFrames = options.maxBFrames;
     }
 
-    // Apply common options with codec-type-specific defaults
-    if (options.bitrate === undefined) {
-      // Set codec-type-specific default bitrate
-      const isAudio = codec.type === AVMEDIA_TYPE_AUDIO;
-      options.bitrate = isAudio ? 128_000 : 1_000_000;
+    // Audio bitrate is left to the codec's default like FFmpeg CLI does: it
+    // depends on codec, channels and rate (AAC 69k per mono channel, G.726 32k),
+    // and some codecs only open at specific rates (G.723.1: 6.3k/5.3k)
+    if (options.bitrate === undefined && codec.type !== AVMEDIA_TYPE_AUDIO) {
+      options.bitrate = 1_000_000;
     }
 
-    const bitrate = typeof options.bitrate === 'string' ? parseBitrate(options.bitrate) : BigInt(options.bitrate);
-    codecContext.bitRate = bitrate;
+    if (options.bitrate !== undefined) {
+      codecContext.bitRate = typeof options.bitrate === 'string' ? parseBitrate(options.bitrate) : BigInt(options.bitrate);
+    }
 
     if (options.minRate !== undefined) {
       const minRate = typeof options.minRate === 'string' ? parseBitrate(options.minRate) : BigInt(options.minRate);
@@ -667,15 +668,13 @@ export class Encoder implements Disposable {
     const codecContext = new CodecContext();
     codecContext.allocContext3(codec);
 
-    // Apply common options with codec-type-specific defaults
-    if (options.bitrate === undefined) {
-      // Set codec-type-specific default bitrate
-      const isAudio = codec.type === AVMEDIA_TYPE_AUDIO;
-      options.bitrate = isAudio ? 128_000 : 1_000_000;
+    if (options.bitrate === undefined && codec.type !== AVMEDIA_TYPE_AUDIO) {
+      options.bitrate = 1_000_000;
     }
 
-    const bitrate = typeof options.bitrate === 'string' ? parseBitrate(options.bitrate) : BigInt(options.bitrate);
-    codecContext.bitRate = bitrate;
+    if (options.bitrate !== undefined) {
+      codecContext.bitRate = typeof options.bitrate === 'string' ? parseBitrate(options.bitrate) : BigInt(options.bitrate);
+    }
 
     if (options.gopSize !== undefined) {
       codecContext.gopSize = options.gopSize;
