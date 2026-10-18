@@ -12,6 +12,8 @@ import {
   AV_PIX_FMT_YUV422P,
   AV_PIX_FMT_YUV444P,
   AV_SAMPLE_FMT_FLTP,
+  Decoder,
+  Demuxer,
   Encoder,
   FF_ENCODER_AAC,
   FF_ENCODER_LIBMP3LAME,
@@ -21,7 +23,7 @@ import {
   HardwareContext,
 } from '../src/index.js';
 import { Frame, Rational, avcodecFindBestPixFmtOfList } from '../src/lib/index.js';
-import { encodeFrame, encodeFrameSync } from './index.js';
+import { encodeFrame, encodeFrameSync, getInputFile } from './index.js';
 
 import type { Packet } from '../src/lib/index.js';
 
@@ -1395,6 +1397,33 @@ describe('Encoder', () => {
       await assert.rejects(() => encoder.encode(frame), { name: 'AbortError' });
       frame.free();
       encoder.close();
+    });
+  });
+
+  describe('frame rate', () => {
+    it("should take the stream's guessed frame rate when the decoder has none", { timeout: 60000 }, async () => {
+      // VP9 carries no frame rate in its bitstream: the decoder reports 0/1, the
+      // WebM stream 60 fps. Without a framerate the encoder would fall back to
+      // the frames' 1/1000 time base and read it as 1000 fps
+      await using media = await Demuxer.open(getInputFile('bbb-4k-vp9.webm'));
+      const video = media.video()!;
+      using decoder = await Decoder.create(video);
+      assert.equal(decoder.getCodecContext()!.framerate.num, 0);
+      using encoder = await Encoder.create(FF_ENCODER_LIBX264, { decoder, options: { preset: 'ultrafast' } });
+
+      for await (using packet of media.packets(video.index)) {
+        if (!packet) break;
+        const frames = await decoder.decodeAll(packet);
+        for (const frame of frames) {
+          (await encoder.encodeAll(frame)).forEach((p) => p.free());
+          frame.free();
+        }
+        if (frames.length > 0) break;
+      }
+
+      const ctx = encoder.getCodecContext()!;
+      assert.deepEqual({ ...ctx.framerate }, { num: 60, den: 1 });
+      assert.deepEqual({ ...ctx.timeBase }, { num: 1, den: 60 });
     });
   });
 });

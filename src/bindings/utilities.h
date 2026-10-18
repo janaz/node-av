@@ -48,6 +48,7 @@ public:
   static Napi::Value GetCodecName(const Napi::CallbackInfo& info);
   static Napi::Value GetCodecString(const Napi::CallbackInfo& info);     // RFC 6381 codec string (DASH/HLS)
   static Napi::Value GetMimeTypeDash(const Napi::CallbackInfo& info);    // DASH MIME type (e.g., "video/mp4")
+  static Napi::Value GuessFrameRate(const Napi::CallbackInfo& info);     // av_guess_frame_rate
 
   // Image utilities
   static Napi::Value ImageAlloc(const Napi::CallbackInfo& info);

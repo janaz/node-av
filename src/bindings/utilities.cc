@@ -68,6 +68,7 @@ Napi::Object Utilities::Init(Napi::Env env, Napi::Object exports) {
   exports.Set("avGetCodecName", Napi::Function::New(env, GetCodecName));
   exports.Set("avGetCodecString", Napi::Function::New(env, GetCodecString));
   exports.Set("avGetMimeTypeDash", Napi::Function::New(env, GetMimeTypeDash));
+  exports.Set("avGuessFrameRate", Napi::Function::New(env, GuessFrameRate));
 
   // Image utilities
   exports.Set("avImageAlloc", Napi::Function::New(env, ImageAlloc));
@@ -441,6 +442,23 @@ Napi::Value Utilities::GetCodecString(const Napi::CallbackInfo& info) {
   av_bprint_finalize(&buf, nullptr);
 
   return result;
+}
+
+Napi::Value Utilities::GuessFrameRate(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+
+  Stream* stream = info.Length() > 0 ? UnwrapNativeObject<Stream>(env, info[0], "Stream") : nullptr;
+  if (!stream) {
+    Napi::TypeError::New(env, "Expected Stream object").ThrowAsJavaScriptException();
+    return env.Null();
+  }
+  // A stream whose format context was freed has no rate to guess
+  if (!stream->Get()) {
+    return RationalToJS(env, {0, 1});
+  }
+
+  // The format context argument is unused by FFmpeg
+  return RationalToJS(env, av_guess_frame_rate(nullptr, stream->Get(), nullptr));
 }
 
 Napi::Value Utilities::GetMimeTypeDash(const Napi::CallbackInfo& info) {

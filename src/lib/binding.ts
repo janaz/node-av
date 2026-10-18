@@ -298,6 +298,7 @@ export interface NativeBinding {
   avGetCodecName: (codecId: AVCodecID) => string | null;
   avGetCodecString: (codecpar: NativeCodecParameters, frameRate?: IRational) => string | null;
   avGetMimeTypeDash: (codecpar: NativeCodecParameters) => string | null;
+  avGuessFrameRate: (stream: NativeStream) => IRational;
   avGetPixFmtName: (pixFmt: AVPixelFormat) => string | null;
   avGetPixFmtFromName: (name: string) => AVPixelFormat;
   avIsHardwarePixelFormat: (pixFmt: AVPixelFormat) => boolean;

@@ -2201,6 +2201,16 @@ export class Encoder implements Disposable {
       const decoderCtx = this.options.decoder.getCodecContext();
       if (decoderCtx?.framerate && decoderCtx.framerate.num > 0) {
         this.codecContext.framerate = decoderCtx.framerate;
+      } else {
+        // The bitstream carries no rate (e.g. an H.264 camera without VUI
+        // timing): guess it from the stream like FFmpeg CLI does. Without a
+        // framerate the time base falls back to the frames' (e.g. 1/90000) and
+        // encoders read its inverse as fps (x264 picks level 6.2, hardware rate
+        // control misbehaves).
+        const guessed = this.options.decoder.getGuessedFrameRate();
+        if (guessed.num > 0 && guessed.den > 0) {
+          this.codecContext.framerate = new Rational(guessed.num, guessed.den);
+        }
       }
     }
 
@@ -2310,6 +2320,11 @@ export class Encoder implements Disposable {
       const decoderCtx = this.options.decoder.getCodecContext();
       if (decoderCtx?.framerate && decoderCtx.framerate.num > 0) {
         this.codecContext.framerate = decoderCtx.framerate;
+      } else {
+        const guessed = this.options.decoder.getGuessedFrameRate();
+        if (guessed.num > 0 && guessed.den > 0) {
+          this.codecContext.framerate = new Rational(guessed.num, guessed.den);
+        }
       }
     }
 

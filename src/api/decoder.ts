@@ -25,7 +25,7 @@ import { Packet } from '../lib/packet.js';
 import { Rational } from '../lib/rational.js';
 import { SoftwareResampleContext } from '../lib/software-resample-context.js';
 import { SoftwareScaleContext } from '../lib/software-scale-context.js';
-import { avChannelLayoutDefault, avGcd, avInvQ, avMulQ, avRescaleDelta, avRescaleQ, avRescaleQRnd } from '../lib/utilities.js';
+import { avChannelLayoutDefault, avGcd, avGuessFrameRate, avInvQ, avMulQ, avRescaleDelta, avRescaleQ, avRescaleQRnd } from '../lib/utilities.js';
 import { FRAME_THREAD_QUEUE_SIZE, PACKET_THREAD_QUEUE_SIZE } from './constants.js';
 import { AsyncQueue } from './utilities/async-queue.js';
 import { applyContextOptions } from './utilities/context-options.js';
@@ -285,6 +285,7 @@ export class Decoder implements Disposable {
   private stream: Stream;
   private readonly streamIndex: number;
   private readonly streamFramerate: Rational;
+  private readonly guessedFramerate: IRational;
   private initialized = true;
   private isClosed = false;
   private options: DecoderOptions;
@@ -337,7 +338,10 @@ export class Decoder implements Disposable {
     this.codec = codec;
     this.stream = stream;
     this.streamIndex = stream.index;
-    this.streamFramerate = stream.avgFrameRate ?? stream.rFrameRate;
+    const avgFramerate = stream.avgFrameRate;
+    this.streamFramerate = avgFramerate.num > 0 && avgFramerate.den > 0 ? avgFramerate : stream.rFrameRate;
+    // Taken now: the stream belongs to the demuxer and reads 0/1 once it closes
+    this.guessedFramerate = avGuessFrameRate(stream);
     this.options = options;
     this.frame = new Frame();
     this.frame.alloc();
@@ -1809,6 +1813,21 @@ export class Decoder implements Disposable {
    */
   getStream(): Stream {
     return this.stream;
+  }
+
+  /**
+   * Get the stream's guessed frame rate.
+   *
+   * av_guess_frame_rate() of the decoded stream, taken when the decoder was
+   * created, so it outlives the demuxer. FFmpeg CLI feeds this rate into the
+   * filter graph, from where it reaches the encoder.
+   *
+   * @returns Guessed frame rate, or 0/1 if unknown
+   *
+   * @internal
+   */
+  getGuessedFrameRate(): IRational {
+    return this.guessedFramerate;
   }
 
   /**
