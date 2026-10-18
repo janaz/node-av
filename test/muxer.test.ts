@@ -1505,6 +1505,41 @@ describe('Muxer', () => {
     });
   });
 
+  describe('encoded stream input properties', () => {
+    it('should copy them from the input stream even if its demuxer closed before the first packet', async () => {
+      const demuxer = await Demuxer.open(inputFile);
+      const video = demuxer.video()!;
+      using decoder = await Decoder.create(video);
+      using encoder = await Encoder.create(FF_ENCODER_LIBX264, { decoder, options: { preset: 'ultrafast' } });
+      const outputFile = getTempFile('mp4');
+      await using output = await Muxer.open(outputFile);
+      const idx = output.addStream(video, { encoder });
+
+      const frames = [];
+      for await (using packet of demuxer.packets(video.index)) {
+        if (!packet) break;
+        frames.push(...(await decoder.decodeAll(packet)));
+        if (frames.length >= 5) break;
+      }
+      // The stream now reads defaults (no metadata, disposition 0)
+      await demuxer.close();
+
+      for (const frame of [...frames, null]) {
+        for (const packet of await encoder.encodeAll(frame)) {
+          await output.writePacket(packet, idx);
+          packet.free();
+        }
+        frame?.free();
+      }
+
+      const outputStream = output.streams[idx];
+      assert.equal(outputStream.metadata?.get('handler_name'), 'VideoHandler');
+      assert.equal(outputStream.disposition, 1);
+      await output.close();
+      await cleanup();
+    });
+  });
+
   describe('Integration', () => {
     it('should transcode video with Demuxer/Output (async)', async () => {
       const input = await Demuxer.open(inputFile);
