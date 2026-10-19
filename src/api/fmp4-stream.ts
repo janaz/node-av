@@ -6,14 +6,13 @@ import {
   AV_CODEC_ID_HEVC,
   AV_CODEC_ID_OPUS,
   AV_HWDEVICE_TYPE_NONE,
-  AV_PIX_FMT_YUV420P,
   AV_SAMPLE_FMT_FLT,
   AV_SAMPLE_FMT_FLTP,
 } from '../constants/constants.js';
 import { FF_ENCODER_AAC, FF_ENCODER_LIBOPUS, FF_ENCODER_LIBX264 } from '../constants/encoders.js';
 import { Codec } from '../lib/codec.js';
 import { Rational } from '../lib/rational.js';
-import { avGetCodecString, avGetMediaTypeString, avGetPixFmtName } from '../lib/utilities.js';
+import { avGetCodecString, avGetMediaTypeString } from '../lib/utilities.js';
 import { Decoder } from './decoder.js';
 import { Demuxer } from './demuxer.js';
 import { Encoder } from './encoder.js';
@@ -22,12 +21,11 @@ import { FilterAPI } from './filter.js';
 import { HardwareContext } from './hardware.js';
 import { Muxer } from './muxer.js';
 import { consumeStreamInParallel, interruptibleFrameSource, pipeline, PipelineControlImpl } from './pipeline.js';
-import { pickSupportedPixelFormat } from './utilities/codec-format.js';
 import { configureLiveDecoderThreading } from './utilities/live-decoding.js';
-import { resolveScaleSize } from './utilities/scale-size.js';
 import { PacketAgeWatchdog } from './utilities/packet-age-watchdog.js';
+import { createVideoTranscodeFilter } from './utilities/video-transcode.js';
 
-import type { AVCodecID, AVHWDeviceType, AVPixelFormat, FFHWDeviceType } from '../constants/index.js';
+import type { AVCodecID, AVHWDeviceType, FFHWDeviceType } from '../constants/index.js';
 import type { CodecContext } from '../lib/codec-context.js';
 import type { DemuxerOptions } from './demuxer.js';
 import type { EncoderOptions } from './encoder.js';
@@ -909,38 +907,10 @@ export class FMP4Stream {
       }
 
       // Transcode to H.264
-      // Determine if we need filters by comparing with current stream properties
-      const currentWidth = videoStream.codecpar.width;
-      const currentHeight = videoStream.codecpar.height;
       const currentFps = videoStream.avgFrameRate.num / videoStream.avgFrameRate.den;
-
-      const needsScale =
-        (this.options.video.width !== undefined && this.options.video.width !== currentWidth) ||
-        (this.options.video.height !== undefined && this.options.video.height !== currentHeight);
-
       const needsFps = this.options.video.fps !== undefined && isFinite(currentFps) && this.options.video.fps !== currentFps;
 
       const encoderCodec = this.hardwareContext?.getEncoderCodec('h264') ?? Codec.findEncoderByName(FF_ENCODER_LIBX264)!;
-      const targetWidth = this.options.video.width ?? -1;
-      const targetHeight = this.options.video.height ?? -1;
-
-      // Software scaling leaves the graph output format unconstrained, so swscale keeps the
-      // source format on both sides of the scale. Packed formats like yuyv422 can't be scaled
-      // in place (yuyv422 -> yuyv422 fails with ENOSYS), and the encoder wouldn't accept them
-      // anyway. Pin the output to yuv420p so the graph negotiates a real conversion: it is the
-      // one format every browser/player can decode via MSE (unlike e.g. the 4:2:2 High profile
-      // that a least-loss pick would choose for a yuyv422 source). Fall back to a codec-supported
-      // format only if the encoder genuinely can't take yuv420p. Hardware chains negotiate their
-      // format through the frames context instead.
-      const encoderFormats = encoderCodec.pixelFormats;
-      const softwareScaleFormat =
-        !encoderFormats || encoderFormats.includes(AV_PIX_FMT_YUV420P)
-          ? AV_PIX_FMT_YUV420P
-          : pickSupportedPixelFormat(videoStream.codecpar.format as AVPixelFormat, encoderFormats);
-
-      // Hardware without a scaler (e.g. D3D11VA, MediaCodec) would skip the scale filter and
-      // keep the source size; scale on the CPU in the decoder instead, once frames left the GPU
-      const decoderScale = needsScale && !!this.hardwareContext && !FilterPreset.chain(this.hardwareContext).supports('scale');
 
       this.videoDecoder = await Decoder.create(videoStream, {
         hardware: this.hardwareContext,
@@ -948,37 +918,18 @@ export class FMP4Stream {
         // Frame threading holds back one frame per thread before the first output;
         // files keep the full thread count for throughput
         ...(this.liveInput ? { configure: configureLiveDecoderThreading } : {}),
-        ...(decoderScale ? { rescale: { ...resolveScaleSize(currentWidth, currentHeight, targetWidth, targetHeight), pixelFormat: softwareScaleFormat } } : {}),
       });
       this.throwIfStopRequested();
 
-      const filterScale = needsScale && !decoderScale;
-
-      // Create filter chain only if needed
-      if (filterScale || needsFps) {
-        const filterChain = FilterPreset.chain(this.hardwareContext);
-
-        // Add scale filter if dimensions differ
-        if (filterScale) {
-          filterChain.scale(targetWidth, targetHeight);
-        }
-
-        // Add fps filter if fps differs
-        if (needsFps) {
-          filterChain.filter('fps', { fps: this.options.video.fps! });
-        }
-
-        if (filterScale && !this.hardwareContext) {
-          const targetFmtName = avGetPixFmtName(softwareScaleFormat);
-          if (targetFmtName) {
-            filterChain.filter('format', { pix_fmts: targetFmtName });
-          }
-        }
-
-        this.videoFilter = FilterAPI.create(filterChain.build(), {
-          hardware: this.hardwareContext,
-        });
-      }
+      // The graph follows the frames: whether they come from the device and in
+      // which format shows only once they are decoded
+      this.videoFilter = createVideoTranscodeFilter({
+        width: this.options.video.width ?? -1,
+        height: this.options.video.height ?? -1,
+        fps: needsFps ? this.options.video.fps : undefined,
+        encoder: encoderCodec,
+        hardware: this.hardwareContext,
+      });
 
       let encoderOptions: EncoderOptions['options'] = {};
       if (encoderCodec.name === FF_ENCODER_LIBX264) {
@@ -997,6 +948,7 @@ export class FMP4Stream {
 
       this.videoEncoder = await Encoder.create(encoderCodec, {
         decoder: this.videoDecoder,
+        filter: this.videoFilter,
         options: encoderOptions,
         configure: (ctx) => {
           ctx.gopSize = this.gopSize(fpsForGop);
@@ -1301,6 +1253,9 @@ export class FMP4Stream {
           this.applyBitrate(ctx, bitrate);
         },
       });
+
+      // Source frames may sit on another device or in a format the encoder rejects
+      this.videoFilter = createVideoTranscodeFilter({ width: -1, height: -1, encoder: encoderCodec, hardware: this.hardwareContext });
     }
 
     if (source.audio) {
@@ -1320,10 +1275,10 @@ export class FMP4Stream {
     // a silent source releasable instead of blocking teardown forever.
     const stopped = this.stopSignal.promise;
 
-    if (source.video && this.videoEncoder) {
+    if (source.video && this.videoFilter && this.videoEncoder) {
       const streamIndex = this.output.addStream(this.videoEncoder);
       const video = interruptibleFrameSource(source.video, stopped);
-      tasks.push(consumeStreamInParallel(this.videoEncoder.packets(video), this.output, streamIndex, shouldStop));
+      tasks.push(consumeStreamInParallel(this.videoEncoder.packets(this.videoFilter.frames(video)), this.output, streamIndex, shouldStop));
     }
 
     if (source.audio && this.audioFilter && this.audioEncoder) {

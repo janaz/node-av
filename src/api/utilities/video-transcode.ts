@@ -1,0 +1,307 @@
+import {
+  AV_HWDEVICE_TYPE_CUDA,
+  AV_HWDEVICE_TYPE_VAAPI,
+  AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+  AV_PIX_FMT_NV12,
+  AV_PIX_FMT_YUV420P,
+  AV_PIX_FMT_YUVJ420P,
+} from '../../constants/constants.js';
+import { Filter } from '../../lib/filter.js';
+import { avGetPixFmtName, avIsHardwarePixelFormat } from '../../lib/utilities.js';
+import { FilterPreset } from '../filter-presets.js';
+import { FilterAPI } from '../filter.js';
+import { pickSupportedPixelFormat } from './codec-format.js';
+import { resolveScaleSize } from './scale-size.js';
+
+import type { AVHWDeviceType, AVPixelFormat } from '../../constants/index.js';
+import type { Codec } from '../../lib/codec.js';
+import type { Frame } from '../../lib/frame.js';
+import type { HardwareContext } from '../hardware.js';
+
+/**
+ * What the video encoder of a transcode has to receive.
+ *
+ * @internal
+ */
+export interface VideoTranscodeTarget {
+  /** Output width, -1 to keep the source width or follow the height */
+  width: number;
+  /** Output height, -1 to keep the source height or follow the width */
+  height: number;
+  /** Output frame rate, when it changes */
+  fps?: number;
+  /** The encoder */
+  encoder: Codec;
+  /** The device the frames are decoded and filtered on */
+  hardware?: HardwareContext | null;
+}
+
+/**
+ * A frame as the transcode graph sees it.
+ *
+ * @internal
+ */
+export interface VideoGraphInput {
+  /** The frame lives on a device */
+  hw: boolean;
+  /** The frame lives on the transcode's device */
+  onDevice: boolean;
+  /** Pixel format, the software format of device frames */
+  format: AVPixelFormat;
+  width: number;
+  height: number;
+}
+
+/**
+ * Filters a device has for a transcode.
+ *
+ * @internal
+ */
+export interface DeviceFilters {
+  /** Scales and converts the pixel format on the device */
+  scaler: boolean;
+  /** Uploads software frames well enough to scale them there instead of on the CPU */
+  upload: boolean;
+}
+
+/**
+ * Devices whose upload and scaler are proven together; elsewhere software frames are scaled on the CPU.
+ *
+ * @internal
+ */
+const UPLOAD_SCALE_DEVICES: readonly AVHWDeviceType[] = [AV_HWDEVICE_TYPE_VAAPI, AV_HWDEVICE_TYPE_CUDA, AV_HWDEVICE_TYPE_VIDEOTOOLBOX];
+
+/**
+ * Filters per device type, the build decides which exist.
+ *
+ * @internal
+ */
+const deviceFilterCache = new Map<AVHWDeviceType, DeviceFilters>();
+
+/**
+ * Build the filter graph that brings a decoded frame to the video encoder of a transcode.
+ *
+ * Frames stay on the device whenever the encoder takes them there, and scaling
+ * and format conversion run on the device whenever it has a scaler. Hardware
+ * encoders get 8-bit 4:2:0 in NV12: VAAPI decodes JPEG into planar or 4:2:2
+ * surfaces and 10-bit sources come as P010, which H.264 hardware encoders reject.
+ * Software encoders get yuv420p when the frames have to be converted anyway, it
+ * is the layout every browser and HomeKit decodes (unlike the 4:2:2 profile x264
+ * picks for a 4:2:2 JPEG camera). Packed sources such as yuyv422 are converted
+ * too, swscale cannot scale them in place.
+ *
+ * Decided per frame, not per stream: a hardware decoder falls back to software
+ * frames for input it cannot handle, e.g. 4:2:2 JPEG on NVDEC.
+ *
+ * @param input - The frame
+ *
+ * @param target - The encoder's needs
+ *
+ * @param filters - What the target's device has, see {@link findDeviceFilters}
+ *
+ * @returns The filter description, `null` when the frame can go to the encoder as it is
+ *
+ * @internal
+ */
+export function videoTranscodeGraph(input: VideoGraphInput, target: VideoTranscodeTarget, filters: DeviceFilters): string {
+  const { encoder, hardware } = target;
+  const size = resolveScaleSize(input.width, input.height, target.width, target.height);
+  const parts: string[] = [];
+  let resize = size.width !== input.width || size.height !== input.height;
+  let format = input.format;
+
+  // a frame dropped first costs no later stage anything
+  if (target.fps !== undefined) parts.push(`fps=${target.fps}`);
+
+  const takesDevice = !!hardware && encoderTakesDevice(encoder, hardware);
+
+  if (input.hw) {
+    if (input.onDevice && filters.scaler) {
+      // the scaler converts in the same pass, and a software encoder gets NV12 downloaded
+      if (resize || format !== AV_PIX_FMT_NV12) parts.push(deviceScale(hardware!, resize ? size : undefined));
+      if (takesDevice) return finish(parts);
+      parts.push('hwdownload', 'format=nv12');
+      format = AV_PIX_FMT_NV12;
+      resize = false;
+    } else if (input.onDevice && takesDevice && !resize && format === AV_PIX_FMT_NV12) {
+      return finish(parts);
+    } else {
+      parts.push('hwdownload', `format=${pixFmtName(format)}`);
+    }
+  }
+
+  // software frames from here on
+  const softwareFormat = encoderSoftwareFormat(encoder);
+  if (hardware && (softwareFormat === null || (takesDevice && resize && filters.upload && filters.scaler))) {
+    // the encoder takes device frames only, or the device scales cheaper than the CPU
+    const scaleOnDevice = resize && filters.scaler;
+    if (resize && !scaleOnDevice) parts.push(`scale=${size.width}:${size.height}`);
+    parts.push('format=nv12', FilterPreset.chain(hardware).hwupload().build());
+    if (scaleOnDevice) parts.push(deviceScale(hardware, size));
+    return finish(parts);
+  }
+
+  if (resize) parts.push(`scale=${size.width}:${size.height}`);
+  if (resize || !takesAsIs(encoder, format)) parts.push(`format=${pixFmtName(softwareFormat ?? AV_PIX_FMT_NV12)}`);
+  return finish(parts);
+}
+
+/**
+ * Describe a decoded frame for {@link videoTranscodeGraph}.
+ *
+ * @param frame - The frame
+ *
+ * @param hardware - The transcode's device, if any
+ *
+ * @returns Where the frame lives, its format and size
+ *
+ * @internal
+ */
+export function describeVideoFrame(frame: Frame, hardware?: HardwareContext | null): VideoGraphInput {
+  const hw = frame.isHwFrame();
+  return {
+    hw,
+    onDevice: hw && !!hardware && frame.format === hardware.devicePixelFormat,
+    format: hw ? (frame.hwFramesCtx?.swFormat ?? AV_PIX_FMT_NV12) : (frame.format as AVPixelFormat),
+    width: frame.width,
+    height: frame.height,
+  };
+}
+
+/**
+ * Create the filter between the video decoder (or frame source) and the encoder of a transcode.
+ *
+ * The graph is built by {@link videoTranscodeGraph} from the first frame and
+ * again whenever the frames change, e.g. when the decoder falls back to software.
+ *
+ * @param target - The encoder's needs
+ *
+ * @returns The filter
+ *
+ * @internal
+ */
+export function createVideoTranscodeFilter(target: VideoTranscodeTarget): FilterAPI {
+  const filters = findDeviceFilters(target.hardware);
+  return FilterAPI.create((frame) => videoTranscodeGraph(describeVideoFrame(frame, target.hardware), target, filters), {
+    hardware: target.hardware,
+  });
+}
+
+/**
+ * Whether an encoder takes the frames of a device as they are.
+ *
+ * @param encoder - The encoder
+ *
+ * @param hardware - The device
+ *
+ * @returns True for a hardware encoder that lists the device's pixel format
+ *
+ * @internal
+ */
+function encoderTakesDevice(encoder: Codec, hardware: HardwareContext): boolean {
+  return encoder.isHardwareAcceleratedEncoder() && (encoder.pixelFormats?.includes(hardware.devicePixelFormat) ?? false);
+}
+
+/**
+ * The software format to convert frames to for an encoder.
+ *
+ * @param encoder - The encoder
+ *
+ * @returns NV12 for hardware encoders and yuv420p for software ones when listed,
+ * otherwise the closest listed software format; `null` if it takes device frames only
+ *
+ * @internal
+ */
+function encoderSoftwareFormat(encoder: Codec): AVPixelFormat | null {
+  const formats = encoder.pixelFormats;
+  if (!formats || formats.length === 0) return AV_PIX_FMT_YUV420P;
+  const preferred = encoder.isHardwareAcceleratedEncoder() ? [AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P] : [AV_PIX_FMT_YUV420P, AV_PIX_FMT_NV12];
+  const listed = preferred.find((format) => formats.includes(format));
+  if (listed !== undefined) return listed;
+  const software = formats.filter((format) => !avIsHardwarePixelFormat(format));
+  return software.length > 0 ? pickSupportedPixelFormat(AV_PIX_FMT_YUV420P, software) : null;
+}
+
+/**
+ * Whether an encoder takes a software frame without conversion.
+ *
+ * @param encoder - The encoder
+ *
+ * @param format - The frame's pixel format
+ *
+ * @returns True for 8-bit 4:2:0 the encoder lists
+ *
+ * @internal
+ */
+function takesAsIs(encoder: Codec, format: AVPixelFormat): boolean {
+  const is420 = format === AV_PIX_FMT_YUV420P || format === AV_PIX_FMT_YUVJ420P || format === AV_PIX_FMT_NV12;
+  return is420 && (encoder.pixelFormats?.includes(format) ?? true);
+}
+
+/**
+ * The device scaler converting to NV12, scaling too when given a size.
+ *
+ * @param hardware - The device
+ *
+ * @param size - Output size, if it changes
+ *
+ * @param size.width - Output width
+ *
+ * @param size.height - Output height
+ *
+ * @returns The filter
+ *
+ * @internal
+ */
+function deviceScale(hardware: HardwareContext, size?: { width: number; height: number }): string {
+  const chain = FilterPreset.chain(hardware);
+  return (size ? chain.scale(size.width, size.height, { format: 'nv12' }) : chain.scaleFormat(AV_PIX_FMT_NV12)).build();
+}
+
+/**
+ * Find out which transcode filters a device has in this FFmpeg build.
+ *
+ * @param hardware - The device, if any
+ *
+ * @returns Its filters, none without a device
+ *
+ * @internal
+ */
+export function findDeviceFilters(hardware: HardwareContext | null | undefined): DeviceFilters {
+  if (!hardware) return { scaler: false, upload: false };
+  let filters = deviceFilterCache.get(hardware.deviceType);
+  if (!filters) {
+    const exists = (description: string): boolean => Filter.getByName(description.split('=')[0]) !== null;
+    const scaler = FilterPreset.chain(hardware).supports('scale') && exists(FilterPreset.chain(hardware).scaleFormat(AV_PIX_FMT_NV12).build());
+    const upload = UPLOAD_SCALE_DEVICES.includes(hardware.deviceType) && exists(FilterPreset.chain(hardware).hwupload().build());
+    filters = { scaler, upload };
+    deviceFilterCache.set(hardware.deviceType, filters);
+  }
+  return filters;
+}
+
+/**
+ * Join the filters of a graph.
+ *
+ * @param parts - The filters
+ *
+ * @returns The description, `null` for none
+ *
+ * @internal
+ */
+function finish(parts: string[]): string {
+  return parts.length > 0 ? parts.join(',') : 'null';
+}
+
+/**
+ * Name of a pixel format for a filter description.
+ *
+ * @param format - The pixel format
+ *
+ * @returns Its name
+ *
+ * @internal
+ */
+function pixFmtName(format: AVPixelFormat): string {
+  return avGetPixFmtName(format) ?? 'nv12';
+}

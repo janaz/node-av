@@ -2,10 +2,11 @@ import assert from 'node:assert';
 import { writeFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
 
-import { FF_ENCODER_LIBX264 } from '../src/index.js';
-import { getInputFile, getOutputFile, prepareTestEnvironment, stallingFrameSource } from './index.js';
+import { AV_CODEC_ID_H264, AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P, avGetPixFmtName, FF_ENCODER_LIBX264 } from '../src/index.js';
+import { encoderInputFormat, getInputFile, getOutputFile, prepareTestEnvironment, stallingFrameSource, yuvj422pSource } from './index.js';
 
 import type { RtpPacket } from 'werift';
+import type { AVPixelFormat, Encoder } from '../src/index.js';
 import type { RTPStreamOptions } from '../src/webrtc/index.js';
 
 prepareTestEnvironment();
@@ -159,6 +160,32 @@ describe('RTPStream', skipWerift, () => {
 
       assert.ok(packets.length > 0, 'expected RTP packets from the scaled yuyv422 source');
     });
+  });
+
+  describe('transcode pixel format', () => {
+    // 4:2:2 JPEG cameras decode to yuvj422p: x264 took it as is and wrote High 4:2:2,
+    // which browsers cannot decode, hardware encoders rejected it outright
+    for (const hardware of [undefined, 'auto'] as const) {
+      it(`hands the encoder 8-bit 4:2:0 for a 4:2:2 source (${hardware ?? 'software'})`, async () => {
+        const { RTPStream } = await import('../src/webrtc/index.js');
+        const { file, inputOptions } = yuvj422pSource('rtp-yuvj422p.raw');
+        let format: AVPixelFormat | undefined;
+        const closed = Promise.withResolvers<void>();
+        const stream = RTPStream.create(file, {
+          supportedVideoCodecs: [AV_CODEC_ID_H264],
+          inputOptions,
+          hardware,
+          onVideoPacket: () => {
+            format ??= encoderInputFormat((stream as unknown as { videoEncoder?: Encoder }).videoEncoder);
+          },
+          onClose: (error) => (error ? closed.reject(error) : closed.resolve()),
+        });
+        await stream.start();
+        await withTimeout(closed.promise, 30000);
+        await stream.stop();
+        assert.ok(format === AV_PIX_FMT_YUV420P || format === AV_PIX_FMT_NV12, `encoder input ${format === undefined ? 'none' : avGetPixFmtName(format)}`);
+      });
+    }
   });
 
   describe('bitrate cap', () => {

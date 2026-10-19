@@ -3,10 +3,10 @@ import { existsSync, unlinkSync, writeFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
 
 import { PacketAgeWatchdog } from '../src/api/utilities/packet-age-watchdog.js';
-import { AV_CODEC_ID_OPUS, AV_NOPTS_VALUE, Demuxer, FMP4Stream, FormatContext } from '../src/index.js';
-import { getInputFile, getOutputFile, prepareTestEnvironment, stallingFrameSource, syntheticVideoFrame } from './index.js';
+import { AV_CODEC_ID_OPUS, AV_NOPTS_VALUE, AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P, avGetPixFmtName, Demuxer, FMP4Stream, FormatContext } from '../src/index.js';
+import { encoderInputFormat, getInputFile, getOutputFile, prepareTestEnvironment, stallingFrameSource, syntheticVideoFrame, yuvj422pSource } from './index.js';
 
-import type { Encoder, FMP4Data, FMP4StreamOptions, Frame, MediaFrameSource, MP4Box, Packet } from '../src/index.js';
+import type { AVPixelFormat, Encoder, FMP4Data, FMP4StreamOptions, Frame, MediaFrameSource, MP4Box, Packet } from '../src/index.js';
 
 prepareTestEnvironment();
 
@@ -895,6 +895,32 @@ describe('FMP4Stream', () => {
         assert.equal(await gopOf({ video: frames() }, options), framesGop, `frame source, fragDuration ${label}`);
       }
     });
+  });
+
+  describe('transcode pixel format', () => {
+    // 4:2:2 JPEG cameras decode to yuvj422p: x264 took it as is and wrote High 4:2:2,
+    // which browsers and HomeKit cannot decode, hardware encoders rejected it outright
+    for (const hardware of [undefined, 'auto'] as const) {
+      it(`hands the encoder 8-bit 4:2:0 for a 4:2:2 source (${hardware ?? 'software'})`, async () => {
+        const { file, inputOptions } = yuvj422pSource('fmp4-yuvj422p.raw');
+        let format: AVPixelFormat | undefined;
+        const closed = Promise.withResolvers<void>();
+        const stream: FMP4Stream = FMP4Stream.create(file, {
+          supportedCodecs: 'avc1.640029',
+          inputOptions,
+          hardware,
+          // the init segment follows the encoder's first frame
+          onData: () => {
+            format ??= encoderInputFormat((stream as unknown as { videoEncoder?: Encoder }).videoEncoder);
+          },
+          onClose: (error) => (error ? closed.reject(error) : closed.resolve()),
+        });
+        await stream.start();
+        await withTimeout(closed.promise, 30000);
+        await stream.stop();
+        assert.ok(format === AV_PIX_FMT_YUV420P || format === AV_PIX_FMT_NV12, `encoder input ${format === undefined ? 'none' : avGetPixFmtName(format)}`);
+      });
+    }
   });
 
   describe('audio transcode target', () => {

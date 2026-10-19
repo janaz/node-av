@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -8,8 +8,10 @@ import { Rational } from '../src/lib/rational.js';
 
 import type { BitStreamFilterAPI } from '../src/api/bitstream-filter.js';
 import type { Decoder } from '../src/api/decoder.js';
+import type { DemuxerOptions } from '../src/api/demuxer.js';
 import type { Encoder } from '../src/api/encoder.js';
 import type { FilterAPI } from '../src/api/filter.js';
+import type { AVPixelFormat } from '../src/constants/index.js';
 import type { Packet } from '../src/lib/packet.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -176,6 +178,20 @@ export function syntheticVideoFrame(index: number, width = 320, height = 240): F
   planes?.[1]?.fill(128);
   planes?.[2]?.fill(128);
   return frame;
+}
+
+// gray rawvideo in the format a 4:2:2 JPEG camera decodes to, with the demuxer options to read it
+export function yuvj422pSource(name: string, width = 320, height = 240, frames = 15): { file: string; inputOptions: DemuxerOptions } {
+  const file = getOutputFile(name);
+  const frame = Buffer.alloc(width * height * 2, 0x80);
+  writeFileSync(file, Buffer.concat(Array.from({ length: frames }, () => frame)));
+  return { file, inputOptions: { format: 'rawvideo', options: { pixel_format: 'yuvj422p', video_size: `${width}x${height}`, framerate: '15' } } };
+}
+
+// the format frames reach an encoder in, the software format of device frames
+export function encoderInputFormat(encoder: Encoder | undefined): AVPixelFormat | undefined {
+  const context = encoder?.getCodecContext();
+  return context ? (context.hwFramesCtx?.swFormat ?? context.pixelFormat) : undefined;
 }
 
 export async function* stallingFrameSource(count: number, onSilent: () => void): AsyncGenerator<Frame | null> {
