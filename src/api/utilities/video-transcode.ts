@@ -1,5 +1,7 @@
 import {
   AVCOL_RANGE_MPEG,
+  AV_CODEC_CAP_EXPERIMENTAL,
+  AV_CODEC_CAP_HARDWARE,
   AV_HWDEVICE_TYPE_CUDA,
   AV_HWDEVICE_TYPE_D3D11VA,
   AV_HWDEVICE_TYPE_DRM,
@@ -288,6 +290,32 @@ export async function openTranscodeDecoder(stream: Stream, hardware: HardwareCon
     }
   }
   return await Decoder.create(stream, options);
+}
+
+/**
+ * Find the software encoder for a codec.
+ *
+ * FFmpeg picks the first encoder registered for a codec. The Linux arm64
+ * builds register the Rockchip MPP encoders ahead of libx264 and libx265, and
+ * those fail to open on every other arm64 machine, e.g. a Raspberry Pi.
+ *
+ * @param codecId - The codec to encode
+ *
+ * @returns The first encoder for the codec that is no hardware encoder, FFmpeg's pick when there is none
+ *
+ * @internal
+ */
+export function findSoftwareEncoder(codecId: AVCodecID): Codec | null {
+  let opaque: bigint | null = null;
+  let result;
+  while ((result = Codec.iterateCodecs(opaque))) {
+    const { codec } = result;
+    if (codec.isEncoder() && codec.id === codecId && !codec.hasCapabilities(AV_CODEC_CAP_HARDWARE) && !codec.hasCapabilities(AV_CODEC_CAP_EXPERIMENTAL)) {
+      return codec;
+    }
+    opaque = result.opaque;
+  }
+  return Codec.findEncoder(codecId);
 }
 
 /**

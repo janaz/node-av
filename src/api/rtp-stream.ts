@@ -17,7 +17,7 @@ import { Muxer } from './muxer.js';
 import { interruptibleFrameSource, pipeline } from './pipeline.js';
 import { pickSupportedLayout, pickSupportedRate, pickSupportedSampleFormat } from './utilities/codec-format.js';
 import { configureLiveDecoderThreading } from './utilities/live-decoding.js';
-import { createVideoTranscodeFilter, findUsableHardwareEncoder, openTranscodeDecoder } from './utilities/video-transcode.js';
+import { createVideoTranscodeFilter, findSoftwareEncoder, findUsableHardwareEncoder, openTranscodeDecoder } from './utilities/video-transcode.js';
 
 import type { AVCodecID, AVHWDeviceType, AVSampleFormat, FFAudioEncoder, FFHWDeviceType, FFVideoEncoder } from '../constants/index.js';
 import type { CodecContext } from '../lib/codec-context.js';
@@ -1251,7 +1251,7 @@ export class RTPStream {
     if (typeof target === 'string') {
       return Codec.findEncoderByName(target);
     }
-    return (await findUsableHardwareEncoder(this.hardwareContext, target, this.options.video.encoderOptions)) ?? Codec.findEncoder(target);
+    return (await findUsableHardwareEncoder(this.hardwareContext, target, this.options.video.encoderOptions)) ?? findSoftwareEncoder(target);
   }
 
   /**

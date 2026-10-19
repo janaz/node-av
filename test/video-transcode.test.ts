@@ -2,6 +2,7 @@ import assert from 'node:assert';
 import { describe, it } from 'node:test';
 
 import {
+  AV_CODEC_ID_H264,
   AV_HWDEVICE_TYPE_CUDA,
   AV_HWDEVICE_TYPE_D3D11VA,
   AV_HWDEVICE_TYPE_QSV,
@@ -32,6 +33,7 @@ import {
   createVideoTranscodeFilter,
   describeVideoFrame,
   findDeviceFilters,
+  findSoftwareEncoder,
   findUsableHardwareEncoder,
   videoTranscodeGraph,
 } from '../src/api/utilities/video-transcode.js';
@@ -207,6 +209,13 @@ describe('video transcode graph', () => {
   describe('findDeviceFilters', () => {
     it('has no filters without a device', () => {
       assert.deepEqual(findDeviceFilters(null), noFilters);
+    });
+  });
+
+  describe('findSoftwareEncoder', () => {
+    // Linux arm64 builds register h264_rkmpp ahead of libx264
+    it('passes over hardware encoders registered first', () => {
+      assert.equal(findSoftwareEncoder(AV_CODEC_ID_H264)?.name, FF_ENCODER_LIBX264);
     });
   });
 
