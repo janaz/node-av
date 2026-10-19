@@ -26,7 +26,7 @@ import {
   HardwareContext,
 } from '../src/index.js';
 import { Frame, Rational, avcodecFindBestPixFmtOfList } from '../src/lib/index.js';
-import { encodeFrame, encodeFrameSync, getInputFile } from './index.js';
+import { encodeFrame, encodeFrameSync, getInputFile, syntheticVideoFrame } from './index.js';
 
 import type { Packet } from '../src/lib/index.js';
 
@@ -1435,6 +1435,47 @@ describe('Encoder', () => {
 
       const ctx = encoder.getCodecContext()!;
       assert.deepEqual({ ...ctx.framerate }, { num: 30, den: 1 });
+      assert.deepEqual({ ...ctx.timeBase }, { num: 1, den: 30 });
+    });
+
+    it('should not take a briefly probed stream clock as frame rate', async () => {
+      // The cover picture runs on a 1/90000 clock. Probed like RTPStream does, the
+      // guess is that clock: 90000 fps, as for MJPEG over RTSP
+      await using media = await Demuxer.open(getInputFile('audio-cover.mp3'), { options: { analyzeduration: 0, probesize: 32 } });
+      const video = media.video()!;
+      using decoder = await Decoder.create(video);
+      assert.deepEqual({ ...decoder.getGuessedFrameRate() }, { num: 90000, den: 1 });
+      using encoder = await Encoder.create(FF_ENCODER_LIBX264, { decoder, autoFormat: true, options: { preset: 'ultrafast' } });
+
+      for await (using frame of decoder.frames(media.packets(video.index))) {
+        if (!frame) continue;
+        (await encoder.encodeAll(frame)).forEach((p) => p.free());
+        break;
+      }
+
+      const ctx = encoder.getCodecContext()!;
+      assert.deepEqual({ ...ctx.framerate }, { num: 25, den: 1 }, 'declares the fallback rate');
+      assert.deepEqual({ ...ctx.timeBase }, { num: 1, den: 90000 }, 'keeps the clock for the timestamps');
+    });
+
+    it('should declare 25 fps for frames on a clock without a rate', async () => {
+      using encoder = await Encoder.create(FF_ENCODER_LIBX264, { options: { preset: 'ultrafast' } });
+      using frame = syntheticVideoFrame(0);
+      frame.timeBase = new Rational(1, 90000);
+      (await encoder.encodeAll(frame)).forEach((p) => p.free());
+
+      const ctx = encoder.getCodecContext()!;
+      assert.deepEqual({ ...ctx.framerate }, { num: 25, den: 1 });
+      assert.deepEqual({ ...ctx.timeBase }, { num: 1, den: 90000 });
+    });
+
+    it('should read a frame-rate time base as the rate', () => {
+      using encoder = Encoder.createSync(FF_ENCODER_LIBX264, { options: { preset: 'ultrafast' } });
+      using frame = syntheticVideoFrame(0);
+      encoder.encodeAllSync(frame).forEach((p) => p.free());
+
+      const ctx = encoder.getCodecContext()!;
+      assert.equal(ctx.framerate.num, 0, 'nothing declared');
       assert.deepEqual({ ...ctx.timeBase }, { num: 1, den: 30 });
     });
   });
