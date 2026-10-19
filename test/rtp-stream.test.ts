@@ -3,10 +3,10 @@ import { writeFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
 
 import { AV_CODEC_ID_H264, AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P, avGetPixFmtName, FF_ENCODER_LIBX264 } from '../src/index.js';
-import { encoderInputFormat, getInputFile, getOutputFile, prepareTestEnvironment, stallingFrameSource, yuvj422pSource } from './index.js';
+import { encoderInputFormat, getInputFile, getOutputFile, prepareTestEnvironment, stallingFrameSource, syntheticVideoFrame, yuvj422pSource } from './index.js';
 
 import type { RtpPacket } from 'werift';
-import type { AVPixelFormat, Encoder } from '../src/index.js';
+import type { AVPixelFormat, Encoder, Frame } from '../src/index.js';
 import type { RTPStreamOptions } from '../src/webrtc/index.js';
 
 prepareTestEnvironment();
@@ -318,6 +318,49 @@ describe('RTPStream', skipWerift, () => {
         process.off('unhandledRejection', onRejection);
         process.off('warning', onWarning);
       }
+    });
+  });
+
+  describe('keyframe request', () => {
+    // Start of an IDR picture in an H.264 RTP payload: single NAL, FU-A start or inside a STAP-A
+    const startsIdr = (payload: Buffer): boolean => {
+      const type = payload[0] & 0x1f;
+      if (type === 5) return true;
+      if (type === 28) return (payload[1] & 0x80) !== 0 && (payload[1] & 0x1f) === 5;
+      if (type === 24) {
+        for (let offset = 1; offset + 2 < payload.length; offset += 2 + payload.readUInt16BE(offset)) {
+          if ((payload[offset + 2] & 0x1f) === 5) return true;
+        }
+      }
+      return false;
+    };
+
+    it('should encode a requested keyframe for a frame source', skipWerift, async () => {
+      const { RTPStream } = await import('../src/webrtc/index.js');
+      let idrs = 0;
+      const closed = Promise.withResolvers<void>();
+      // 30 fps keeps the next scheduled keyframe 60 frames away, past the end
+      async function* frames(): AsyncGenerator<Frame | null> {
+        for (let i = 0; i < 40; i++) {
+          if (i === 20) stream.requestVideoKeyframe();
+          yield syntheticVideoFrame(i);
+        }
+        yield null;
+      }
+      const stream = RTPStream.create(
+        { video: frames() },
+        {
+          video: { fps: 30 },
+          onVideoPacket: (rtp: RtpPacket) => {
+            if (startsIdr(rtp.payload)) idrs++;
+          },
+          onClose: (error) => (error ? closed.reject(error) : closed.resolve()),
+        },
+      );
+      await stream.start();
+      await closed.promise;
+      await stream.stop();
+      assert.equal(idrs, 2, 'the first frame and the requested one');
     });
   });
 

@@ -825,9 +825,13 @@ export class RTPStream {
       if (encoderCodec.name === FF_ENCODER_LIBX264 || encoderCodec.name === FF_ENCODER_LIBX265) {
         encoderOptions.preset = 'ultrafast';
         encoderOptions.tune = 'zerolatency';
-        // Make a requested keyframe (frame.pictType = I) an actual IDR, so a
-        // receiver that missed the stream start can resync (PLI handling).
-        encoderOptions['forced-idr'] = true;
+      }
+      // Make a requested keyframe (frame.pictType = I) an actual IDR, so a
+      // receiver that missed the stream start can resync (PLI handling).
+      // VAAPI, D3D12 and VideoToolbox do so without an option
+      const forcedIdr = forcedIdrOption(encoderCodec.name);
+      if (forcedIdr) {
+        encoderOptions[forcedIdr] = true;
       }
       encoderOptions = { ...encoderOptions, ...this.options.video.encoderOptions };
 
@@ -846,6 +850,8 @@ export class RTPStream {
       const bitrate = this.options.video.bitrate;
       this.videoEncoder = await Encoder.create(encoderCodec, {
         maxBFrames: 0,
+        // the encoder would clear the pictType a keyframe request sets
+        preserveFramePictType: true,
         options: encoderOptions,
         configure: (ctx) => {
           ctx.framerate = new Rational(Math.round(fps), 1);
@@ -1345,4 +1351,23 @@ export class RTPStream {
     if (picked.nbChannels === 2) return 'stereo';
     return picked.mask.toString();
   }
+}
+
+/**
+ * The option that makes an encoder emit a forced I frame (frame.pictType = I) as IDR.
+ *
+ * @param name - The encoder's name
+ *
+ * @returns The option, or null when the encoder needs none or has none
+ *
+ * @internal
+ */
+function forcedIdrOption(name: string | null): string | null {
+  if (name === FF_ENCODER_LIBX264 || name === FF_ENCODER_LIBX265 || name?.endsWith('_nvenc')) {
+    return 'forced-idr';
+  }
+  if (name?.endsWith('_qsv') || name?.endsWith('_amf')) {
+    return 'forced_idr';
+  }
+  return null;
 }
