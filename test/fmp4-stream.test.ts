@@ -897,6 +897,35 @@ describe('FMP4Stream', () => {
     });
   });
 
+  describe('transcode B-frames', () => {
+    it('encodes without B-frames, also with encoder options that would add them', async () => {
+      const reorderOf = async (input: string | MediaFrameSource): Promise<number | undefined> => {
+        let reorder: number | undefined;
+        const closed = Promise.withResolvers<void>();
+        const stream: FMP4Stream = FMP4Stream.create(input, {
+          supportedCodecs: 'avc1.640029',
+          video: { encoderOptions: { preset: 'medium', tune: 'film' } },
+          onData: () => {
+            reorder ??= (stream as unknown as { videoEncoder?: Encoder }).videoEncoder?.getCodecContext()?.hasBFrames;
+          },
+          onClose: (error) => (error ? closed.reject(error) : closed.resolve()),
+        });
+        await stream.start();
+        await withTimeout(closed.promise, 30000);
+        await stream.stop();
+        return reorder;
+      };
+      // The preset's lookahead holds every packet until the flush at the end
+      const frames = async function* (): AsyncGenerator<Frame | null> {
+        for (let i = 0; i < 10; i++) yield syntheticVideoFrame(i);
+        yield null;
+      };
+
+      assert.equal(await reorderOf(getInputFile('hevc-short.mp4')), 0, 'transcoded input');
+      assert.equal(await reorderOf({ video: frames() }), 0, 'frame source');
+    });
+  });
+
   describe('transcode pixel format', () => {
     // 4:2:2 JPEG cameras decode to yuvj422p: x264 took it as is and wrote High 4:2:2,
     // which browsers and HomeKit cannot decode, hardware encoders rejected it outright

@@ -950,6 +950,9 @@ export class FMP4Stream {
       this.videoEncoder = await Encoder.create(encoderCodec, {
         decoder: this.videoDecoder,
         filter: this.videoFilter,
+        // Hardware encoders default to B-frames, which delay every fragment and
+        // fail on some D3D12 drivers that report support for them
+        context: { maxBFrames: 0 },
         options: encoderOptions,
         configure: (ctx) => {
           ctx.gopSize = this.gopSize(fpsForGop);
@@ -1249,6 +1252,7 @@ export class FMP4Stream {
       const bitrate = this.options.video.bitrate;
 
       this.videoEncoder = await Encoder.create(encoderCodec, {
+        context: { maxBFrames: 0 },
         options: encoderOptions,
         configure: (ctx) => {
           ctx.framerate = new Rational(Math.round(fps), 1);
