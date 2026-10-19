@@ -1,9 +1,21 @@
 import assert from 'node:assert';
 import { describe, it } from 'node:test';
 
-import { AV_PIX_FMT_YUV420P, AVCOL_RANGE_JPEG, Decoder, Demuxer, HardwareContext, Scaler } from '../src/index.js';
+import {
+  AV_HWDEVICE_TYPE_D3D11VA,
+  AV_HWDEVICE_TYPE_D3D12VA,
+  AV_HWDEVICE_TYPE_DXVA2,
+  AV_PIX_FMT_YUV420P,
+  AVCOL_RANGE_JPEG,
+  Decoder,
+  Demuxer,
+  HardwareContext,
+  Scaler,
+} from '../src/index.js';
 import { Frame, Rational } from '../src/lib/index.js';
 import { getInputFile, prepareTestEnvironment, skipInCI } from './index.js';
+
+import type { AVHWDeviceType } from '../src/index.js';
 
 prepareTestEnvironment();
 
@@ -634,6 +646,48 @@ describe('Scaler', () => {
           }
           const rgb = await scaler.toBuffer(frame, { resize: { width: 320, height: 180 }, format: 'rgb' });
           assert.strictEqual(rgb.length, 320 * 180 * 3);
+        } finally {
+          await close();
+        }
+      } finally {
+        hw.dispose();
+      }
+    });
+
+    it('downloads first where the GPU scaler cannot crop or scale', skipInCI, async () => {
+      const hw = HardwareContext.auto();
+      if (!hw) {
+        console.log('No hardware acceleration available - skipping HW download test');
+        return;
+      }
+
+      try {
+        const { frame, width, height, close } = await firstFrame(hw);
+        using cpu = new Scaler();
+        try {
+          if (!frame.isHwFrame()) {
+            return;
+          }
+          // Only the device type decides; the frames stay on the real device
+          const as = (deviceType: AVHWDeviceType, deviceTypeName: string) => new Scaler({ hardware: { deviceType, deviceTypeName } as HardwareContext });
+          const crop = { crop: { x: width >> 1, y: height >> 1, width: width >> 1, height: height >> 1 }, resize: { width: 128, height: 72 }, format: 'rgb' } as const;
+          const full = { resize: { width: 128, height: 72 }, format: 'rgb' } as const;
+
+          // scale_d3d11 and scale_d3d12 scale on the GPU but ignore the crop
+          for (const [deviceType, name] of [
+            [AV_HWDEVICE_TYPE_D3D11VA, 'd3d11va'],
+            [AV_HWDEVICE_TYPE_D3D12VA, 'd3d12va'],
+          ] as const) {
+            using scaler = as(deviceType, name);
+            assert.ok((await scaler.toBuffer(frame, crop)).equals(await cpu.toBuffer(frame, crop)), `${name} crop`);
+            assert.ok(scaler.toBufferSync(frame, crop).equals(cpu.toBufferSync(frame, crop)), `${name} crop (sync)`);
+            assert.ok((await scaler.toJpeg(frame, crop)).equals(await cpu.toJpeg(frame, crop)), `${name} crop to JPEG`);
+          }
+
+          // DXVA2 has no scaler at all
+          using dxva2 = as(AV_HWDEVICE_TYPE_DXVA2, 'dxva2');
+          assert.ok((await dxva2.toBuffer(frame, full)).equals(await cpu.toBuffer(frame, full)), 'dxva2 full frame');
+          assert.ok((await dxva2.toPng(frame, crop)).equals(await cpu.toPng(frame, crop)), 'dxva2 crop to PNG');
         } finally {
           await close();
         }
