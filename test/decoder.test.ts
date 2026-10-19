@@ -20,6 +20,9 @@ import { FF_DECODER_AAC, FF_DECODER_H264 } from '../src/constants/decoders.js';
 import { Codec, Packet } from '../src/lib/index.js';
 import { decodePacket, decodePacketSync, getInputFile, prepareTestEnvironment } from './index.js';
 
+import type { DecoderOptions } from '../src/api/decoder.js';
+import type { CodecContext } from '../src/lib/index.js';
+
 prepareTestEnvironment();
 
 const inputFile = getInputFile('demux.mp4');
@@ -1548,6 +1551,79 @@ describe('Decoder', () => {
       }
       decoder.close();
       await media.close();
+    });
+  });
+
+  describe('hardware fallback', () => {
+    const noHardware = !HardwareContext.auto() && 'No hardware context available';
+    // A hardware decoder that accepts the stream and returns nothing, like a driver failing every frame
+    const silenceHardware = (ctx: CodecContext): void => {
+      if (ctx.hwDeviceCtx) {
+        ctx.setOption('skip_frame', 'all');
+      }
+    };
+    const countFrames = async (
+      file: string,
+      options: DecoderOptions,
+      onFrame?: (decoder: Decoder, frames: number) => void,
+    ): Promise<{ frames: number; hardware: boolean }> => {
+      await using media = await Demuxer.open(getInputFile(file));
+      const video = media.video()!;
+      using decoder = await Decoder.create(video, { exitOnError: false, ...options });
+      let frames = 0;
+      for await (using frame of decoder.frames(media.packets(video.index))) {
+        if (!frame) continue;
+        frames++;
+        onFrame?.(decoder, frames);
+      }
+      return { frames, hardware: decoder.isHardware() };
+    };
+
+    it('should decode in software when the hardware decoder stays silent', { skip: noHardware }, async (t) => {
+      using hw = HardwareContext.auto()!;
+      const silent = await countFrames('demux.mp4', { hardware: hw, configure: silenceHardware });
+      if (!silent.hardware || silent.frames > 0) return t.skip('Hardware decoder does not take skip_frame');
+
+      const result = await countFrames('demux.mp4', { hardware: hw, hardwareFallback: true, configure: silenceHardware });
+      assert.equal(result.hardware, false);
+      // replayed from the first keyframe, nothing lost
+      assert.equal(result.frames, 60);
+    });
+
+    it('should decode in software synchronously too', { skip: noHardware }, (t) => {
+      using hw = HardwareContext.auto()!;
+      const media = Demuxer.openSync(getInputFile('demux.mp4'));
+      const video = media.video()!;
+      using decoder = Decoder.createSync(video, { hardware: hw, hardwareFallback: true, exitOnError: false, configure: silenceHardware });
+      if (!decoder.isHardware()) {
+        media.closeSync();
+        return t.skip('No hardware decoder for the stream');
+      }
+      let frames = 0;
+      for (using frame of decoder.framesSync(media.packetsSync(video.index))) {
+        if (frame) frames++;
+      }
+      media.closeSync();
+      assert.equal(frames, 60);
+      assert.equal(decoder.isHardware(), false);
+    });
+
+    it('should fall back when a running hardware decoder turns silent', { skip: noHardware }, async (t) => {
+      using hw = HardwareContext.auto()!;
+      // video.mp4 has a keyframe every 12 packets: silent after frame 30, stuck two keyframes later
+      const result = await countFrames('video.mp4', { hardware: hw, hardwareFallback: true }, (decoder, frames) => {
+        if (frames === 30) decoder.getCodecContext()?.setOption('skip_frame', 'all');
+      });
+      if (result.frames === 30) return t.skip('Hardware decoder does not take skip_frame');
+      assert.equal(result.hardware, false);
+      assert.ok(result.frames > 90, `Expected decoding to go on in software, got ${result.frames} of 120 frames`);
+    });
+
+    it('should stay on the device while the hardware decoder works', { skip: noHardware }, async () => {
+      using hw = HardwareContext.auto()!;
+      const plain = await countFrames('video.mp4', { hardware: hw });
+      const watched = await countFrames('video.mp4', { hardware: hw, hardwareFallback: true });
+      assert.deepEqual(watched, plain);
     });
   });
 });

@@ -239,6 +239,9 @@ export function createVideoTranscodeFilter(target: VideoTranscodeTarget, filters
 /**
  * Open the video decoder of a transcode, on the device unless it fails to open there.
  *
+ * A device decoder that opens but then produces nothing moves to software on
+ * its own ({@link DecoderOptions.hardwareFallback}).
+ *
  * @param stream - The video stream
  *
  * @param hardware - The device to decode on, if any
@@ -254,7 +257,7 @@ export function createVideoTranscodeFilter(target: VideoTranscodeTarget, filters
 export async function openTranscodeDecoder(stream: Stream, hardware: HardwareContext | null | undefined, options: DecoderOptions): Promise<Decoder> {
   if (hardware) {
     try {
-      return await Decoder.create(stream, { ...options, hardware });
+      return await Decoder.create(stream, { ...options, hardware, hardwareFallback: true });
     } catch (error) {
       Log.log(AV_LOG_WARNING, `Video decoder failed to open on ${hardware.deviceTypeName}, decoding in software: ${(error as Error).message}\n`);
     }
