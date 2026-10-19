@@ -46,7 +46,7 @@ import { Dictionary } from '../lib/dictionary.js';
 import { FFmpegError } from '../lib/error.js';
 import { HardwareDeviceContext } from '../lib/hardware-device-context.js';
 import { Stream } from '../lib/stream.js';
-import { avGetHardwareDeviceTypeFromName } from '../lib/utilities.js';
+import { avGetHardwareDeviceTypeFromName, avIsHardwarePixelFormat } from '../lib/utilities.js';
 import { getDirname } from '../utils/electron.js';
 import { Decoder } from './decoder.js';
 import { Demuxer } from './demuxer.js';
@@ -1088,16 +1088,6 @@ export class HardwareContext implements Disposable {
       const packetGenerator = input.packetsSync();
       const hwFrameGenerator = decoder.framesSync(packetGenerator);
 
-      // Optionally create hwdownload filter to test hardware → software transfer
-      using filter = useFilter
-        ? FilterAPI.create('hwdownload,format=nv12', {
-            framerate: videoStream.avgFrameRate,
-            hardware: this,
-          })
-        : null;
-
-      const frameGenerator = filter ? filter.framesSync(hwFrameGenerator) : hwFrameGenerator;
-
       // Resolve encoder codec if provided
       if (encoderCodec) {
         if (encoderCodec instanceof Codec) {
@@ -1111,6 +1101,21 @@ export class HardwareContext implements Disposable {
           return false;
         }
       }
+
+      // VAAPI, Vulkan and D3D12 encoders list no software format and refuse downloaded frames
+      const encoderFormats = codecEncoder?.pixelFormats ?? [];
+      const takesDeviceFramesOnly = encoderFormats.length > 0 && encoderFormats.every((format) => avIsHardwarePixelFormat(format));
+
+      // Optionally create hwdownload filter to test hardware → software transfer
+      using filter =
+        useFilter && !takesDeviceFramesOnly
+          ? FilterAPI.create('hwdownload,format=nv12', {
+              framerate: videoStream.avgFrameRate,
+              hardware: this,
+            })
+          : null;
+
+      const frameGenerator = filter ? filter.framesSync(hwFrameGenerator) : hwFrameGenerator;
 
       using encoder = codecEncoder
         ? Encoder.createSync(codecEncoder, {
