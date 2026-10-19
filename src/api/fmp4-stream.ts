@@ -23,7 +23,7 @@ import { Muxer } from './muxer.js';
 import { consumeStreamInParallel, interruptibleFrameSource, pipeline, PipelineControlImpl } from './pipeline.js';
 import { configureLiveDecoderThreading } from './utilities/live-decoding.js';
 import { PacketAgeWatchdog } from './utilities/packet-age-watchdog.js';
-import { createVideoTranscodeFilter } from './utilities/video-transcode.js';
+import { createVideoTranscodeFilter, findUsableHardwareEncoder, openTranscodeDecoder } from './utilities/video-transcode.js';
 
 import type { AVCodecID, AVHWDeviceType, FFHWDeviceType } from '../constants/index.js';
 import type { CodecContext } from '../lib/codec-context.js';
@@ -910,10 +910,11 @@ export class FMP4Stream {
       const currentFps = videoStream.avgFrameRate.num / videoStream.avgFrameRate.den;
       const needsFps = this.options.video.fps !== undefined && isFinite(currentFps) && this.options.video.fps !== currentFps;
 
-      const encoderCodec = this.hardwareContext?.getEncoderCodec('h264') ?? Codec.findEncoderByName(FF_ENCODER_LIBX264)!;
+      const encoderCodec =
+        (await findUsableHardwareEncoder(this.hardwareContext, 'h264', this.options.video.encoderOptions)) ?? Codec.findEncoderByName(FF_ENCODER_LIBX264)!;
+      this.throwIfStopRequested();
 
-      this.videoDecoder = await Decoder.create(videoStream, {
-        hardware: this.hardwareContext,
+      this.videoDecoder = await openTranscodeDecoder(videoStream, this.hardwareContext, {
         exitOnError: false,
         // Frame threading holds back one frame per thread before the first output;
         // files keep the full thread count for throughput
@@ -1227,7 +1228,9 @@ export class FMP4Stream {
         this.hardwareContext = HardwareContext.create(this.options.hardware.deviceType, this.options.hardware.device, this.options.hardware.options);
       }
 
-      const encoderCodec = this.hardwareContext?.getEncoderCodec('h264') ?? Codec.findEncoderByName(FF_ENCODER_LIBX264)!;
+      const encoderCodec =
+        (await findUsableHardwareEncoder(this.hardwareContext, 'h264', this.options.video.encoderOptions)) ?? Codec.findEncoderByName(FF_ENCODER_LIBX264)!;
+      this.throwIfStopRequested();
 
       let encoderOptions: EncoderOptions['options'] = {};
       if (encoderCodec.name === FF_ENCODER_LIBX264) {

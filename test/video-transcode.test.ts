@@ -26,11 +26,12 @@ import {
   FF_HWDEVICE_TYPE_QSV,
   FF_HWDEVICE_TYPE_VAAPI,
   FF_HWDEVICE_TYPE_VIDEOTOOLBOX,
+  HardwareContext,
 } from '../src/index.js';
-import { describeVideoFrame, findDeviceFilters, videoTranscodeGraph } from '../src/api/utilities/video-transcode.js';
+import { describeVideoFrame, findDeviceFilters, findUsableHardwareEncoder, videoTranscodeGraph } from '../src/api/utilities/video-transcode.js';
 import { prepareTestEnvironment, syntheticVideoFrame } from './index.js';
 
-import type { AVHWDeviceType, AVPixelFormat, FFHWDeviceType, HardwareContext } from '../src/index.js';
+import type { AVHWDeviceType, AVPixelFormat, FFHWDeviceType } from '../src/index.js';
 import type { DeviceFilters, VideoGraphInput } from '../src/api/utilities/video-transcode.js';
 
 prepareTestEnvironment();
@@ -177,6 +178,23 @@ describe('video transcode graph', () => {
   describe('findDeviceFilters', () => {
     it('has no filters without a device', () => {
       assert.deepEqual(findDeviceFilters(null), noFilters);
+    });
+  });
+
+  describe('findUsableHardwareEncoder', () => {
+    it('finds nothing without a device', async () => {
+      assert.equal(await findUsableHardwareEncoder(null, 'h264'), null);
+    });
+
+    const hardware = HardwareContext.auto();
+    it('answers the same after testing the encoder once', { skip: hardware ? false : 'no hardware' }, async () => {
+      try {
+        const first = await findUsableHardwareEncoder(hardware, 'h264');
+        assert.ok(first === null || first.isHardwareAcceleratedEncoder());
+        assert.equal((await findUsableHardwareEncoder(hardware, 'h264'))?.name, first?.name);
+      } finally {
+        hardware?.dispose();
+      }
     });
   });
 });

@@ -1,22 +1,31 @@
 import {
+  AVCOL_RANGE_MPEG,
   AV_HWDEVICE_TYPE_CUDA,
   AV_HWDEVICE_TYPE_VAAPI,
   AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+  AV_LOG_WARNING,
   AV_PIX_FMT_NV12,
   AV_PIX_FMT_YUV420P,
   AV_PIX_FMT_YUVJ420P,
 } from '../../constants/constants.js';
 import { Filter } from '../../lib/filter.js';
+import { Frame } from '../../lib/frame.js';
+import { Log } from '../../lib/log.js';
+import { Rational } from '../../lib/rational.js';
 import { avGetPixFmtName, avIsHardwarePixelFormat } from '../../lib/utilities.js';
+import { Decoder } from '../decoder.js';
+import { Encoder } from '../encoder.js';
 import { FilterPreset } from '../filter-presets.js';
 import { FilterAPI } from '../filter.js';
 import { pickSupportedPixelFormat } from './codec-format.js';
 import { resolveScaleSize } from './scale-size.js';
 
-import type { AVHWDeviceType, AVPixelFormat } from '../../constants/index.js';
+import type { AVCodecID, AVHWDeviceType, AVPixelFormat } from '../../constants/index.js';
 import type { Codec } from '../../lib/codec.js';
-import type { Frame } from '../../lib/frame.js';
-import type { HardwareContext } from '../hardware.js';
+import type { Stream } from '../../lib/stream.js';
+import type { DecoderOptions } from '../decoder.js';
+import type { EncoderOptions } from '../encoder.js';
+import type { BaseCodecName, HardwareContext } from '../hardware.js';
 
 /**
  * What the video encoder of a transcode has to receive.
@@ -70,6 +79,28 @@ export interface DeviceFilters {
  * @internal
  */
 const UPLOAD_SCALE_DEVICES: readonly AVHWDeviceType[] = [AV_HWDEVICE_TYPE_VAAPI, AV_HWDEVICE_TYPE_CUDA, AV_HWDEVICE_TYPE_VIDEOTOOLBOX];
+
+/**
+ * How long a hardware encoder that failed its test stays passed over, a busy GPU can recover.
+ *
+ * @internal
+ */
+const FAILED_PROBE_RETRY_MS = 60_000;
+
+/**
+ * Size of the test frame a hardware encoder has to encode.
+ *
+ * @internal
+ */
+const PROBE_WIDTH = 640;
+const PROBE_HEIGHT = 360;
+
+/**
+ * Test encodes per device and encoder, failures with the time they failed.
+ *
+ * @internal
+ */
+const encoderProbes = new Map<string, { usable: Promise<boolean>; failedAt?: number }>();
 
 /**
  * Filters per device type, the build decides which exist.
@@ -185,6 +216,142 @@ export function createVideoTranscodeFilter(target: VideoTranscodeTarget): Filter
   return FilterAPI.create((frame) => videoTranscodeGraph(describeVideoFrame(frame, target.hardware), target, filters), {
     hardware: target.hardware,
   });
+}
+
+/**
+ * Open the video decoder of a transcode, on the device unless it fails to open there.
+ *
+ * @param stream - The video stream
+ *
+ * @param hardware - The device to decode on, if any
+ *
+ * @param options - Decoder options besides the device
+ *
+ * @returns The decoder
+ *
+ * @throws {FFmpegError} If no software decoder opens either
+ *
+ * @internal
+ */
+export async function openTranscodeDecoder(stream: Stream, hardware: HardwareContext | null | undefined, options: DecoderOptions): Promise<Decoder> {
+  if (hardware) {
+    try {
+      return await Decoder.create(stream, { ...options, hardware });
+    } catch (error) {
+      Log.log(AV_LOG_WARNING, `Video decoder failed to open on ${hardware.deviceTypeName}, decoding in software: ${(error as Error).message}\n`);
+    }
+  }
+  return await Decoder.create(stream, options);
+}
+
+/**
+ * Find the device's encoder for a codec, if it works on this machine.
+ *
+ * @param hardware - The device, if any
+ *
+ * @param codec - The codec to encode
+ *
+ * @param options - Encoder options the encoder will get, some drivers need them to open (e.g. `low_power`)
+ *
+ * @returns The hardware encoder, or null to encode in software
+ *
+ * @internal
+ */
+export async function findUsableHardwareEncoder(
+  hardware: HardwareContext | null | undefined,
+  codec: BaseCodecName | AVCodecID,
+  options?: EncoderOptions['options'],
+): Promise<Codec | null> {
+  const encoder = hardware?.getEncoderCodec(codec);
+  return encoder && hardware && (await canEncodeOnDevice(encoder, hardware, options)) ? encoder : null;
+}
+
+/**
+ * Check whether a hardware encoder works on this machine, by encoding a test frame once.
+ *
+ * Finding an encoder says nothing about the driver: NVENC refuses to open
+ * when the driver is older than the API it was built against, many GPUs have
+ * no encoder at all. A failed encoder is passed over for a minute, then tried
+ * again. Concurrent callers share one test.
+ *
+ * @param encoder - The hardware encoder
+ *
+ * @param hardware - The device it encodes on
+ *
+ * @param options - Encoder options the encoder will get
+ *
+ * @returns Whether it encoded the frame
+ *
+ * @internal
+ */
+export async function canEncodeOnDevice(encoder: Codec, hardware: HardwareContext, options?: EncoderOptions['options']): Promise<boolean> {
+  const settings = JSON.stringify(options ?? {}, (_key, value: unknown) => (typeof value === 'bigint' ? String(value) : value));
+  const key = `${hardware.deviceTypeName}:${encoder.name}:${settings}`;
+  const known = encoderProbes.get(key);
+  if (known && (known.failedAt === undefined || Date.now() - known.failedAt < FAILED_PROBE_RETRY_MS)) {
+    return known.usable;
+  }
+
+  const probe: { usable: Promise<boolean>; failedAt?: number } = { usable: probeEncoder(encoder, hardware, options) };
+  encoderProbes.set(key, probe);
+  const usable = await probe.usable;
+  if (!usable) {
+    probe.failedAt = Date.now();
+    Log.log(AV_LOG_WARNING, `Hardware encoder ${encoder.name} failed to encode a test frame on ${hardware.deviceTypeName}, encoding video in software\n`);
+  }
+  return usable;
+}
+
+/**
+ * Encode one frame with a hardware encoder.
+ *
+ * @param codec - The hardware encoder
+ *
+ * @param hardware - The device it encodes on
+ *
+ * @param options - Encoder options
+ *
+ * @returns Whether a packet came out
+ *
+ * @internal
+ */
+async function probeEncoder(codec: Codec, hardware: HardwareContext, options: EncoderOptions['options']): Promise<boolean> {
+  try {
+    using frame = Frame.fromVideoBuffer(Buffer.alloc((PROBE_WIDTH * PROBE_HEIGHT * 3) / 2), {
+      width: PROBE_WIDTH,
+      height: PROBE_HEIGHT,
+      format: AV_PIX_FMT_NV12,
+      timeBase: { num: 1, den: 25 },
+      pts: 0n,
+    });
+    // an unset range makes some encoders warn
+    frame.colorRange = AVCOL_RANGE_MPEG;
+    using upload = encoderSoftwareFormat(codec) === null ? FilterAPI.create(FilterPreset.chain(hardware).hwupload().build(), { hardware }) : undefined;
+    using encoder = await Encoder.create(codec, {
+      maxBFrames: 0,
+      options,
+      configure: (context) => {
+        context.framerate = new Rational(25, 1);
+      },
+    });
+
+    const inputs = upload ? await upload.processAll(frame) : [frame];
+    let packets = 0;
+    try {
+      for (const input of inputs) {
+        for (const packet of await encoder.encodeAll(input)) {
+          packets++;
+          packet.free();
+        }
+      }
+    } finally {
+      if (upload) inputs.forEach((input) => input.free());
+    }
+    for await (using _packet of encoder.flushPackets()) packets++;
+    return packets > 0;
+  } catch {
+    return false;
+  }
 }
 
 /**

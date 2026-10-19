@@ -17,7 +17,7 @@ import { Muxer } from './muxer.js';
 import { interruptibleFrameSource, pipeline } from './pipeline.js';
 import { pickSupportedLayout, pickSupportedRate, pickSupportedSampleFormat } from './utilities/codec-format.js';
 import { configureLiveDecoderThreading } from './utilities/live-decoding.js';
-import { createVideoTranscodeFilter } from './utilities/video-transcode.js';
+import { createVideoTranscodeFilter, findUsableHardwareEncoder, openTranscodeDecoder } from './utilities/video-transcode.js';
 
 import type { AVCodecID, AVHWDeviceType, AVSampleFormat, FFAudioEncoder, FFHWDeviceType, FFVideoEncoder } from '../constants/index.js';
 import type { CodecContext } from '../lib/codec-context.js';
@@ -534,20 +534,14 @@ export class RTPStream {
         throw new Error('No supported video codec specified for transcoding');
       }
 
-      let encoderCodec: Codec | null = null;
-      if (typeof targetCodecId === 'string') {
-        encoderCodec = Codec.findEncoderByName(targetCodecId);
-      } else {
-        encoderCodec = this.hardwareContext?.getEncoderCodec(targetCodecId) ?? Codec.findEncoder(targetCodecId);
-      }
-
+      const encoderCodec = await this.findVideoEncoder(targetCodecId);
       if (!encoderCodec) {
         throw new Error(`No encoder found for codec ID ${targetCodecId}`);
       }
+      this.throwIfStopRequested();
 
-      this.videoDecoder = await Decoder.create(videoStream, {
+      this.videoDecoder = await openTranscodeDecoder(videoStream, this.hardwareContext, {
         exitOnError: false,
-        hardware: this.hardwareContext,
         // Frame threading holds back one frame per thread before the first output
         configure: configureLiveDecoderThreading,
       });
@@ -821,15 +815,11 @@ export class RTPStream {
       }
 
       const targetCodecId = this.options.supportedVideoCodecs[0] ?? FF_ENCODER_LIBX264;
-      let encoderCodec: Codec | null = null;
-      if (typeof targetCodecId === 'string') {
-        encoderCodec = Codec.findEncoderByName(targetCodecId);
-      } else {
-        encoderCodec = this.hardwareContext?.getEncoderCodec(targetCodecId) ?? Codec.findEncoder(targetCodecId);
-      }
+      const encoderCodec = await this.findVideoEncoder(targetCodecId);
       if (!encoderCodec) {
         throw new Error(`No encoder found for video codec ${String(targetCodecId)}`);
       }
+      this.throwIfStopRequested();
 
       let encoderOptions: EncoderOptions['options'] = {};
       if (encoderCodec.name === FF_ENCODER_LIBX264 || encoderCodec.name === FF_ENCODER_LIBX265) {
@@ -1240,6 +1230,22 @@ export class RTPStream {
     }
 
     return isSupported;
+  }
+
+  /**
+   * Find the encoder for a target video codec, on the device when it works there.
+   *
+   * @param target - Codec ID, or the name of a specific encoder to use as it is
+   *
+   * @returns The encoder, or null if none exists
+   *
+   * @internal
+   */
+  private async findVideoEncoder(target: AVCodecID | FFVideoEncoder): Promise<Codec | null> {
+    if (typeof target === 'string') {
+      return Codec.findEncoderByName(target);
+    }
+    return (await findUsableHardwareEncoder(this.hardwareContext, target, this.options.video.encoderOptions)) ?? Codec.findEncoder(target);
   }
 
   /**
