@@ -1,4 +1,5 @@
 import assert from 'node:assert';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import {
@@ -11,6 +12,11 @@ import {
   AV_HWDEVICE_TYPE_VAAPI,
   AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
   AV_HWDEVICE_TYPE_VULKAN,
+  AV_PIX_FMT_YUV420P,
+  AV_PROFILE_AV1_MAIN,
+  AV_PROFILE_H264_MAIN,
+  AV_PROFILE_HEVC_MAIN,
+  AV_PROFILE_VP9_0,
   Decoder,
   Demuxer,
   Encoder,
@@ -299,6 +305,22 @@ describe('HardwareContext', () => {
         console.log('Decoder validation failed:', error);
         hw.dispose();
         throw error;
+      }
+    });
+
+    it('should test with bitstreams in profiles hardware decoders take', async () => {
+      // A 4:4:4 or intra-only profile would make testDecoder() fail on GPUs that decode the codec fine
+      const bitstreams = [
+        { file: 'test_h264.h264', profile: AV_PROFILE_H264_MAIN },
+        { file: 'test_hevc.h265', profile: AV_PROFILE_HEVC_MAIN },
+        { file: 'test_av1.ivf', profile: AV_PROFILE_AV1_MAIN },
+        { file: 'test_vp9.ivf', profile: AV_PROFILE_VP9_0 },
+      ];
+      for (const { file, profile } of bitstreams) {
+        await using input = await Demuxer.open(join(import.meta.dirname, '../src/api/data', file));
+        const codecpar = input.video()!.codecpar;
+        assert.equal(codecpar.profile, profile, `${file} profile`);
+        assert.equal(codecpar.format, AV_PIX_FMT_YUV420P, `${file} pixel format`);
       }
     });
 
