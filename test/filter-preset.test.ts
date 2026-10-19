@@ -3,6 +3,8 @@ import { describe, it } from 'node:test';
 
 import {
   AV_HWDEVICE_TYPE_D3D11VA,
+  AV_HWDEVICE_TYPE_D3D12VA,
+  AV_HWDEVICE_TYPE_DXVA2,
   AV_HWDEVICE_TYPE_MEDIACODEC,
   AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
   AV_PIX_FMT_YUV420P,
@@ -201,7 +203,7 @@ describe('FilterPreset', () => {
 
     it('should report hardware without a scaler', () => {
       for (const [type, name] of [
-        [AV_HWDEVICE_TYPE_D3D11VA, 'd3d11va'],
+        [AV_HWDEVICE_TYPE_DXVA2, 'dxva2'],
         [AV_HWDEVICE_TYPE_MEDIACODEC, 'mediacodec'],
       ] as const) {
         const chain = FilterPreset.chain(fakeHardware(type, name));
@@ -210,6 +212,19 @@ describe('FilterPreset', () => {
         strictEqual(chain.scale(1280, 720).build(), '');
       }
       strictEqual(FilterPreset.chain(fakeHardware(AV_HWDEVICE_TYPE_VIDEOTOOLBOX, 'videotoolbox')).supports('scale'), true);
+    });
+
+    it('should scale with the Direct3D video processors', () => {
+      const d3d11va = fakeHardware(AV_HWDEVICE_TYPE_D3D11VA, 'd3d11va');
+      const d3d12va = fakeHardware(AV_HWDEVICE_TYPE_D3D12VA, 'd3d12va');
+      strictEqual(FilterPreset.chain(d3d11va).supports('scale'), true);
+      strictEqual(FilterPreset.chain(d3d12va).supports('scale'), true);
+      // scale_d3d11 fails without an output format
+      strictEqual(FilterPreset.chain(d3d11va).scale(1280, 720).build(), 'scale_d3d11=1280:720:format=nv12');
+      strictEqual(FilterPreset.chain(d3d11va).scale(1280, 720, { format: 'p010' }).build(), 'scale_d3d11=1280:720:format=p010');
+      strictEqual(FilterPreset.chain(d3d12va).scale(1280, 720).build(), 'scale_d3d12=1280:720');
+      strictEqual(FilterPreset.chain(d3d11va).scaleFormat('nv12').build(), 'scale_d3d11=format=nv12');
+      strictEqual(FilterPreset.chain(d3d12va).scaleFormat('nv12').build(), 'scale_d3d12=format=nv12');
     });
   });
 });

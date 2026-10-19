@@ -148,9 +148,9 @@ export class FilterPreset {
   /**
    * Checks if an operation is available for this chain's hardware.
    *
-   * Operations the hardware has no filter for (e.g. scaling on D3D11VA or
-   * MediaCodec) are skipped when added, so check first where skipping would be
-   * wrong and fall back to software, e.g. by scaling in the decoder.
+   * Operations the hardware has no filter for (e.g. scaling on MediaCodec) are
+   * skipped when added, so check first where skipping would be wrong and fall
+   * back to software, e.g. by scaling in the decoder.
    *
    * @param operation - Operation to check
    *
@@ -301,6 +301,16 @@ export class FilterPreset {
       } else if (this.hardware.deviceType === AV_HWDEVICE_TYPE_QSV) {
         filterName = 'vpp_qsv'; // QSV uses vpp_qsv for scaling with w= and h= parameters
         filter = `${filterName}=w=${width}:h=${height}`;
+      } else if (this.hardware.deviceType === AV_HWDEVICE_TYPE_D3D11VA) {
+        // scale_d3d11 fails without an output format and takes no -1/-2 sizes
+        filterName = 'scale_d3d11';
+        filter = `${filterName}=${width}:${height}`;
+        if (options?.format === undefined) {
+          filter += ':format=nv12';
+        }
+      } else if (this.hardware.deviceType === AV_HWDEVICE_TYPE_D3D12VA) {
+        filterName = 'scale_d3d12';
+        filter = `${filterName}=${width}:${height}`;
       } else {
         filterName = `scale_${this.hardware.deviceTypeName}`;
         filter = `${filterName}=${width}:${height}`;
@@ -372,6 +382,10 @@ export class FilterPreset {
       filterName = 'scale_vt';
     } else if (this.hardware.deviceType === AV_HWDEVICE_TYPE_QSV) {
       filterName = 'vpp_qsv';
+    } else if (this.hardware.deviceType === AV_HWDEVICE_TYPE_D3D11VA) {
+      filterName = 'scale_d3d11';
+    } else if (this.hardware.deviceType === AV_HWDEVICE_TYPE_D3D12VA) {
+      filterName = 'scale_d3d12';
     } else {
       filterName = `scale_${this.hardware.deviceTypeName}`;
     }
@@ -1463,11 +1477,28 @@ export class FilterPreset {
           stack: false,
         };
 
+      case AV_HWDEVICE_TYPE_D3D11VA: // Windows video processor
+      case AV_HWDEVICE_TYPE_D3D12VA:
+        return {
+          scale: true, // scale_d3d11 / scale_d3d12
+          overlay: false,
+          transpose: false,
+          tonemap: false,
+          deinterlace: false,
+          denoise: false,
+          flip: false,
+          blur: false,
+          sharpen: false,
+          sobel: false,
+          chromakey: false,
+          colorspace: false,
+          pad: false,
+          stack: false,
+        };
+
       // These hardware types don't have dedicated filters - they're mainly for decode/encode
       case AV_HWDEVICE_TYPE_VDPAU: // Decode-only, deprecated in favor of VAAPI
       case AV_HWDEVICE_TYPE_DXVA2: // Windows decode-only
-      case AV_HWDEVICE_TYPE_D3D11VA: // Windows decode-only
-      case AV_HWDEVICE_TYPE_D3D12VA: // Has HEVC encoder but no filters
       case AV_HWDEVICE_TYPE_DRM: // Linux DRM buffer sharing, not processing
         return {
           scale: false,

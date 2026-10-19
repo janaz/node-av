@@ -110,6 +110,14 @@ describe('video transcode graph', () => {
       );
     });
 
+    it('scales with the Direct3D 11 video processor before downloading', () => {
+      assert.equal(
+        videoTranscodeGraph(onDevice(AV_PIX_FMT_P010LE), { ...half, encoder: libx264, hardware: d3d11va }, scalerOnly),
+        'scale_d3d11=640:360:format=nv12,hwdownload,format=nv12',
+      );
+      assert.equal(videoTranscodeGraph(onDevice(AV_PIX_FMT_P010LE), { ...keep, encoder: h264Nvenc, hardware: d3d11va }, scalerOnly), 'scale_d3d11=format=nv12');
+    });
+
     it('downloads first on a device without a scaler', () => {
       assert.equal(
         videoTranscodeGraph(onDevice(AV_PIX_FMT_P010LE), { ...half, encoder: libx264, hardware: d3d11va }, noFilters),
