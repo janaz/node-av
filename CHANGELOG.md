@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [6.2.0-beta.31] - 2026-10-17
+## [6.2.0-beta.333] - 2026-10-19
 
 ### Added
 
@@ -22,6 +22,7 @@ All notable changes to this project will be documented in this file.
 - **`FMP4Stream` transcodes audio to Opus when the client lists Opus but not AAC.** Unsupported input audio is encoded with libopus at 48 kHz in 20 ms frames, mono input stays mono, and `getCodecString()` reports `opus`. With AAC in `supportedCodecs` the target stays AAC as before.
 - **`Decoder.decodeErrors`** counts the packets and frames that failed to decode, like the ffmpeg CLI's decode error count; useful with `exitOnError: false`, where these errors are skipped.
 - **`FilterPreset.supports(operation)`** tells whether a chain's hardware has a filter for an operation (e.g. `scale` on D3D11VA or MediaCodec), since the builder methods skip unsupported ones and leave the chain unchanged.
+- **`hardwareFallback` on `Decoder`.** A hardware decoder that produces nothing (no frame within 16 packets plus its thread count after the first keyframe, or two keyframes in a row without output later) is replaced by a software decoder, and the packets since the last silent keyframe are decoded again, so no picture is lost. `RTPStream` and `FMP4Stream` turn it on.
 - **`OutputFormat.getCodecTag()`/`getCodecId()`** look up a format's codec tag table (`av_codec_get_tag2`, `av_codec_get_id`), and **`avGuessFrameRate(stream)`** wraps `av_guess_frame_rate`.
 
 ### Performance
@@ -29,6 +30,7 @@ All notable changes to this project will be documented in this file.
 - **`Muxer` writes packets with less overhead.** The timestamp fixup reads each timestamp once and per-stream state once per stream instead of from native code on every access; remuxing is 7–14 % faster with identical output.
 - **Rational getters are about 2.5× faster** (`Frame.timeBase`, `Stream.timeBase`, `CodecContext.framerate`, …): the `{ num, den }` object is created in JS instead of natively.
 - **`Scaler` writes scaled output directly into the result buffer** when the packed layout allows it, skipping the staging copy.
+- **`FilterAPI.create()` accepts a function that builds the description from a frame.** It runs for the first frame and again whenever the graph is rebuilt for frames with other properties, so the graph can follow what the frames turn out to be, e.g. hardware frames, or software frames after a decoder fell back. When the graph fails to configure, the function is asked once more with the error and can return another description, e.g. one without the device filter the driver refused.
 
 ### Changed
 
@@ -56,6 +58,7 @@ All notable changes to this project will be documented in this file.
 - **Encoded audio keeps the input timing.** Fixed-frame-size encoders (AAC, Opus, MP3, …) and `autoResample` re-stamped their output from 0 by sample count, so audio that started late or had gaps drifted against the video. Frames now carry their first input sample's timestamp; gaps up to 1 s are filled with silence, overlaps up to 1 s are dropped and larger jumps restart the timeline (`audioFrameBuffer: { timestamps: 'samples' }` restores the old behavior).
 - **Decoders with `exitOnError: false` pass corrupt frames on** with their `decodeErrorFlags`/`AV_FRAME_FLAG_CORRUPT` set instead of dropping them, as the ffmpeg CLI does; with `exitOnError: true` they still throw.
 - **Audio encoders use the codec's default bitrate** when none is set, as the ffmpeg CLI does, instead of a fixed 128 kbit/s: G.726 encodes the standard 32 kbit/s instead of 40, G.723.1 opens at all, AAC gets 69 kbit/s per mono channel and Opus 64 (mono) or 96 kbit/s (stereo). Video keeps the 1 Mbit/s default.
+- **`FMP4Stream` encodes video without B-frames**, like `RTPStream` and libx264 with `zerolatency`. Hardware encoders default to B-frames, which delay every fragment, and `h264_d3d12va` failed with them on a driver that reports support for them (GTX 1080).
 - **`RTPStream` and `FMP4Stream` start decoding live video sooner.** Frame threading held back one frame per thread (up to 16) before the first output, ~0.6 s at 25 fps. Hardware decoding now uses slice threading and software decoding at most 4 frame threads; `FMP4Stream` keeps the full thread count for file inputs.
 
 
@@ -115,9 +118,19 @@ All notable changes to this project will be documented in this file.
 - **Stream copy into another container resets foreign codec tags** like the ffmpeg CLI. Remuxing MP4 into Matroska kept tags such as `mp4a`, which the Matroska muxer rejects; tags the target format knows for the codec (e.g. `hvc1` in MP4/MOV) are kept.
 - **Encoders created from a decoder without a frame rate guess it from the stream** (`av_guess_frame_rate`, e.g. VP9 in WebM). They used the stream time base (often 1/90000) instead, so libx264 picked level 6.2 and the rate control was off.
 - **Encoders keep video timestamps strictly increasing**, like the ffmpeg CLI's VFR sync. Frames that rounded onto the same tick of the encoder time base (e.g. a burst from a source timed by wallclock, at 1/25) reached the encoder with duplicate pts (x264: "non-strictly-monotonic PTS"); such a frame now moves to the next tick, or is dropped if it ends before it, and a keyframe requested on a dropped frame goes to the next one.
-- **`FMP4Stream` and `RTPStream` scale on hardware without a scaler.** On D3D11VA or MediaCodec the scale filter was skipped and the source size kept; the decoder now scales on the CPU after the frames leave the GPU.
+- **`FMP4Stream` and `RTPStream` scale on hardware without a scaler.** On D3D11VA or MediaCodec the scale filter was skipped and the source size kept; D3D11VA and D3D12VA now scale on the GPU, devices without a scaler on the CPU after the frames leave the GPU.
+- **`FilterPreset` scales on D3D11VA and D3D12VA** with `scale_d3d11` and `scale_d3d12`; `scaleFormat()` emitted `scale_d3d11va`, which does not exist.
+- **`Scaler` handles hardware frames on D3D11VA, D3D12VA and devices without a GPU scaler.** Every call failed there ("Filter not found"); D3D11VA and D3D12VA now scale on the GPU, and since their scalers ignore the crop, cropped calls download the frame and crop in software, as devices without a scaler (DXVA2, MediaCodec, DRM, VDPAU) now always do.
 - **`Decoder.create()`/`Encoder.create()` (and the `Sync` variants) no longer modify the options object passed in**, so one object can be reused, e.g. a shared `hardware` option for an audio and a video decoder.
 - **`Muxer` encoders created lazily keep the input stream's metadata, disposition, side data and duration** when the input `Demuxer` is closed before the first packet; they were read from the closed stream and came out empty.
+- **`RTPStream` and `FMP4Stream` transcode on the GPU where they used to fail.** The filters between decoder and encoder are chosen from the decoded frames: they stay on the GPU and are converted to NV12 there when the encoder needs it (VAAPI decodes JPEG into surfaces `h264_vaapi` cannot encode, 10-bit sources arrive as P010), software frames are converted and uploaded for the hardware encoder (MJPEG on VideoToolbox and D3D11VA, 4:2:2 JPEG that NVDEC hands back in software), and scaling runs on the GPU where it can.
+- **`RTPStream` and `FMP4Stream` fall back to software when the GPU cannot encode.** A hardware encoder has to encode a test frame first (once per process; a failed one is tried again after a minute), so an NVENC whose driver is older than the bundled API, or a GPU without an encoder, encodes with libx264 instead of ending the stream, while decoding and scaling stay on the GPU. A hardware decoder that fails to open or produces no frames decodes in software, and device filters that fail to configure are replaced by a conversion in software. Devices without an encoder of their own (D3D11VA, DXVA2, OpenCL, VDPAU, DRM) try NVENC, QSV and AMF in turn.
+- **Transcoded video is 8-bit 4:2:0 in software too.** A 4:2:2 JPEG camera or a 10-bit source was encoded as High 4:2:2 or High 10, which browsers and HomeKit cannot decode.
+- **`FMP4Stream` with `video.fps` gives the encoder that frame rate** instead of the source's.
+- **Encoders no longer take a stream clock for the frame rate.** After a short probe (`RTPStream` opens RTSP with `analyzeduration 0`), `av_guess_frame_rate` returns the inverse time base for MJPEG, 90000 fps: `h264_vaapi` failed with an internal encoding error, `h264_qsv` with "Function not implemented" and libx264 picked level 6.2. Guesses above 240 fps are ignored, and frames on such a clock with no known rate are encoded as 25 fps, as the ffmpeg CLI does.
+- **`RTPStream.requestVideoKeyframe()` works for frame sources.** The encoder cleared the requested picture type, and only libx264 was told to make it an IDR; NVENC, QSV and AMF get their forced-IDR option now.
+- **`HardwareContext.testEncoder()` and `getEncoderCodec(…, true)` accept VAAPI, Vulkan and D3D12 encoders.** The test downloaded the frames to the CPU, and encoders that take only device frames rejected them.
+- **`HardwareContext.testDecoder()` tests HEVC, AV1 and VP9 in common profiles.** The bundled test bitstreams were HEVC Main Intra, AV1 High 4:4:4 and VP9 Profile 1, which most GPUs cannot decode, so these codecs were reported as unsupported on GPUs that decode them (VAAPI, QSV and Vulkan on Intel, VideoToolbox).
 
 ## [6.1.1] - 2026-07-06
 
