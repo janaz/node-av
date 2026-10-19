@@ -217,7 +217,7 @@ export interface FilterOptions {
  */
 export class FilterAPI implements Disposable {
   private graph: FilterGraph;
-  private description: string;
+  private description: string | ((frame: Frame) => string);
   private options: FilterOptions;
   private buffersrcCtx: FilterContext | null = null;
   private buffersinkCtx: FilterContext | null = null;
@@ -249,13 +249,13 @@ export class FilterAPI implements Disposable {
   /**
    * @param graph - Filter graph instance
    *
-   * @param description - Filter description string
+   * @param description - Filter description string, or a function building it from a frame
    *
    * @param options - Filter options
    *
    * @internal
    */
-  private constructor(graph: FilterGraph, description: string, options: FilterOptions) {
+  private constructor(graph: FilterGraph, description: string | ((frame: Frame) => string), options: FilterOptions) {
     this.graph = graph;
     this.description = description;
     this.options = options;
@@ -268,7 +268,10 @@ export class FilterAPI implements Disposable {
    *
    * Direct mapping to avfilter_graph_parse_ptr() and avfilter_graph_config().
    *
-   * @param description - Filter graph description
+   * @param description - Filter graph description, or a function that builds it from the
+   * first frame. The function runs again whenever the graph is rebuilt for a frame with
+   * other properties, so the graph can follow what the frames turn out to be, e.g.
+   * hardware frames or software frames after a decoder fell back.
    *
    * @param options - Filter options
    *
@@ -299,10 +302,16 @@ export class FilterAPI implements Disposable {
    * });
    * ```
    *
+   * @example
+   * ```typescript
+   * // Graph chosen by the frames: download hardware frames, pass software ones
+   * const filter = FilterAPI.create((frame) => (frame.isHwFrame() ? 'hwdownload,format=nv12' : 'null'));
+   * ```
+   *
    * @see {@link process} For frame processing
    * @see {@link FilterOptions} For configuration options
    */
-  static create(description: string, options: FilterOptions = {}): FilterAPI {
+  static create(description: string | ((frame: Frame) => string), options: FilterOptions = {}): FilterAPI {
     // Validate options: CFR requires framerate
     if (options.cfr && !options.framerate) {
       throw new Error('cfr=true requires framerate to be set');
@@ -2136,8 +2145,10 @@ export class FilterAPI implements Disposable {
       throw new Error('Buffer filters not initialized');
     }
 
+    const description = typeof this.description === 'function' ? this.description(frame) : this.description;
+
     // Handle empty or simple passthrough
-    if (!this.description || this.description === 'null' || this.description === 'anull') {
+    if (!description || description === 'null' || description === 'anull') {
       // Direct connection for null filters
       const ret = this.buffersrcCtx.link(0, this.buffersinkCtx, 0);
       FFmpegError.throwIfError(ret, 'Failed to link buffer filters');
@@ -2145,7 +2156,7 @@ export class FilterAPI implements Disposable {
     }
 
     // Step 1: Parse the filter description into a segment
-    const segment = this.graph.segmentParse(this.description);
+    const segment = this.graph.segmentParse(description);
     if (!segment) {
       throw new Error('Failed to parse filter segment');
     }

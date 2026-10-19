@@ -18,7 +18,7 @@ import {
   Frame,
   Rational,
 } from '../src/index.js';
-import { decodePacket, decodePacketSync, filterFrame, getInputFile, prepareTestEnvironment } from './index.js';
+import { decodePacket, decodePacketSync, filterFrame, getInputFile, prepareTestEnvironment, syntheticVideoFrame } from './index.js';
 
 prepareTestEnvironment();
 
@@ -105,6 +105,57 @@ describe('High-Level Filter API', () => {
       });
 
       filter.close();
+    });
+  });
+
+  describe('description from the frames', () => {
+    it('builds the graph from the first frame', async () => {
+      const seen: string[] = [];
+      using filter = FilterAPI.create((frame) => {
+        seen.push(`${frame.width}x${frame.height}`);
+        return `scale=${frame.width / 2}:${frame.height / 2}`;
+      });
+
+      using input = syntheticVideoFrame(0, 320, 240);
+      const outputs = await filter.processAll(input);
+      assert.deepEqual(
+        outputs.map((output) => `${output.width}x${output.height}`),
+        ['160x120'],
+      );
+      outputs.forEach((output) => output.free());
+      assert.deepEqual(seen, ['320x240']);
+    });
+
+    it('builds the graph again for frames with other properties', () => {
+      const seen: string[] = [];
+      using filter = FilterAPI.create((frame) => {
+        seen.push(`${frame.width}x${frame.height}`);
+        return `scale=${frame.width / 2}:${frame.height / 2}`;
+      });
+
+      const sizes: string[] = [];
+      for (const [index, width, height] of [
+        [0, 320, 240],
+        [1, 320, 240],
+        [2, 640, 480],
+      ]) {
+        using input = syntheticVideoFrame(index, width, height);
+        for (const output of filter.processAllSync(input)) {
+          sizes.push(`${output.width}x${output.height}`);
+          output.free();
+        }
+      }
+      assert.deepEqual(sizes, ['160x120', '160x120', '320x240']);
+      assert.deepEqual(seen, ['320x240', '640x480']);
+    });
+
+    it('passes frames through when the function returns null', async () => {
+      using filter = FilterAPI.create(() => 'null');
+      using input = syntheticVideoFrame(0, 320, 240);
+      const outputs = await filter.processAll(input);
+      assert.equal(outputs.length, 1);
+      assert.equal(outputs[0].format, AV_PIX_FMT_YUV420P);
+      outputs.forEach((output) => output.free());
     });
   });
 
