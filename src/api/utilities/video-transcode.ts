@@ -1,13 +1,19 @@
 import {
   AVCOL_RANGE_MPEG,
   AV_HWDEVICE_TYPE_CUDA,
+  AV_HWDEVICE_TYPE_D3D11VA,
+  AV_HWDEVICE_TYPE_DRM,
+  AV_HWDEVICE_TYPE_DXVA2,
+  AV_HWDEVICE_TYPE_OPENCL,
   AV_HWDEVICE_TYPE_VAAPI,
+  AV_HWDEVICE_TYPE_VDPAU,
   AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
   AV_LOG_WARNING,
   AV_PIX_FMT_NV12,
   AV_PIX_FMT_YUV420P,
   AV_PIX_FMT_YUVJ420P,
 } from '../../constants/constants.js';
+import { Codec } from '../../lib/codec.js';
 import { Filter } from '../../lib/filter.js';
 import { Frame } from '../../lib/frame.js';
 import { Log } from '../../lib/log.js';
@@ -20,8 +26,7 @@ import { FilterAPI } from '../filter.js';
 import { pickSupportedPixelFormat } from './codec-format.js';
 import { resolveScaleSize } from './scale-size.js';
 
-import type { AVCodecID, AVHWDeviceType, AVPixelFormat } from '../../constants/index.js';
-import type { Codec } from '../../lib/codec.js';
+import type { AVCodecID, AVHWDeviceType, AVPixelFormat, FFEncoderCodec } from '../../constants/index.js';
 import type { Stream } from '../../lib/stream.js';
 import type { DecoderOptions } from '../decoder.js';
 import type { EncoderOptions } from '../encoder.js';
@@ -79,6 +84,26 @@ export interface DeviceFilters {
  * @internal
  */
 const UPLOAD_SCALE_DEVICES: readonly AVHWDeviceType[] = [AV_HWDEVICE_TYPE_VAAPI, AV_HWDEVICE_TYPE_CUDA, AV_HWDEVICE_TYPE_VIDEOTOOLBOX];
+
+/**
+ * Devices without encoders of their own, they borrow one from a GPU vendor.
+ *
+ * @internal
+ */
+const BORROWING_DEVICES: readonly AVHWDeviceType[] = [
+  AV_HWDEVICE_TYPE_D3D11VA,
+  AV_HWDEVICE_TYPE_DXVA2,
+  AV_HWDEVICE_TYPE_OPENCL,
+  AV_HWDEVICE_TYPE_VDPAU,
+  AV_HWDEVICE_TYPE_DRM,
+];
+
+/**
+ * The vendor encoders such a device borrows, in the order {@link HardwareContext.getEncoderCodec} looks for them.
+ *
+ * @internal
+ */
+const VENDOR_ENCODERS = ['nvenc', 'qsv', 'amf'] as const;
 
 /**
  * How long a hardware encoder that failed its test stays passed over, a busy GPU can recover.
@@ -284,7 +309,42 @@ export async function findUsableHardwareEncoder(
   options?: EncoderOptions['options'],
 ): Promise<Codec | null> {
   const encoder = hardware?.getEncoderCodec(codec);
-  return encoder && hardware && (await canEncodeOnDevice(encoder, hardware, options)) ? encoder : null;
+  if (!encoder || !hardware) {
+    return null;
+  }
+  for (const candidate of encoderCandidates(encoder, hardware)) {
+    if (await canEncodeOnDevice(candidate, hardware, options)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+/**
+ * The encoders to try for a device, the one it names first.
+ *
+ * A device without encoders of its own names the first vendor encoder the
+ * build has, NVENC on every Windows build. On an AMD or Intel GPU that one
+ * cannot work but the vendor's own can.
+ *
+ * @param encoder - The encoder the device names
+ *
+ * @param hardware - The device
+ *
+ * @returns The encoders in the order to try them
+ *
+ * @internal
+ */
+function encoderCandidates(encoder: Codec, hardware: HardwareContext): Codec[] {
+  const name = encoder.name;
+  if (!name || !BORROWING_DEVICES.includes(hardware.deviceType)) {
+    return [encoder];
+  }
+  const base = name.slice(0, name.lastIndexOf('_'));
+  const others = VENDOR_ENCODERS.map((vendor) => Codec.findEncoderByName(`${base}_${vendor}` as FFEncoderCodec)).filter(
+    (candidate): candidate is Codec => !!candidate?.isHardwareAcceleratedEncoder() && candidate.name !== name,
+  );
+  return [encoder, ...others];
 }
 
 /**
