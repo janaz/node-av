@@ -217,7 +217,7 @@ export interface FilterOptions {
  */
 export class FilterAPI implements Disposable {
   private graph: FilterGraph;
-  private description: string | ((frame: Frame) => string);
+  private description: string | ((frame: Frame, failure?: Error) => string);
   private options: FilterOptions;
   private buffersrcCtx: FilterContext | null = null;
   private buffersinkCtx: FilterContext | null = null;
@@ -255,7 +255,7 @@ export class FilterAPI implements Disposable {
    *
    * @internal
    */
-  private constructor(graph: FilterGraph, description: string | ((frame: Frame) => string), options: FilterOptions) {
+  private constructor(graph: FilterGraph, description: string | ((frame: Frame, failure?: Error) => string), options: FilterOptions) {
     this.graph = graph;
     this.description = description;
     this.options = options;
@@ -271,7 +271,9 @@ export class FilterAPI implements Disposable {
    * @param description - Filter graph description, or a function that builds it from the
    * first frame. The function runs again whenever the graph is rebuilt for a frame with
    * other properties, so the graph can follow what the frames turn out to be, e.g.
-   * hardware frames or software frames after a decoder fell back.
+   * hardware frames or software frames after a decoder fell back. When its graph fails to
+   * configure, the function is asked once more with the error and can return another one,
+   * e.g. without a device filter the driver refused.
    *
    * @param options - Filter options
    *
@@ -308,10 +310,16 @@ export class FilterAPI implements Disposable {
    * const filter = FilterAPI.create((frame) => (frame.isHwFrame() ? 'hwdownload,format=nv12' : 'null'));
    * ```
    *
+   * @example
+   * ```typescript
+   * // Scale on the device, in software if the device filter fails
+   * const filter = FilterAPI.create((frame, failure) => (failure ? 'hwdownload,format=nv12,scale=640:-2' : 'scale_vaapi=640:-2'), { hardware });
+   * ```
+   *
    * @see {@link process} For frame processing
    * @see {@link FilterOptions} For configuration options
    */
-  static create(description: string | ((frame: Frame) => string), options: FilterOptions = {}): FilterAPI {
+  static create(description: string | ((frame: Frame, failure?: Error) => string), options: FilterOptions = {}): FilterAPI {
     // Validate options: CFR requires framerate
     if (options.cfr && !options.framerate) {
       throw new Error('cfr=true requires framerate to be set');
@@ -1823,28 +1831,17 @@ export class FilterAPI implements Disposable {
       channels: frame.channelLayout?.nbChannels ?? 0,
     };
 
-    // Set graph options before parsing
-    if (this.options.scaleSwsOpts) {
-      this.graph.scaleSwsOpts = this.options.scaleSwsOpts;
+    try {
+      await this.buildGraph(frame);
+    } catch (error) {
+      // A device filter can fail to configure on a driver that refuses the
+      // input. A function may know another graph, so it is asked once more
+      if (typeof this.description !== 'function') {
+        throw error;
+      }
+      this.resetGraph();
+      await this.buildGraph(frame, error as Error);
     }
-
-    if (this.options.audioResampleOpts) {
-      this.graph.aresampleSwrOpts = this.options.audioResampleOpts;
-    }
-
-    // Create buffer source and sink
-    this.createBufferSource(frame);
-    this.createBufferSink(frame);
-
-    // Parse filter description
-    this.parseFilterDescription(frame);
-
-    applyContextOptions(this.graph, this.options.graph);
-    this.options.configure?.(this.graph);
-
-    // Configure the graph
-    const ret = await this.graph.config();
-    FFmpegError.throwIfError(ret, 'Failed to configure filter graph');
 
     this.initialized = true;
   }
@@ -1880,6 +1877,36 @@ export class FilterAPI implements Disposable {
       channels: frame.channelLayout?.nbChannels ?? 0,
     };
 
+    try {
+      this.buildGraphSync(frame);
+    } catch (error) {
+      if (typeof this.description !== 'function') {
+        throw error;
+      }
+      this.resetGraph();
+      this.buildGraphSync(frame, error as Error);
+    }
+
+    this.initialized = true;
+  }
+
+  /**
+   * Build and configure the graph for a frame.
+   *
+   * Sets the graph options, creates the buffer source and sink and parses the
+   * description between them.
+   *
+   * @param frame - Frame the graph is built for
+   *
+   * @param failure - Why the previous graph for this frame failed, passed to a description function
+   *
+   * @throws {Error} If building fails
+   *
+   * @throws {FFmpegError} If configuration fails
+   *
+   * @internal
+   */
+  private async buildGraph(frame: Frame, failure?: Error): Promise<void> {
     // Set graph options before parsing
     if (this.options.scaleSwsOpts) {
       this.graph.scaleSwsOpts = this.options.scaleSwsOpts;
@@ -1894,16 +1921,76 @@ export class FilterAPI implements Disposable {
     this.createBufferSink(frame);
 
     // Parse filter description
-    this.parseFilterDescription(frame);
+    this.parseFilterDescription(frame, failure);
 
     applyContextOptions(this.graph, this.options.graph);
     this.options.configure?.(this.graph);
 
     // Configure the graph
+    const ret = await this.graph.config();
+    FFmpegError.throwIfError(ret, 'Failed to configure filter graph');
+  }
+
+  /**
+   * Build and configure the graph for a frame synchronously.
+   * Synchronous version of buildGraph.
+   *
+   * @param frame - Frame the graph is built for
+   *
+   * @param failure - Why the previous graph for this frame failed, passed to a description function
+   *
+   * @throws {Error} If building fails
+   *
+   * @throws {FFmpegError} If configuration fails
+   *
+   * @internal
+   *
+   * @see {@link buildGraph} For async version
+   */
+  private buildGraphSync(frame: Frame, failure?: Error): void {
+    if (this.options.scaleSwsOpts) {
+      this.graph.scaleSwsOpts = this.options.scaleSwsOpts;
+    }
+
+    if (this.options.audioResampleOpts) {
+      this.graph.aresampleSwrOpts = this.options.audioResampleOpts;
+    }
+
+    this.createBufferSource(frame);
+    this.createBufferSink(frame);
+    this.parseFilterDescription(frame, failure);
+
+    applyContextOptions(this.graph, this.options.graph);
+    this.options.configure?.(this.graph);
+
     const ret = this.graph.configSync();
     FFmpegError.throwIfError(ret, 'Failed to configure filter graph');
+  }
 
-    this.initialized = true;
+  /**
+   * Replace the graph with a new, empty one.
+   *
+   * @internal
+   */
+  private resetGraph(): void {
+    this.graph.free();
+
+    // Create new graph
+    this.graph = new FilterGraph();
+    this.graph.alloc();
+
+    // Configure threading
+    if (this.options.threads !== undefined) {
+      this.graph.nbThreads = this.options.threads;
+    }
+
+    // Configure scaler options
+    if (this.options.scaleSwsOpts) {
+      this.graph.scaleSwsOpts = this.options.scaleSwsOpts;
+    }
+
+    this.buffersrcCtx = null;
+    this.buffersinkCtx = null;
   }
 
   /**
@@ -1953,24 +2040,7 @@ export class FilterAPI implements Disposable {
     }
 
     // Close current graph and reinitialize
-    this.graph.free();
-
-    // Create new graph
-    this.graph = new FilterGraph();
-    this.graph.alloc();
-
-    // Configure threading
-    if (this.options.threads !== undefined) {
-      this.graph.nbThreads = this.options.threads;
-    }
-
-    // Configure scaler options
-    if (this.options.scaleSwsOpts) {
-      this.graph.scaleSwsOpts = this.options.scaleSwsOpts;
-    }
-
-    this.buffersrcCtx = null;
-    this.buffersinkCtx = null;
+    this.resetGraph();
     this.initialized = false;
     this.initializePromise = null;
     this.calculatedTimeBase = null;
@@ -2134,18 +2204,20 @@ export class FilterAPI implements Disposable {
    *
    * @param frame - First frame to process, provides hw_frames_ctx if any
    *
+   * @param failure - Why the previous graph for this frame failed, passed to a description function
+   *
    * @throws {Error} If parsing fails
    *
    * @throws {FFmpegError} If graph construction fails
    *
    * @internal
    */
-  private parseFilterDescription(frame: Frame): void {
+  private parseFilterDescription(frame: Frame, failure?: Error): void {
     if (!this.buffersrcCtx || !this.buffersinkCtx) {
       throw new Error('Buffer filters not initialized');
     }
 
-    const description = typeof this.description === 'function' ? this.description(frame) : this.description;
+    const description = typeof this.description === 'function' ? this.description(frame, failure) : this.description;
 
     // Handle empty or simple passthrough
     if (!description || description === 'null' || description === 'anull') {

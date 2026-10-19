@@ -157,6 +157,51 @@ describe('High-Level Filter API', () => {
       assert.equal(outputs[0].format, AV_PIX_FMT_YUV420P);
       outputs.forEach((output) => output.free());
     });
+
+    it('asks the function again with the error when its graph fails', async () => {
+      const failures: (Error | undefined)[] = [];
+      // hwdownload fails to configure for software frames, like a device filter the driver refuses
+      using filter = FilterAPI.create((_frame, failure) => {
+        failures.push(failure);
+        return failure ? 'scale=160:120' : 'hwdownload,format=nv12';
+      });
+
+      using input = syntheticVideoFrame(0, 320, 240);
+      const outputs = await filter.processAll(input);
+      assert.deepEqual(
+        outputs.map((output) => `${output.width}x${output.height}`),
+        ['160x120'],
+      );
+      outputs.forEach((output) => output.free());
+      assert.equal(failures.length, 2);
+      assert.equal(failures[0], undefined);
+      assert.ok(failures[1] instanceof Error);
+    });
+
+    it('asks again synchronously too', () => {
+      using filter = FilterAPI.create((_frame, failure) => (failure ? 'null' : 'hwdownload,format=nv12'));
+      using input = syntheticVideoFrame(0, 320, 240);
+      const outputs = filter.processAllSync(input);
+      assert.equal(outputs.length, 1);
+      outputs.forEach((output) => output.free());
+    });
+
+    it('throws when the second graph fails as well', async () => {
+      let calls = 0;
+      using filter = FilterAPI.create(() => {
+        calls++;
+        return 'hwdownload,format=nv12';
+      });
+      using input = syntheticVideoFrame(0, 320, 240);
+      await assert.rejects(filter.process(input));
+      assert.equal(calls, 2);
+    });
+
+    it('does not retry a failing description string', async () => {
+      using filter = FilterAPI.create('hwdownload,format=nv12');
+      using input = syntheticVideoFrame(0, 320, 240);
+      await assert.rejects(filter.process(input));
+    });
   });
 
   describe('options', () => {

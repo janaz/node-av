@@ -28,7 +28,13 @@ import {
   FF_HWDEVICE_TYPE_VIDEOTOOLBOX,
   HardwareContext,
 } from '../src/index.js';
-import { describeVideoFrame, findDeviceFilters, findUsableHardwareEncoder, videoTranscodeGraph } from '../src/api/utilities/video-transcode.js';
+import {
+  createVideoTranscodeFilter,
+  describeVideoFrame,
+  findDeviceFilters,
+  findUsableHardwareEncoder,
+  videoTranscodeGraph,
+} from '../src/api/utilities/video-transcode.js';
 import { prepareTestEnvironment, syntheticVideoFrame } from './index.js';
 
 import type { AVHWDeviceType, AVPixelFormat, FFHWDeviceType } from '../src/index.js';
@@ -180,6 +186,21 @@ describe('video transcode graph', () => {
     it('describes a software frame', () => {
       using frame = syntheticVideoFrame(0, 320, 240);
       assert.deepEqual(describeVideoFrame(frame, vaapi), { hw: false, onDevice: false, format: AV_PIX_FMT_YUV420P, width: 320, height: 240 });
+    });
+  });
+
+  describe('createVideoTranscodeFilter', () => {
+    it('converts in software when the device filters fail', async () => {
+      // the fake device has no CUDA behind it, so uploading and scaling there fails to configure
+      using filter = createVideoTranscodeFilter({ ...half, width: 160, encoder: h264Nvenc, hardware: cuda }, withScaler);
+      using input = syntheticVideoFrame(0, 320, 240);
+      const outputs = await filter.processAll(input);
+      assert.deepEqual(
+        outputs.map((output) => [output.format, `${output.width}x${output.height}`]),
+        [[AV_PIX_FMT_NV12, '160x120']],
+      );
+      outputs.forEach((output) => output.free());
+      assert.match(filter.getGraphDescription() ?? '', /scale/);
     });
   });
 

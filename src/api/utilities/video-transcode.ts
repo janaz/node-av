@@ -103,6 +103,13 @@ const PROBE_HEIGHT = 360;
 const encoderProbes = new Map<string, { usable: Promise<boolean>; failedAt?: number }>();
 
 /**
+ * No scaler and no upload for scaling, the graph of a device whose filters failed.
+ *
+ * @internal
+ */
+const NO_DEVICE_FILTERS: DeviceFilters = { scaler: false, upload: false };
+
+/**
  * Filters per device type, the build decides which exist.
  *
  * @internal
@@ -204,18 +211,29 @@ export function describeVideoFrame(frame: Frame, hardware?: HardwareContext | nu
  *
  * The graph is built by {@link videoTranscodeGraph} from the first frame and
  * again whenever the frames change, e.g. when the decoder falls back to software.
+ * A graph whose device filters fail to configure is replaced by one that
+ * converts in software.
  *
  * @param target - The encoder's needs
+ *
+ * @param filters - The device's filters, found by default
  *
  * @returns The filter
  *
  * @internal
  */
-export function createVideoTranscodeFilter(target: VideoTranscodeTarget): FilterAPI {
-  const filters = findDeviceFilters(target.hardware);
-  return FilterAPI.create((frame) => videoTranscodeGraph(describeVideoFrame(frame, target.hardware), target, filters), {
-    hardware: target.hardware,
-  });
+export function createVideoTranscodeFilter(target: VideoTranscodeTarget, filters: DeviceFilters = findDeviceFilters(target.hardware)): FilterAPI {
+  return FilterAPI.create(
+    (frame, failure) => {
+      const input = describeVideoFrame(frame, target.hardware);
+      if (!failure) {
+        return videoTranscodeGraph(input, target, filters);
+      }
+      Log.log(AV_LOG_WARNING, `Video filters on ${target.hardware?.deviceTypeName ?? 'the CPU'} failed (${failure.message}), converting in software\n`);
+      return videoTranscodeGraph(input, target, NO_DEVICE_FILTERS);
+    },
+    { hardware: target.hardware },
+  );
 }
 
 /**
@@ -435,7 +453,7 @@ function deviceScale(hardware: HardwareContext, size?: { width: number; height: 
  * @internal
  */
 export function findDeviceFilters(hardware: HardwareContext | null | undefined): DeviceFilters {
-  if (!hardware) return { scaler: false, upload: false };
+  if (!hardware) return NO_DEVICE_FILTERS;
   let filters = deviceFilterCache.get(hardware.deviceType);
   if (!filters) {
     const exists = (description: string): boolean => Filter.getByName(description.split('=')[0]) !== null;
