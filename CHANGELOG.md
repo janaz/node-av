@@ -60,7 +60,7 @@ All notable changes to this project will be documented in this file.
 - **Audio encoders use the codec's default bitrate** when none is set, as the ffmpeg CLI does, instead of a fixed 128 kbit/s: G.726 encodes the standard 32 kbit/s instead of 40, G.723.1 opens at all, AAC gets 69 kbit/s per mono channel and Opus 64 (mono) or 96 kbit/s (stereo). Video keeps the 1 Mbit/s default.
 - **`FMP4Stream` encodes video without B-frames**, like `RTPStream` and libx264 with `zerolatency`. Hardware encoders default to B-frames, which delay every fragment, and `h264_d3d12va` failed with them on a driver that reports support for them (GTX 1080).
 - **`RTPStream` and `FMP4Stream` start decoding live video sooner.** Frame threading held back one frame per thread (up to 16) before the first output, ~0.6 s at 25 fps. Hardware decoding now uses slice threading and software decoding at most 4 frame threads; `FMP4Stream` keeps the full thread count for file inputs.
-
+- **`RTPStream` derives the video bitrate from the picture when none is given.** A transcode without `video.bitrate` encoded at the encoder's 1 Mbps default, which blocks up at camera resolutions. The target now follows size and frame rate (0.1 bit per pixel for H.264, 0.06 for HEVC) and is capped like an explicit bitrate.
 
 ### Fixed
 

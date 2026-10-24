@@ -115,12 +115,11 @@ const VENDOR_ENCODERS = ['nvenc', 'qsv', 'amf'] as const;
 const FAILED_PROBE_RETRY_MS = 60_000;
 
 /**
- * Size of the test frame a hardware encoder has to encode.
+ * Size of the test frame a hardware encoder has to encode, when the caller names none.
  *
  * @internal
  */
-const PROBE_WIDTH = 640;
-const PROBE_HEIGHT = 360;
+const PROBE_SIZE = { width: 640, height: 360 };
 
 /**
  * Test encodes per device and encoder, failures with the time they failed.
@@ -327,6 +326,12 @@ export function findSoftwareEncoder(codecId: AVCodecID): Codec | null {
  *
  * @param options - Encoder options the encoder will get, some drivers need them to open (e.g. `low_power`)
  *
+ * @param size - The size it will encode, hardware encoders have a maximum that differs per GPU
+ *
+ * @param size.width - Width
+ *
+ * @param size.height - Height
+ *
  * @returns The hardware encoder, or null to encode in software
  *
  * @internal
@@ -335,13 +340,14 @@ export async function findUsableHardwareEncoder(
   hardware: HardwareContext | null | undefined,
   codec: BaseCodecName | AVCodecID,
   options?: EncoderOptions['options'],
+  size?: { width: number; height: number },
 ): Promise<Codec | null> {
   const encoder = hardware?.getEncoderCodec(codec);
   if (!encoder || !hardware) {
     return null;
   }
   for (const candidate of encoderCandidates(encoder, hardware)) {
-    if (await canEncodeOnDevice(candidate, hardware, options)) {
+    if (await canEncodeOnDevice(candidate, hardware, options, size)) {
       return candidate;
     }
   }
@@ -389,24 +395,38 @@ function encoderCandidates(encoder: Codec, hardware: HardwareContext): Codec[] {
  *
  * @param options - Encoder options the encoder will get
  *
+ * @param size - Size of the test frame
+ *
+ * @param size.width - Width
+ *
+ * @param size.height - Height
+ *
  * @returns Whether it encoded the frame
  *
  * @internal
  */
-export async function canEncodeOnDevice(encoder: Codec, hardware: HardwareContext, options?: EncoderOptions['options']): Promise<boolean> {
+export async function canEncodeOnDevice(
+  encoder: Codec,
+  hardware: HardwareContext,
+  options?: EncoderOptions['options'],
+  size: { width: number; height: number } = PROBE_SIZE,
+): Promise<boolean> {
   const settings = JSON.stringify(options ?? {}, (_key, value: unknown) => (typeof value === 'bigint' ? String(value) : value));
-  const key = `${hardware.deviceTypeName}:${encoder.name}:${settings}`;
+  const key = `${hardware.deviceTypeName}:${encoder.name}:${size.width}x${size.height}:${settings}`;
   const known = encoderProbes.get(key);
   if (known && (known.failedAt === undefined || Date.now() - known.failedAt < FAILED_PROBE_RETRY_MS)) {
     return known.usable;
   }
 
-  const probe: { usable: Promise<boolean>; failedAt?: number } = { usable: probeEncoder(encoder, hardware, options) };
+  const probe: { usable: Promise<boolean>; failedAt?: number } = { usable: probeEncoder(encoder, hardware, options, size) };
   encoderProbes.set(key, probe);
   const usable = await probe.usable;
   if (!usable) {
     probe.failedAt = Date.now();
-    Log.log(AV_LOG_WARNING, `Hardware encoder ${encoder.name} failed to encode a test frame on ${hardware.deviceTypeName}, encoding video in software\n`);
+    Log.log(
+      AV_LOG_WARNING,
+      `Hardware encoder ${encoder.name} failed to encode a ${size.width}x${size.height} test frame on ${hardware.deviceTypeName}, encoding video in software\n`,
+    );
   }
   return usable;
 }
@@ -420,15 +440,21 @@ export async function canEncodeOnDevice(encoder: Codec, hardware: HardwareContex
  *
  * @param options - Encoder options
  *
+ * @param size - Size of the test frame
+ *
+ * @param size.width - Width
+ *
+ * @param size.height - Height
+ *
  * @returns Whether a packet came out
  *
  * @internal
  */
-async function probeEncoder(codec: Codec, hardware: HardwareContext, options: EncoderOptions['options']): Promise<boolean> {
+async function probeEncoder(codec: Codec, hardware: HardwareContext, options: EncoderOptions['options'], size: { width: number; height: number }): Promise<boolean> {
   try {
-    using frame = Frame.fromVideoBuffer(Buffer.alloc((PROBE_WIDTH * PROBE_HEIGHT * 3) / 2), {
-      width: PROBE_WIDTH,
-      height: PROBE_HEIGHT,
+    using frame = Frame.fromVideoBuffer(Buffer.alloc((size.width * size.height * 3) / 2), {
+      width: size.width,
+      height: size.height,
       format: AV_PIX_FMT_NV12,
       timeBase: { num: 1, den: 25 },
       pts: 0n,

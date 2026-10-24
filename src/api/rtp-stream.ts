@@ -17,6 +17,7 @@ import { Muxer } from './muxer.js';
 import { interruptibleFrameSource, pipeline } from './pipeline.js';
 import { pickSupportedLayout, pickSupportedRate, pickSupportedSampleFormat } from './utilities/codec-format.js';
 import { configureLiveDecoderThreading } from './utilities/live-decoding.js';
+import { resolveScaleSize } from './utilities/scale-size.js';
 import { createVideoTranscodeFilter, findSoftwareEncoder, findUsableHardwareEncoder, openTranscodeDecoder } from './utilities/video-transcode.js';
 
 import type { AVCodecID, AVHWDeviceType, AVSampleFormat, FFAudioEncoder, FFHWDeviceType, FFVideoEncoder } from '../constants/index.js';
@@ -534,7 +535,12 @@ export class RTPStream {
         throw new Error('No supported video codec specified for transcoding');
       }
 
-      const encoderCodec = await this.findVideoEncoder(targetCodecId);
+      const width = this.options.video.width ?? -1;
+      const height = this.options.video.height ?? -1;
+      const { codecpar } = videoStream;
+      // a GPU encodes up to a size of its own, test it with the size it will get
+      const outputSize = codecpar.width > 0 && codecpar.height > 0 ? resolveScaleSize(codecpar.width, codecpar.height, width, height) : undefined;
+      const encoderCodec = await this.findVideoEncoder(targetCodecId, outputSize);
       if (!encoderCodec) {
         throw new Error(`No encoder found for codec ID ${targetCodecId}`);
       }
@@ -549,8 +555,8 @@ export class RTPStream {
       // The graph follows the frames: whether they come from the device and in
       // which format shows only once they are decoded
       this.videoFilter = createVideoTranscodeFilter({
-        width: this.options.video.width ?? -1,
-        height: this.options.video.height ?? -1,
+        width,
+        height,
         fps: needsFps ? this.options.video.fps : undefined,
         encoder: encoderCodec,
         hardware: this.hardwareContext,
@@ -684,7 +690,8 @@ export class RTPStream {
    *
    * Sets the target bitrate together with a VBV cap (maxrate + a 1s buffer).
    * Encoder.create() always seeds a default target bitrate (1 Mbps for video),
-   * so the target MUST be lowered along with the cap.
+   * so the target MUST be lowered along with the cap. Without a bitrate the
+   * target follows the picture size and frame rate, see {@link defaultVideoBitrate}.
    *
    * @param ctx - Encoder codec context
    *
@@ -693,10 +700,7 @@ export class RTPStream {
    * @internal
    */
   private applyBitrate(ctx: CodecContext, bitrate: number | undefined): void {
-    if (!bitrate || bitrate <= 0) {
-      return;
-    }
-    const rate = Math.round(bitrate);
+    const rate = Math.round(bitrate && bitrate > 0 ? bitrate : defaultVideoBitrate(ctx));
     ctx.bitRate = BigInt(rate);
     ctx.rcMaxRate = BigInt(rate);
     ctx.rcBufferSize = rate;
@@ -1243,15 +1247,21 @@ export class RTPStream {
    *
    * @param target - Codec ID, or the name of a specific encoder to use as it is
    *
+   * @param size - The output size, when known before the first frame
+   *
+   * @param size.width - Width
+   *
+   * @param size.height - Height
+   *
    * @returns The encoder, or null if none exists
    *
    * @internal
    */
-  private async findVideoEncoder(target: AVCodecID | FFVideoEncoder): Promise<Codec | null> {
+  private async findVideoEncoder(target: AVCodecID | FFVideoEncoder, size?: { width: number; height: number }): Promise<Codec | null> {
     if (typeof target === 'string') {
       return Codec.findEncoderByName(target);
     }
-    return (await findUsableHardwareEncoder(this.hardwareContext, target, this.options.video.encoderOptions)) ?? findSoftwareEncoder(target);
+    return (await findUsableHardwareEncoder(this.hardwareContext, target, this.options.video.encoderOptions, size)) ?? findSoftwareEncoder(target);
   }
 
   /**
@@ -1351,6 +1361,26 @@ export class RTPStream {
     if (picked.nbChannels === 2) return 'stereo';
     return picked.mask.toString();
   }
+}
+
+/**
+ * A bitrate that encodes the picture without blocking.
+ *
+ * Scales with the picture size and frame rate the encoder opens with, so a
+ * transcode that only changes the codec keeps the quality of the source.
+ * HEVC needs about 40% fewer bits than H.264 for the same picture.
+ *
+ * @param ctx - Encoder codec context with size and timing set
+ *
+ * @returns Bitrate in bits per second
+ *
+ * @internal
+ */
+function defaultVideoBitrate(ctx: CodecContext): number {
+  // without a frame rate the encoder reads the inverse time base as one
+  const rate = ctx.framerate.num > 0 ? ctx.framerate : new Rational(ctx.timeBase.den, ctx.timeBase.num);
+  const bitsPerPixel = ctx.codecId === AV_CODEC_ID_HEVC ? 0.06 : 0.1;
+  return ctx.width * ctx.height * (rate.num / rate.den) * bitsPerPixel;
 }
 
 /**

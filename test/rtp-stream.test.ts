@@ -216,6 +216,33 @@ describe('RTPStream', skipWerift, () => {
         await stream.stop();
       }
     });
+
+    it('derives the bitrate from picture size and frame rate when none is given', async () => {
+      const { RTPStream } = await import('../src/webrtc/index.js');
+
+      let sawPacket!: () => void;
+      const firstPacket = new Promise<void>((resolve) => (sawPacket = resolve));
+
+      const stream = RTPStream.create(getInputFile('hevc-short.mp4'), {
+        supportedVideoCodecs: [FF_ENCODER_LIBX264],
+        onVideoPacket: () => sawPacket(),
+      });
+
+      await stream.start();
+      try {
+        await withTimeout(firstPacket, 15000);
+
+        const encoder = (stream as unknown as { videoEncoder?: unknown }).videoEncoder;
+        const ctx = (encoder as { codecContext: { bitRate: bigint; rcMaxRate: bigint; width: number; height: number; framerate: { num: number; den: number } } })
+          .codecContext;
+        // libx264 keeps whole kbit/s
+        const expected = Math.round((ctx.width * ctx.height * (ctx.framerate.num / ctx.framerate.den) * 0.1) / 1000);
+        assert.equal(Math.round(Number(ctx.bitRate) / 1000), expected, 'target must follow the source picture, not the 1 Mbps seed');
+        assert.equal(Math.round(Number(ctx.rcMaxRate) / 1000), expected);
+      } finally {
+        await stream.stop();
+      }
+    });
   });
 
   describe('abort handling', () => {
