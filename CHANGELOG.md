@@ -4,7 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [6.2.0-beta.33] - 2026-10-19
+## [6.2.0-beta.35] - 2026-10-25
+
+### Performance
+
+- **`Muxer` writes packets with less overhead.** The timestamp fixup reads each timestamp once and per-stream state once per stream instead of from native code on every access; remuxing is 7–14 % faster with identical output.
+- **Rational getters are about 2.5× faster** (`Frame.timeBase`, `Stream.timeBase`, `CodecContext.framerate`, …): the `{ num, den }` object is created in JS instead of natively.
+- **`Scaler` writes scaled output directly into the result buffer** when the packed layout allows it, skipping the staging copy.
+- **`FilterAPI.create()` accepts a function that builds the description from a frame.** It runs for the first frame and again whenever the graph is rebuilt for frames with other properties, so the graph can follow what the frames turn out to be, e.g. hardware frames, or software frames after a decoder fell back. When the graph fails to configure, the function is asked once more with the error and can return another description, e.g. one without the device filter the driver refused.
+
 
 ### Added
 
@@ -25,13 +33,7 @@ All notable changes to this project will be documented in this file.
 - **`FilterPreset.supports(operation)`** tells whether a chain's hardware has a filter for an operation (e.g. `scale` on D3D11VA or MediaCodec), since the builder methods skip unsupported ones and leave the chain unchanged.
 - **`hardwareFallback` on `Decoder`.** A hardware decoder that produces nothing (no frame within 16 packets plus its thread count after the first keyframe, or two keyframes in a row without output later) is replaced by a software decoder, and the packets since the last silent keyframe are decoded again, so no picture is lost. `RTPStream` and `FMP4Stream` turn it on.
 - **`OutputFormat.getCodecTag()`/`getCodecId()`** look up a format's codec tag table (`av_codec_get_tag2`, `av_codec_get_id`), and **`avGuessFrameRate(stream)`** wraps `av_guess_frame_rate`.
-
-### Performance
-
-- **`Muxer` writes packets with less overhead.** The timestamp fixup reads each timestamp once and per-stream state once per stream instead of from native code on every access; remuxing is 7–14 % faster with identical output.
-- **Rational getters are about 2.5× faster** (`Frame.timeBase`, `Stream.timeBase`, `CodecContext.framerate`, …): the `{ num, den }` object is created in JS instead of natively.
-- **`Scaler` writes scaled output directly into the result buffer** when the packed layout allows it, skipping the staging copy.
-- **`FilterAPI.create()` accepts a function that builds the description from a frame.** It runs for the first frame and again whenever the graph is rebuilt for frames with other properties, so the graph can follow what the frames turn out to be, e.g. hardware frames, or software frames after a decoder fell back. When the graph fails to configure, the function is asked once more with the error and can return another description, e.g. one without the device filter the driver refused.
+- **`video.transcode` on `RTPStream` and `FMP4Stream`.** The video is encoded again even when its codec is one of `supportedVideoCodecs` (`supportedCodecs` for `FMP4Stream`), so `width`, `height`, `fps` and `bitrate` apply to a stream that would otherwise pass through.
 
 ### Changed
 
@@ -65,6 +67,8 @@ All notable changes to this project will be documented in this file.
 - **`RTPStream` never scales the video up.** A `video.width` or `video.height` larger than the source keeps the source size, since a bigger picture only raises the bitrate.
 - **`RTPStream` sends a keyframe every 2 seconds when it transcodes a URL or `Demuxer` input.** Frame sources and `FMP4Stream` already did. Before, the encoder default applied, 120 frames for VAAPI and 250 for libx264 and NVENC, so a receiver that lost a packet showed a still picture for up to 8 s at 15 fps.
 - **`RTPStream.requestVideoKeyframe()` also works when a URL or `Demuxer` input is transcoded.** It only applied to frame sources, so a receiver that lost packets waited for the next scheduled keyframe. A passed-through stream keeps the source's keyframes.
+- **`FMP4Stream` never scales the video up**, like `RTPStream`. A `video.width` or `video.height` larger than the source keeps the source size.
+- **`FMP4Stream` tests a hardware encoder with the size it will encode**, like `RTPStream`, so a GPU that cannot encode that size falls back to software before the stream starts.
 
 ### Fixed
 
@@ -135,6 +139,8 @@ All notable changes to this project will be documented in this file.
 - **`RTPStream.requestVideoKeyframe()` works for frame sources.** The encoder cleared the requested picture type, and only libx264 was told to make it an IDR; NVENC, QSV and AMF get their forced-IDR option now.
 - **`HardwareContext.testEncoder()` and `getEncoderCodec(…, true)` accept VAAPI, Vulkan and D3D12 encoders.** The test downloaded the frames to the CPU, and encoders that take only device frames rejected them.
 - **`HardwareContext.testDecoder()` tests HEVC, AV1 and VP9 in common profiles.** The bundled test bitstreams were HEVC Main Intra, AV1 High 4:4:4 and VP9 Profile 1, which most GPUs cannot decode, so these codecs were reported as unsupported on GPUs that decode them (VAAPI, QSV and Vulkan on Intel, VideoToolbox).
+- **`FMP4Stream` encodes at the set bitrate.** `video.bitrate` only capped the encoder's 1 Mbps default target, so a transcode came out at about 1 Mbps whatever was set. The bitrate is now target and cap, and without one the target follows size and frame rate as in `RTPStream`.
+- **`FMP4Stream.getVideoInfo()` reports the size the video is encoded at.** With only `video.width` set it gave the source height.
 
 ## [6.1.1] - 2026-07-06
 
