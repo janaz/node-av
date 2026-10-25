@@ -17,11 +17,10 @@ import { Muxer } from './muxer.js';
 import { interruptibleFrameSource, pipeline } from './pipeline.js';
 import { pickSupportedLayout, pickSupportedRate, pickSupportedSampleFormat } from './utilities/codec-format.js';
 import { configureLiveDecoderThreading } from './utilities/live-decoding.js';
-import { resolveScaleSize } from './utilities/scale-size.js';
-import { createVideoTranscodeFilter, findSoftwareEncoder, findUsableHardwareEncoder, openTranscodeDecoder } from './utilities/video-transcode.js';
+import { transcodeScale } from './utilities/scale-size.js';
+import { applyVideoBitrate, createVideoTranscodeFilter, findSoftwareEncoder, findUsableHardwareEncoder, openTranscodeDecoder } from './utilities/video-transcode.js';
 
 import type { AVCodecID, AVHWDeviceType, AVSampleFormat, FFAudioEncoder, FFHWDeviceType, FFVideoEncoder } from '../constants/index.js';
-import type { CodecContext } from '../lib/codec-context.js';
 import type { DemuxerOptions } from './demuxer.js';
 import type { EncoderOptions } from './encoder.js';
 import type { PipelineControl, PipelineProgress } from './pipeline.js';
@@ -99,6 +98,8 @@ export interface RTPStreamOptions {
     height?: number;
     bitrate?: number;
     dumpExtra?: boolean;
+    /** Transcode even when the source codec is one of `supportedVideoCodecs`. */
+    transcode?: boolean;
     encoderOptions?: EncoderOptions['options'];
   };
 
@@ -285,6 +286,7 @@ export class RTPStream {
         height: options.video?.height,
         bitrate: options.video?.bitrate,
         dumpExtra: options.video?.dumpExtra,
+        transcode: options.video?.transcode,
         encoderOptions: options.video?.encoderOptions ?? {},
       },
       audio: {
@@ -491,7 +493,7 @@ export class RTPStream {
     let videoOutputIsHevc = videoStream?.codecpar.codecId === AV_CODEC_ID_HEVC;
 
     // Setup video transcoding if needed
-    if (videoStream && !this.isVideoCodecSupported(videoStream.codecpar.codecId)) {
+    if (videoStream && (this.options.video.transcode || !this.isVideoCodecSupported(videoStream.codecpar.codecId))) {
       // Check if we need hardware acceleration
       if (this.options.hardware === 'auto') {
         this.hardwareContext = HardwareContext.auto();
@@ -509,13 +511,9 @@ export class RTPStream {
       }
 
       const { codecpar } = videoStream;
-      // a picture larger than the source only costs bitrate
-      const upscales = codecpar.width > 0 && ((this.options.video.width ?? 0) > codecpar.width || (this.options.video.height ?? 0) > codecpar.height);
-      const width = upscales ? -1 : (this.options.video.width ?? -1);
-      const height = upscales ? -1 : (this.options.video.height ?? -1);
+      const scale = transcodeScale(codecpar.width, codecpar.height, this.options.video.width, this.options.video.height);
       // a GPU encodes up to a size of its own, test it with the size it will get
-      const outputSize = codecpar.width > 0 && codecpar.height > 0 ? resolveScaleSize(codecpar.width, codecpar.height, width, height) : undefined;
-      const encoderCodec = await this.findVideoEncoder(targetCodecId, outputSize);
+      const encoderCodec = await this.findVideoEncoder(targetCodecId, scale.output);
       if (!encoderCodec) {
         throw new Error(`No encoder found for codec ID ${targetCodecId}`);
       }
@@ -530,8 +528,7 @@ export class RTPStream {
       // The graph follows the frames: whether they come from the device and in
       // which format shows only once they are decoded
       this.videoFilter = createVideoTranscodeFilter({
-        width,
-        height,
+        ...scale.target,
         fps: needsFps ? this.options.video.fps : undefined,
         encoder: encoderCodec,
         hardware: this.hardwareContext,
@@ -550,7 +547,7 @@ export class RTPStream {
           // after the short probe the input rate is often unknown, the context has it from the frames
           const fps = ctx.framerate.num > 0 ? ctx.framerate.num / ctx.framerate.den : 30;
           ctx.gopSize = Math.max(1, Math.round(fps * 2));
-          this.applyBitrate(ctx, bitrate);
+          applyVideoBitrate(ctx, bitrate);
         },
       });
       this.throwIfStopRequested();
@@ -652,27 +649,6 @@ export class RTPStream {
     if (this.stopRequested) {
       throw new Error('RTPStream stopped during start');
     }
-  }
-
-  /**
-   * Cap the video bitrate on the encoder context.
-   *
-   * Sets the target bitrate together with a VBV cap (maxrate + a 1s buffer).
-   * Encoder.create() always seeds a default target bitrate (1 Mbps for video),
-   * so the target MUST be lowered along with the cap. Without a bitrate the
-   * target follows the picture size and frame rate, see {@link defaultVideoBitrate}.
-   *
-   * @param ctx - Encoder codec context
-   *
-   * @param bitrate - Maximum bitrate in bits per second, or undefined
-   *
-   * @internal
-   */
-  private applyBitrate(ctx: CodecContext, bitrate: number | undefined): void {
-    const rate = Math.round(bitrate && bitrate > 0 ? bitrate : defaultVideoBitrate(ctx));
-    ctx.bitRate = BigInt(rate);
-    ctx.rcMaxRate = BigInt(rate);
-    ctx.rcBufferSize = rate;
   }
 
   /**
@@ -815,7 +791,7 @@ export class RTPStream {
         configure: (ctx) => {
           ctx.framerate = new Rational(Math.round(fps), 1);
           ctx.gopSize = Math.max(1, Math.round(fps * 2));
-          this.applyBitrate(ctx, bitrate);
+          applyVideoBitrate(ctx, bitrate);
         },
       });
 
@@ -1318,26 +1294,6 @@ export class RTPStream {
     if (picked.nbChannels === 2) return 'stereo';
     return picked.mask.toString();
   }
-}
-
-/**
- * A bitrate that encodes the picture without blocking.
- *
- * Scales with the picture size and frame rate the encoder opens with, so a
- * transcode that only changes the codec keeps the quality of the source.
- * HEVC needs about 40% fewer bits than H.264 for the same picture.
- *
- * @param ctx - Encoder codec context with size and timing set
- *
- * @returns Bitrate in bits per second
- *
- * @internal
- */
-function defaultVideoBitrate(ctx: CodecContext): number {
-  // without a frame rate the encoder reads the inverse time base as one
-  const rate = ctx.framerate.num > 0 ? ctx.framerate : new Rational(ctx.timeBase.den, ctx.timeBase.num);
-  const bitsPerPixel = ctx.codecId === AV_CODEC_ID_HEVC ? 0.06 : 0.1;
-  return ctx.width * ctx.height * (rate.num / rate.den) * bitsPerPixel;
 }
 
 /**

@@ -6,7 +6,7 @@ import { PacketAgeWatchdog } from '../src/api/utilities/packet-age-watchdog.js';
 import { AV_CODEC_ID_OPUS, AV_NOPTS_VALUE, AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P, avGetPixFmtName, Demuxer, FMP4Stream, FormatContext } from '../src/index.js';
 import { encoderInputFormat, getInputFile, getOutputFile, prepareTestEnvironment, stallingFrameSource, syntheticVideoFrame, yuvj422pSource } from './index.js';
 
-import type { AVPixelFormat, Encoder, FMP4Data, FMP4StreamOptions, Frame, MediaFrameSource, MP4Box, Packet } from '../src/index.js';
+import type { AVPixelFormat, Encoder, FMP4Data, FMP4StreamOptions, FMP4VideoInfo, Frame, MediaFrameSource, MP4Box, Packet } from '../src/index.js';
 
 prepareTestEnvironment();
 
@@ -923,6 +923,74 @@ describe('FMP4Stream', () => {
 
       assert.equal(await reorderOf(getInputFile('hevc-short.mp4')), 0, 'transcoded input');
       assert.equal(await reorderOf({ video: frames() }), 0, 'frame source');
+    });
+  });
+
+  describe('transcode size and bitrate', () => {
+    interface EncodedVideo {
+      width: number;
+      height: number;
+      bitRate: bigint;
+      rcMaxRate: bigint;
+      fps: number;
+      info?: FMP4VideoInfo;
+    }
+
+    // video.mp4: h264, 320x180, which avc1 lets through without transcode
+    const encodedVideo = async (video: FMP4StreamOptions['video']): Promise<EncodedVideo | undefined> => {
+      let encoded: EncodedVideo | undefined;
+      const closed = Promise.withResolvers<void>();
+      const stream: FMP4Stream = FMP4Stream.create(inputFile, {
+        supportedCodecs: 'avc1.640029',
+        video,
+        onData: () => {
+          const ctx = (stream as unknown as { videoEncoder?: Encoder }).videoEncoder?.getCodecContext();
+          if (ctx && !encoded) {
+            const { width, height, bitRate, rcMaxRate, framerate } = ctx;
+            encoded = { width, height, bitRate, rcMaxRate, fps: framerate.num / framerate.den, info: stream.getVideoInfo() };
+          }
+        },
+        onClose: (error) => (error ? closed.reject(error) : closed.resolve()),
+      });
+      await stream.start();
+      await withTimeout(closed.promise, 30000);
+      await stream.stop();
+      return encoded;
+    };
+
+    it('transcodes a supported codec when transcode is set', async () => {
+      const encoded = await encodedVideo({ transcode: true, width: 160 });
+      assert.equal(encoded?.width, 160);
+      assert.equal(encoded?.height, 90);
+      assert.equal(encoded?.info?.width, 160);
+      assert.equal(encoded?.info?.height, 90, 'video info must report the derived height, not the source height');
+    });
+
+    it('passes a supported codec through without transcode', async () => {
+      assert.equal(await encodedVideo({ width: 160 }), undefined);
+    });
+
+    it('keeps the source size instead of scaling up', async () => {
+      const encoded = await encodedVideo({ transcode: true, width: 640 });
+      assert.equal(encoded?.width, 320);
+      assert.equal(encoded?.height, 180);
+      assert.equal(encoded?.info?.width, 320);
+      assert.equal(encoded?.info?.height, 180);
+    });
+
+    it('applies the bitrate as target and VBV cap', async () => {
+      const encoded = await encodedVideo({ transcode: true, bitrate: 300_000 });
+      assert.equal(encoded?.bitRate, 300000n, 'the 1 Mbps seed must not stay the target');
+      assert.equal(encoded?.rcMaxRate, 300000n);
+    });
+
+    it('derives the bitrate from picture size and frame rate when none is given', async () => {
+      const encoded = await encodedVideo({ transcode: true });
+      assert.ok(encoded);
+      // libx264 keeps whole kbit/s
+      const expected = Math.round((encoded.width * encoded.height * encoded.fps * 0.1) / 1000);
+      assert.equal(Math.round(Number(encoded.bitRate) / 1000), expected);
+      assert.equal(Math.round(Number(encoded.rcMaxRate) / 1000), expected);
     });
   });
 

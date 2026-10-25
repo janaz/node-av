@@ -162,6 +162,39 @@ describe('RTPStream', skipWerift, () => {
     });
   });
 
+  describe('forced transcode', () => {
+    async function videoEncoderWidth(options: RTPStreamOptions): Promise<number | undefined> {
+      const { RTPStream } = await import('../src/webrtc/index.js');
+
+      let sawPacket!: () => void;
+      const firstPacket = new Promise<void>((resolve) => (sawPacket = resolve));
+
+      // video.mp4: h264, 320x180
+      const stream = RTPStream.create(getInputFile('video.mp4'), {
+        ...options,
+        supportedVideoCodecs: [AV_CODEC_ID_H264],
+        onVideoPacket: () => sawPacket(),
+      });
+
+      await stream.start();
+      try {
+        await withTimeout(firstPacket, 15000);
+        const encoder = (stream as unknown as { videoEncoder?: unknown }).videoEncoder;
+        return (encoder as { codecContext: { width: number } } | undefined)?.codecContext.width;
+      } finally {
+        await stream.stop();
+      }
+    }
+
+    it('transcodes a supported codec when transcode is set', async () => {
+      assert.equal(await videoEncoderWidth({ video: { transcode: true, width: 160 } }), 160);
+    });
+
+    it('passes a supported codec through without transcode', async () => {
+      assert.equal(await videoEncoderWidth({ video: { width: 160 } }), undefined);
+    });
+  });
+
   describe('transcode pixel format', () => {
     // 4:2:2 JPEG cameras decode to yuvj422p: x264 took it as is and wrote High 4:2:2,
     // which browsers cannot decode, hardware encoders rejected it outright

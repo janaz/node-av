@@ -2,6 +2,7 @@ import {
   AVCOL_RANGE_MPEG,
   AV_CODEC_CAP_EXPERIMENTAL,
   AV_CODEC_CAP_HARDWARE,
+  AV_CODEC_ID_HEVC,
   AV_HWDEVICE_TYPE_CUDA,
   AV_HWDEVICE_TYPE_D3D11VA,
   AV_HWDEVICE_TYPE_DRM,
@@ -29,6 +30,7 @@ import { pickSupportedPixelFormat } from './codec-format.js';
 import { resolveScaleSize } from './scale-size.js';
 
 import type { AVCodecID, AVHWDeviceType, AVPixelFormat, FFEncoderCodec } from '../../constants/index.js';
+import type { CodecContext } from '../../lib/codec-context.js';
 import type { Stream } from '../../lib/stream.js';
 import type { DecoderOptions } from '../decoder.js';
 import type { EncoderOptions } from '../encoder.js';
@@ -289,6 +291,48 @@ export async function openTranscodeDecoder(stream: Stream, hardware: HardwareCon
     }
   }
   return await Decoder.create(stream, options);
+}
+
+/**
+ * Set the video bitrate on the encoder context.
+ *
+ * Sets the target bitrate together with a VBV cap (maxrate + a 1s buffer).
+ * Encoder.create() always seeds a default target bitrate (1 Mbps for video),
+ * so the target MUST be set along with the cap, a cap above the seeded target
+ * changes nothing. Without a bitrate the target follows the picture size and
+ * frame rate, see {@link defaultVideoBitrate}.
+ *
+ * @param ctx - Encoder codec context
+ *
+ * @param bitrate - Maximum bitrate in bits per second, or undefined
+ *
+ * @internal
+ */
+export function applyVideoBitrate(ctx: CodecContext, bitrate: number | undefined): void {
+  const rate = Math.round(bitrate && bitrate > 0 ? bitrate : defaultVideoBitrate(ctx));
+  ctx.bitRate = BigInt(rate);
+  ctx.rcMaxRate = BigInt(rate);
+  ctx.rcBufferSize = rate;
+}
+
+/**
+ * A bitrate that encodes the picture without blocking.
+ *
+ * Scales with the picture size and frame rate the encoder opens with, so a
+ * transcode that only changes the codec keeps the quality of the source.
+ * HEVC needs about 40% fewer bits than H.264 for the same picture.
+ *
+ * @param ctx - Encoder codec context with size and timing set
+ *
+ * @returns Bitrate in bits per second
+ *
+ * @internal
+ */
+function defaultVideoBitrate(ctx: CodecContext): number {
+  // without a frame rate the encoder reads the inverse time base as one
+  const rate = ctx.framerate.num > 0 ? ctx.framerate : new Rational(ctx.timeBase.den, ctx.timeBase.num);
+  const bitsPerPixel = ctx.codecId === AV_CODEC_ID_HEVC ? 0.06 : 0.1;
+  return ctx.width * ctx.height * (rate.num / rate.den) * bitsPerPixel;
 }
 
 /**

@@ -23,10 +23,10 @@ import { Muxer } from './muxer.js';
 import { consumeStreamInParallel, interruptibleFrameSource, pipeline, PipelineControlImpl } from './pipeline.js';
 import { configureLiveDecoderThreading } from './utilities/live-decoding.js';
 import { PacketAgeWatchdog } from './utilities/packet-age-watchdog.js';
-import { createVideoTranscodeFilter, findUsableHardwareEncoder, openTranscodeDecoder } from './utilities/video-transcode.js';
+import { transcodeScale } from './utilities/scale-size.js';
+import { applyVideoBitrate, createVideoTranscodeFilter, findUsableHardwareEncoder, openTranscodeDecoder } from './utilities/video-transcode.js';
 
 import type { AVCodecID, AVHWDeviceType, FFHWDeviceType } from '../constants/index.js';
-import type { CodecContext } from '../lib/codec-context.js';
 import type { DemuxerOptions } from './demuxer.js';
 import type { EncoderOptions } from './encoder.js';
 import type { IOOutputCallbacks } from './io-stream.js';
@@ -240,6 +240,10 @@ export interface FMP4StreamOptions {
     width?: number;
     height?: number;
     bitrate?: number;
+    /**
+     * Transcode to H.264 even when the source codec is one of `supportedCodecs`, so `width`, `height`, `fps` and `bitrate` apply.
+     */
+    transcode?: boolean;
     /**
      * FourCC sample entry tag for the HEVC video stream, e.g. `hvc1`. Only applied to HEVC output.
      */
@@ -526,6 +530,7 @@ export class FMP4Stream {
         width: options.video?.width,
         height: options.video?.height,
         bitrate: options.video?.bitrate,
+        transcode: options.video?.transcode,
         tag: options.video?.tag,
         encoderOptions: options.video?.encoderOptions ?? {},
       },
@@ -705,7 +710,7 @@ export class FMP4Stream {
     // Determine video codec string
     let videoCodec: string | null = null;
     if (videoCodecId) {
-      const needsVideoTranscode = !this.isVideoCodecSupported(videoCodecId);
+      const needsVideoTranscode = this.transcodesVideo(videoCodecId);
 
       if (needsVideoTranscode) {
         // Transcoding to H.264
@@ -788,17 +793,19 @@ export class FMP4Stream {
       return undefined;
     }
 
-    const codecId = videoStream.codecpar.codecId;
-    const transcode = !this.isVideoCodecSupported(codecId);
-    const codecString = transcode ? FMP4_CODECS.H264 : (avGetCodecString(videoStream.codecpar) ?? FMP4_CODECS.H264);
+    const { codecpar } = videoStream;
+    const codecId = codecpar.codecId;
+    const transcode = this.transcodesVideo(codecId);
+    const codecString = transcode ? FMP4_CODECS.H264 : (avGetCodecString(codecpar) ?? FMP4_CODECS.H264);
     const codec: FMP4VideoInfo['codec'] =
       transcode || codecId === AV_CODEC_ID_H264 ? 'h264' : codecId === AV_CODEC_ID_HEVC ? 'hevc' : codecId === AV_CODEC_ID_AV1 ? 'av1' : 'unknown';
+    const size = transcode ? transcodeScale(codecpar.width, codecpar.height, this.options.video.width, this.options.video.height).output : undefined;
     const rate = videoStream.avgFrameRate;
     return {
       codec,
       codecString,
-      width: transcode && this.options.video?.width ? this.options.video.width : videoStream.codecpar.width,
-      height: transcode && this.options.video?.height ? this.options.video.height : videoStream.codecpar.height,
+      width: size?.width ?? codecpar.width,
+      height: size?.height ?? codecpar.height,
       fps: transcode && this.options.video?.fps ? this.options.video.fps : rate.den ? rate.num / rate.den : 0,
     };
   }
@@ -896,7 +903,7 @@ export class FMP4Stream {
     const audioStream = this.input.audio();
 
     // Check if video needs transcoding
-    const needsVideoTranscode = videoStream && !this.isVideoCodecSupported(videoStream.codecpar.codecId);
+    const needsVideoTranscode = videoStream && this.transcodesVideo(videoStream.codecpar.codecId);
 
     if (needsVideoTranscode) {
       // Check if we need hardware acceleration
@@ -910,8 +917,11 @@ export class FMP4Stream {
       const currentFps = videoStream.avgFrameRate.num / videoStream.avgFrameRate.den;
       const needsFps = this.options.video.fps !== undefined && isFinite(currentFps) && this.options.video.fps !== currentFps;
 
+      const { codecpar } = videoStream;
+      const scale = transcodeScale(codecpar.width, codecpar.height, this.options.video.width, this.options.video.height);
+      // a GPU encodes up to a size of its own, test it with the size it will get
       const encoderCodec =
-        (await findUsableHardwareEncoder(this.hardwareContext, 'h264', this.options.video.encoderOptions)) ?? Codec.findEncoderByName(FF_ENCODER_LIBX264)!;
+        (await findUsableHardwareEncoder(this.hardwareContext, 'h264', this.options.video.encoderOptions, scale.output)) ?? Codec.findEncoderByName(FF_ENCODER_LIBX264)!;
       this.throwIfStopRequested();
 
       this.videoDecoder = await openTranscodeDecoder(videoStream, this.hardwareContext, {
@@ -925,8 +935,7 @@ export class FMP4Stream {
       // The graph follows the frames: whether they come from the device and in
       // which format shows only once they are decoded
       this.videoFilter = createVideoTranscodeFilter({
-        width: this.options.video.width ?? -1,
-        height: this.options.video.height ?? -1,
+        ...scale.target,
         fps: needsFps ? this.options.video.fps : undefined,
         encoder: encoderCodec,
         hardware: this.hardwareContext,
@@ -956,7 +965,7 @@ export class FMP4Stream {
         options: encoderOptions,
         configure: (ctx) => {
           ctx.gopSize = this.gopSize(fpsForGop);
-          this.applyBitrate(ctx, bitrate);
+          applyVideoBitrate(ctx, bitrate);
         },
       });
       this.throwIfStopRequested();
@@ -996,32 +1005,6 @@ export class FMP4Stream {
     if (this.stopRequested) {
       throw new Error('FMP4Stream stopped during start');
     }
-  }
-
-  /**
-   * Cap the video bitrate on the encoder context.
-   *
-   * Applies a VBV rate cap (maxrate + a 1s buffer) WITHOUT setting a target
-   * bitrate, so the encoder keeps its default constant-quality mode but can
-   * never exceed the negotiated ceiling. Setting the bitrate as an ABR target
-   * instead would push a normally-lighter stream UP to fill it, overshooting on
-   * bursts - the opposite of what strict rate-capped consumers want.
-   * No-op when no bitrate was requested.
-   *
-   * @param ctx - Encoder codec context
-   *
-   * @param bitrate - Maximum bitrate in bits per second, or undefined
-   *
-   * @internal
-   */
-  private applyBitrate(ctx: CodecContext, bitrate: number | undefined): void {
-    if (!bitrate || bitrate <= 0) {
-      return;
-    }
-    ctx.rcMaxRate = BigInt(Math.round(bitrate));
-    // 1s buffer keeps per-fragment size close to the cap instead of allowing
-    // multi-second bursts over it.
-    ctx.rcBufferSize = Math.round(bitrate);
   }
 
   /**
@@ -1257,7 +1240,7 @@ export class FMP4Stream {
         configure: (ctx) => {
           ctx.framerate = new Rational(Math.round(fps), 1);
           ctx.gopSize = this.gopSize(fps);
-          this.applyBitrate(ctx, bitrate);
+          applyVideoBitrate(ctx, bitrate);
         },
       });
 
@@ -1557,6 +1540,19 @@ export class FMP4Stream {
 
     await this.pipeline.completion;
     this.pipeline = undefined;
+  }
+
+  /**
+   * Check if the video is encoded again instead of passed through.
+   *
+   * @param codecId - Codec ID of the source video
+   *
+   * @returns True if `video.transcode` is set or the codec is not in supported codecs
+   *
+   * @internal
+   */
+  private transcodesVideo(codecId: AVCodecID): boolean {
+    return this.options.video.transcode === true || !this.isVideoCodecSupported(codecId);
   }
 
   /**
