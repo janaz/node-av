@@ -461,20 +461,22 @@ export class IOStream {
       totalBuffered = 0;
       wakeUp(); // settle a read parked on an empty buffer
     };
-    const nativeFree = ioContext.freeContext.bind(ioContext);
-    const nativeDispose = ioContext[Symbol.dispose].bind(ioContext);
-    const nativeAsyncDispose = ioContext[Symbol.asyncDispose].bind(ioContext);
-    ioContext.freeContext = () => {
+
+    // The hooks reach the I/O context through `this` rather than capturing it:
+    // the read callback above shares this scope and the native side holds it
+    // strongly, so a captured reference would keep an I/O context that is never
+    // freed (demuxer dropped without close()) alive together with the stream.
+    ioContext.freeContext = function (this: IOContext) {
       release();
-      nativeFree();
+      IOContext.prototype.freeContext.call(this);
     };
-    ioContext[Symbol.dispose] = () => {
+    ioContext[Symbol.dispose] = function (this: IOContext) {
       release();
-      nativeDispose();
+      IOContext.prototype[Symbol.dispose].call(this);
     };
-    ioContext[Symbol.asyncDispose] = async () => {
+    ioContext[Symbol.asyncDispose] = async function (this: IOContext) {
       release();
-      await nativeAsyncDispose();
+      await IOContext.prototype[Symbol.asyncDispose].call(this);
     };
 
     return ioContext;

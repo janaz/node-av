@@ -30,7 +30,7 @@
     "@electron-toolkit/tsconfig": "^2.0.0",
     "@types/node": "^25.1.0",
     "@vitejs/plugin-vue": "^6.0.2",
-    "electron": "^40.0.0",
+    "electron": "^42.11.16",
     "electron-builder": "^26.6.0",
     "electron-vite": "^5.0.0",
     "eslint": "^9.39.1",
@@ -41,8 +41,5 @@
     "vue": "^3.5.25",
     "vue-eslint-parser": "^10.2.0",
     "vue-tsc": "^3.1.6"
-  },
-  "overrides": {
-    "@shinyoshiaki/binary-data": "npm:@seydx/binary-data@0.6.2"
   }
 }

@@ -36,12 +36,27 @@ import { IOStream } from './io-stream.js';
 import { AsyncQueue } from './utilities/async-queue.js';
 import { applyContextOptions } from './utilities/context-options.js';
 
-import type { AVMediaType, MuxerFormat, MuxerOptionsFor } from '../constants/index.js';
+import type { AVDisposition, AVMediaType, AVPacketSideDataType, MuxerFormat, MuxerOptionsFor } from '../constants/index.js';
 import type { IRational, OutputFormat, Stream } from '../lib/index.js';
 import type { BitStreamFilterAPI } from './bitstream-filter.js';
 import type { Demuxer, RTPDemuxer } from './demuxer.js';
 import type { IOOutputCallbacks } from './io-stream.js';
 import type { ContextOptions } from './utilities/context-options.js';
+
+/**
+ * Input stream properties an encoded output stream copies once its encoder is
+ * initialized. Taken at addStream(): the input stream belongs to its demuxer and
+ * reads defaults once that closes, which can happen before the first packet.
+ *
+ * @internal
+ */
+interface InputStreamProps {
+  metadata: Dictionary | null;
+  disposition: AVDisposition;
+  codedSideData: { type: AVPacketSideDataType; data: Buffer }[];
+  duration: bigint;
+  timeBase: IRational;
+}
 
 /**
  * Per-stream muxing state: output stream, encoder/bitstream filter, and the
@@ -51,7 +66,7 @@ import type { ContextOptions } from './utilities/context-options.js';
  */
 interface StreamDescription {
   initialized: boolean;
-  inputStream?: Stream; // Source stream for metadata/properties (optional in encoder-only mode)
+  input?: InputStreamProps; // Source stream properties (encoder path; absent in encoder-only mode)
   outputStream: Stream;
   encoder?: Encoder;
   bsf?: BitStreamFilterAPI; // Trailing bitstream filter whose output parameters override the encoder's
@@ -1124,6 +1139,15 @@ export class Muxer implements AsyncDisposable, Disposable {
       const ret = stream.codecpar.copy(outStream.codecpar);
       FFmpegError.throwIfError(ret, 'Failed to copy codec parameters');
 
+      // Keep the source codec tag only where the output format accepts it, as
+      // FFmpeg CLI's streamcopy_init() does; otherwise let the muxer pick one.
+      // E.g. mp4's 'mp4a' for AAC fails the Matroska header as invalid data.
+      const oformat = this.formatContext.oformat;
+      const { codecTag, codecId } = outStream.codecpar;
+      if (codecTag && oformat && oformat.getCodecId(codecTag) !== codecId && oformat.getCodecTag(codecId) !== null) {
+        outStream.codecpar.codecTag = 0;
+      }
+
       // Set the timebases
       const sourceTimeBase = stream.timeBase;
 
@@ -1160,7 +1184,6 @@ export class Muxer implements AsyncDisposable, Disposable {
       this._streams.set(outStream.index, {
         initialized: true,
         outputStream: outStream,
-        inputStream: stream,
         encoder: undefined,
         sourceTimeBase,
         isStreamCopy: true,
@@ -1181,7 +1204,15 @@ export class Muxer implements AsyncDisposable, Disposable {
       this._streams.set(outStream.index, {
         initialized: false,
         outputStream: outStream,
-        inputStream: stream,
+        input: stream
+          ? {
+              metadata: stream.metadata,
+              disposition: stream.disposition,
+              codedSideData: stream.codecpar.getAllCodedSideData(),
+              duration: stream.duration,
+              timeBase: stream.timeBase,
+            }
+          : undefined,
         encoder,
         bsf: options?.bsf,
         sourceTimeBase: undefined, // Will be set on initialization
@@ -1445,31 +1476,28 @@ export class Muxer implements AsyncDisposable, Disposable {
         }
 
         // 4. Copy metadata from input stream
-        if (streamInfo.inputStream) {
-          const metadata = streamInfo.inputStream.metadata;
-          if (metadata) {
-            streamInfo.outputStream.metadata = metadata;
+        const input = streamInfo.input;
+        if (input) {
+          if (input.metadata) {
+            streamInfo.outputStream.metadata = input.metadata;
           }
 
           // 5. Copy disposition from input stream
-          streamInfo.outputStream.disposition = streamInfo.inputStream.disposition;
+          streamInfo.outputStream.disposition = input.disposition;
 
           // 5b. Copy coded_side_data from input stream (display matrix / rotation,
           // HDR mastering display & content light level). The encoder path only
           // copied codec parameters, so without this these are lost on transcode
           // (e.g. a portrait phone video would play sideways). Mirrors the stream
           // copy path.
-          const inputSideData = streamInfo.inputStream.codecpar.getAllCodedSideData();
-          for (const sd of inputSideData) {
+          for (const sd of input.codedSideData) {
             streamInfo.outputStream.codecpar.addCodedSideData(sd.type, sd.data);
           }
 
           // 6. Copy duration hint from input stream
-          if (streamInfo.inputStream.duration > 0n) {
-            const inputTb = streamInfo.inputStream.timeBase;
+          if (input.duration > 0n) {
             const outputTb = streamInfo.outputStream.timeBase;
-            const rescaledDuration = avRescaleQ(streamInfo.inputStream.duration, inputTb, outputTb);
-            streamInfo.outputStream.duration = rescaledDuration;
+            streamInfo.outputStream.duration = avRescaleQ(input.duration, input.timeBase, outputTb);
           }
         }
 
@@ -1822,31 +1850,28 @@ export class Muxer implements AsyncDisposable, Disposable {
         }
 
         // 4. Copy metadata from input stream
-        if (streamInfo.inputStream) {
-          const metadata = streamInfo.inputStream.metadata;
-          if (metadata) {
-            streamInfo.outputStream.metadata = metadata;
+        const input = streamInfo.input;
+        if (input) {
+          if (input.metadata) {
+            streamInfo.outputStream.metadata = input.metadata;
           }
 
           // 5. Copy disposition from input stream
-          streamInfo.outputStream.disposition = streamInfo.inputStream.disposition;
+          streamInfo.outputStream.disposition = input.disposition;
 
           // 5b. Copy coded_side_data from input stream (display matrix / rotation,
           // HDR mastering display & content light level). The encoder path only
           // copied codec parameters, so without this these are lost on transcode
           // (e.g. a portrait phone video would play sideways). Mirrors the stream
           // copy path.
-          const inputSideData = streamInfo.inputStream.codecpar.getAllCodedSideData();
-          for (const sd of inputSideData) {
+          for (const sd of input.codedSideData) {
             streamInfo.outputStream.codecpar.addCodedSideData(sd.type, sd.data);
           }
 
           // 6. Copy duration hint from input stream
-          if (streamInfo.inputStream.duration > 0n) {
-            const inputTb = streamInfo.inputStream.timeBase;
+          if (input.duration > 0n) {
             const outputTb = streamInfo.outputStream.timeBase;
-            const rescaledDuration = avRescaleQ(streamInfo.inputStream.duration, inputTb, outputTb);
-            streamInfo.outputStream.duration = rescaledDuration;
+            streamInfo.outputStream.duration = avRescaleQ(input.duration, input.timeBase, outputTb);
           }
         }
 

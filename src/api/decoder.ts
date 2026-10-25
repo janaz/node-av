@@ -3,6 +3,7 @@ import {
   AV_CODEC_FLAG_COPY_OPAQUE,
   AV_FRAME_FLAG_CORRUPT,
   AV_HWFRAME_TRANSFER_DIRECTION_FROM,
+  AV_LOG_WARNING,
   AV_NOPTS_VALUE,
   AV_PIX_FMT_NONE,
   AV_ROUND_UP,
@@ -21,11 +22,12 @@ import { Codec } from '../lib/codec.js';
 import { Dictionary } from '../lib/dictionary.js';
 import { FFmpegError } from '../lib/error.js';
 import { Frame } from '../lib/frame.js';
+import { Log } from '../lib/log.js';
 import { Packet } from '../lib/packet.js';
 import { Rational } from '../lib/rational.js';
 import { SoftwareResampleContext } from '../lib/software-resample-context.js';
 import { SoftwareScaleContext } from '../lib/software-scale-context.js';
-import { avChannelLayoutDefault, avGcd, avInvQ, avMulQ, avRescaleDelta, avRescaleQ, avRescaleQRnd } from '../lib/utilities.js';
+import { avChannelLayoutDefault, avGcd, avGuessFrameRate, avInvQ, avMulQ, avRescaleDelta, avRescaleQ, avRescaleQRnd } from '../lib/utilities.js';
 import { FRAME_THREAD_QUEUE_SIZE, PACKET_THREAD_QUEUE_SIZE } from './constants.js';
 import { AsyncQueue } from './utilities/async-queue.js';
 import { applyContextOptions } from './utilities/context-options.js';
@@ -47,8 +49,10 @@ export interface DecoderOptions<C = unknown> {
   /**
    * Exit immediately on first decode error.
    *
-   * When enabled, the decoder will terminate on the first decode error.
-   * When disabled, errors are logged but decoding continues with next packet.
+   * When enabled, the decoder throws on the first decode error or corrupt frame.
+   * When disabled it continues like FFmpeg CLI: failed packets are skipped and
+   * counted in {@link Decoder.decodeErrors}, and corrupt frames are returned with
+   * `decodeErrorFlags` or `AV_FRAME_FLAG_CORRUPT` set, so callers can drop them.
    *
    * @default true
    */
@@ -61,6 +65,20 @@ export interface DecoderOptions<C = unknown> {
    * Set to null to disable hardware acceleration.
    */
   hardware?: HardwareContext | null;
+
+  /**
+   * Decode in software when the hardware decoder produces nothing.
+   *
+   * Some drivers accept a stream and then fail on every frame, which with
+   * `exitOnError: false` leaves a stream without pictures. A new hardware
+   * decoder has to produce a frame within a few packets after its first
+   * keyframe, a running one counts as stuck once two keyframes in a row stay
+   * silent. The decoder then reopens in software and decodes the packets since
+   * the last silent keyframe again, so the frames carry on from there.
+   *
+   * @default false
+   */
+  hardwareFallback?: boolean;
 
   /**
    * Number of extra hardware frames to allocate.
@@ -237,6 +255,44 @@ export interface DecoderOptions<C = unknown> {
 }
 
 /**
+ * Packets a new hardware decoder has after its first keyframe, on top of its threads' delay, to produce a frame.
+ *
+ * @internal
+ */
+const HW_DECODE_PROBE = 16;
+
+/**
+ * Packets after the second silent keyframe in a row before a running hardware decoder counts as stuck.
+ *
+ * @internal
+ */
+const HW_DECODE_DELAY = 8;
+
+/**
+ * State of the watch on a hardware decoder that may fall back to software.
+ *
+ * @internal
+ */
+interface HardwareDecodeWatch {
+  /** A keyframe went in; packets before it are silent with any decoder */
+  started: boolean;
+  /** The decoder produced a frame */
+  proven: boolean;
+  /** Frames out since the last packet went in */
+  framesSincePacket: number;
+  /** Whether the last packet was a keyframe, undefined before the first */
+  lastKeyframe?: boolean;
+  /** Packets in a row without a frame */
+  silent: number;
+  /** Keyframes in a row without a frame */
+  silentKeyframes: number;
+  /** Packets since the second silent keyframe in a row */
+  sinceSecondKeyframe: number;
+  /** Packets since the last silent keyframe, decoded again in software */
+  held: Packet[];
+}
+
+/**
  * High-level decoder for audio and video streams.
  *
  * Provides a simplified interface for decoding media streams from packets to frames.
@@ -285,9 +341,15 @@ export class Decoder implements Disposable {
   private stream: Stream;
   private readonly streamIndex: number;
   private readonly streamFramerate: Rational;
+  private readonly guessedFramerate: IRational;
   private initialized = true;
   private isClosed = false;
   private options: DecoderOptions;
+  private _decodeErrors = 0;
+
+  // Software fallback of a hardware decoder (hardwareFallback)
+  private hardwareWatch?: HardwareDecodeWatch;
+  private replayedFrames: Frame[] = [];
 
   // Frame tracking for PTS/duration estimation
   private lastFramePts = AV_NOPTS_VALUE;
@@ -337,13 +399,19 @@ export class Decoder implements Disposable {
     this.codec = codec;
     this.stream = stream;
     this.streamIndex = stream.index;
-    this.streamFramerate = stream.avgFrameRate ?? stream.rFrameRate;
+    const avgFramerate = stream.avgFrameRate;
+    this.streamFramerate = avgFramerate.num > 0 && avgFramerate.den > 0 ? avgFramerate : stream.rFrameRate;
+    // Taken now: the stream belongs to the demuxer and reads 0/1 once it closes
+    this.guessedFramerate = avGuessFrameRate(stream);
     this.options = options;
     this.frame = new Frame();
     this.frame.alloc();
     this.lastFrameTb = new Rational(0, 1);
     this.inputQueue = new AsyncQueue<Packet>(PACKET_THREAD_QUEUE_SIZE, (p) => p.free());
     this.outputQueue = new AsyncQueue<Frame>(FRAME_THREAD_QUEUE_SIZE, (f) => f.free());
+    if (options.hardwareFallback && this.isHardware() && codecContext.codecType === AVMEDIA_TYPE_VIDEO) {
+      this.hardwareWatch = { started: false, proven: false, framesSincePacket: 0, silent: 0, silentKeyframes: 0, sinceSecondKeyframe: 0, held: [] };
+    }
   }
 
   /**
@@ -418,10 +486,10 @@ export class Decoder implements Disposable {
       ) {
         // First argument is a codec
         explicitCodec = optionsOrCodec;
-        options = maybeOptions ?? {};
+        options = { ...maybeOptions };
       } else {
-        // First argument is options
-        options = optionsOrCodec;
+        // First argument is options (copied: create() fills in defaults)
+        options = { ...optionsOrCodec };
       }
     }
 
@@ -612,10 +680,10 @@ export class Decoder implements Disposable {
       ) {
         // First argument is a codec
         explicitCodec = optionsOrCodec;
-        options = maybeOptions ?? {};
+        options = { ...maybeOptions };
       } else {
-        // First argument is options
-        options = optionsOrCodec;
+        // First argument is options (copied: create() fills in defaults)
+        options = { ...optionsOrCodec };
       }
     }
 
@@ -773,6 +841,32 @@ export class Decoder implements Disposable {
   }
 
   /**
+   * Number of decode errors so far.
+   *
+   * Counts packets the decoder rejected, failed frame receives and frames that
+   * could not be transferred from the GPU, rescaled or cropped. With
+   * `exitOnError: false` these are skipped instead of thrown, so this is the way
+   * to notice them (e.g. a hardware decoder that keeps failing).
+   *
+   * Like FFmpeg CLI's decode error count. Corrupt frames are not counted; they are
+   * returned with `decodeErrorFlags` or `AV_FRAME_FLAG_CORRUPT` set.
+   *
+   * @returns Decode error count
+   *
+   * @example
+   * ```typescript
+   * const decoder = await Decoder.create(stream, { exitOnError: false });
+   * // ...
+   * if (decoder.decodeErrors > lastErrors) {
+   *   console.warn(`${decoder.decodeErrors - lastErrors} decode errors`);
+   * }
+   * ```
+   */
+  get decodeErrors(): number {
+    return this._decodeErrors;
+  }
+
+  /**
    * Check if decoder uses hardware acceleration.
    *
    * @returns true if hardware-accelerated
@@ -880,6 +974,12 @@ export class Decoder implements Disposable {
       return;
     }
 
+    // A hardware decoder that stayed silent is replaced before this packet goes in
+    const stuck = this.hardwareWatch ? this.watchHardware(packet) : null;
+    if (stuck) {
+      await this.fallBackToSoftware(stuck);
+    }
+
     // Send packet to decoder
     const sendRet = await this.codecContext.sendPacket(packet);
 
@@ -891,6 +991,7 @@ export class Decoder implements Disposable {
 
     // Handle send errors
     if (sendRet < 0 && sendRet !== AVERROR_EOF) {
+      this._decodeErrors++;
       if (this.options.exitOnError) {
         FFmpegError.throwIfError(sendRet, 'Failed to send packet to decoder');
       }
@@ -971,6 +1072,11 @@ export class Decoder implements Disposable {
       return;
     }
 
+    const stuck = this.hardwareWatch ? this.watchHardware(packet) : null;
+    if (stuck) {
+      this.fallBackToSoftwareSync(stuck);
+    }
+
     // Send packet to decoder
     const sendRet = this.codecContext.sendPacketSync(packet);
 
@@ -982,6 +1088,7 @@ export class Decoder implements Disposable {
 
     // Handle send errors
     if (sendRet < 0 && sendRet !== AVERROR_EOF) {
+      this._decodeErrors++;
       if (this.options.exitOnError) {
         FFmpegError.throwIfError(sendRet, 'Failed to send packet to decoder');
       }
@@ -1519,22 +1626,29 @@ export class Decoder implements Disposable {
       return EOF;
     }
 
+    // Frames the software decoder produced from the replayed packets come first
+    const replayed = this.replayedFrames.shift();
+    if (replayed) {
+      return replayed;
+    }
+
     // Clear previous frame data
     this.frame.unref();
 
     const ret = await this.codecContext.receiveFrame(this.frame);
 
     if (ret === 0) {
+      if (this.hardwareWatch) {
+        this.hardwareWatch.framesSincePacket++;
+      }
+
       // Set frame time_base to decoder's packet timebase
       this.frame.timeBase = this.codecContext.pktTimebase;
 
-      // Check for corrupt frame
-      if (this.frame.decodeErrorFlags || this.frame.hasFlags(AV_FRAME_FLAG_CORRUPT)) {
-        if (this.options.exitOnError) {
-          throw new FFmpegError(AVERROR_INVALIDDATA);
-        }
-        // exitOnError=false: skip corrupt frame
-        return null;
+      // Corrupt frame: with exitOnError off it is passed on with its flags set,
+      // as FFmpeg CLI does (it only warns), so callers can decide to drop it
+      if (this.options.exitOnError && (this.frame.decodeErrorFlags || this.frame.hasFlags(AV_FRAME_FLAG_CORRUPT))) {
+        throw new FFmpegError(AVERROR_INVALIDDATA);
       }
 
       // Handles PTS assignment, duration estimation, and frame tracking
@@ -1577,6 +1691,7 @@ export class Decoder implements Disposable {
       return EOF;
     } else {
       // Error during receive
+      this._decodeErrors++;
       if (this.options.exitOnError) {
         FFmpegError.throwIfError(ret, 'Failed to receive frame');
       }
@@ -1640,22 +1755,27 @@ export class Decoder implements Disposable {
       return EOF;
     }
 
+    const replayed = this.replayedFrames.shift();
+    if (replayed) {
+      return replayed;
+    }
+
     // Clear previous frame data
     this.frame.unref();
 
     const ret = this.codecContext.receiveFrameSync(this.frame);
 
     if (ret === 0) {
+      if (this.hardwareWatch) {
+        this.hardwareWatch.framesSincePacket++;
+      }
+
       // Set frame time_base to decoder's packet timebase
       this.frame.timeBase = this.codecContext.pktTimebase;
 
       // Check for corrupt frame
-      if (this.frame.decodeErrorFlags || this.frame.hasFlags(AV_FRAME_FLAG_CORRUPT)) {
-        if (this.options.exitOnError) {
-          throw new FFmpegError(AVERROR_INVALIDDATA);
-        }
-        // exitOnError=false: skip corrupt frame
-        return null;
+      if (this.options.exitOnError && (this.frame.decodeErrorFlags || this.frame.hasFlags(AV_FRAME_FLAG_CORRUPT))) {
+        throw new FFmpegError(AVERROR_INVALIDDATA);
       }
 
       // Process video frame
@@ -1700,6 +1820,7 @@ export class Decoder implements Disposable {
       return EOF;
     } else {
       // Error during receive
+      this._decodeErrors++;
       if (this.options.exitOnError) {
         FFmpegError.throwIfError(ret, 'Failed to receive frame');
       }
@@ -1786,6 +1907,15 @@ export class Decoder implements Disposable {
     this.scaledFrame?.free();
     this.scaledFrame = undefined;
 
+    for (const held of this.hardwareWatch?.held ?? []) {
+      held.free();
+    }
+    this.hardwareWatch = undefined;
+    for (const frame of this.replayedFrames) {
+      frame.free();
+    }
+    this.replayedFrames = [];
+
     this.codecContext.freeContext();
     this.frame.free();
 
@@ -1809,6 +1939,21 @@ export class Decoder implements Disposable {
    */
   getStream(): Stream {
     return this.stream;
+  }
+
+  /**
+   * Get the stream's guessed frame rate.
+   *
+   * av_guess_frame_rate() of the decoded stream, taken when the decoder was
+   * created, so it outlives the demuxer. FFmpeg CLI feeds this rate into the
+   * filter graph, from where it reaches the encoder.
+   *
+   * @returns Guessed frame rate, or 0/1 if unknown
+   *
+   * @internal
+   */
+  getGuessedFrameRate(): IRational {
+    return this.guessedFramerate;
   }
 
   /**
@@ -1842,6 +1987,178 @@ export class Decoder implements Disposable {
    */
   getCodecContext(): CodecContext | null {
     return !this.isClosed && this.initialized ? this.codecContext : null;
+  }
+
+  /**
+   * Account for the packet that went in before this one and hold this one.
+   *
+   * A new hardware decoder has to produce a frame within {@link HW_DECODE_PROBE}
+   * packets (plus its threads' delay) after its first keyframe. A running one
+   * counts as stuck once two keyframes in a row stayed silent, because a
+   * single corrupt keyframe leaves even a healthy decoder silent until the next
+   * one. Packets since the last silent keyframe are held, so the software
+   * decoder can start over from it.
+   *
+   * @param packet - The packet about to go in
+   *
+   * @returns Why the decoder counts as stuck, or null while it is not
+   *
+   * @internal
+   */
+  private watchHardware(packet: Packet): string | null {
+    const watch = this.hardwareWatch!;
+    if (watch.lastKeyframe !== undefined) {
+      if (watch.framesSincePacket > 0) {
+        watch.proven = true;
+        watch.silent = 0;
+        watch.silentKeyframes = 0;
+        watch.sinceSecondKeyframe = 0;
+        for (const held of watch.held) {
+          held.free();
+        }
+        watch.held = [];
+      } else if (watch.started) {
+        watch.silent++;
+        if (watch.lastKeyframe && ++watch.silentKeyframes === 2) {
+          watch.sinceSecondKeyframe = 0;
+        } else if (watch.silentKeyframes >= 2) {
+          watch.sinceSecondKeyframe++;
+        }
+      }
+    }
+    watch.framesSincePacket = 0;
+    watch.lastKeyframe = packet.isKeyframe;
+    watch.started ||= packet.isKeyframe;
+
+    // Frame threads hold back one frame each before the first comes out
+    const probe = HW_DECODE_PROBE + Math.max(0, this.codecContext.threadCount);
+    const stuck = watch.proven ? watch.silentKeyframes >= 2 && watch.sinceSecondKeyframe >= HW_DECODE_DELAY : watch.silent >= probe;
+    if (stuck) {
+      return `no frame from the last ${watch.silent} packets`;
+    }
+
+    // Only a run that starts at a keyframe can be decoded again
+    if (packet.isKeyframe) {
+      for (const held of watch.held) {
+        held.free();
+      }
+      watch.held = [];
+    }
+    if (packet.isKeyframe || watch.held.length > 0) {
+      const held = packet.clone();
+      if (held) {
+        watch.held.push(held);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Reopen the decoder in software and decode the held packets again.
+   *
+   * The frames they produce are returned by the next receive calls, before
+   * anything the new decoder makes of later packets.
+   *
+   * @param reason - Why the hardware decoder counts as stuck
+   *
+   * @throws {FFmpegError} If the software decoder fails to open or decode
+   *
+   * @internal
+   */
+  private async fallBackToSoftware(reason: string): Promise<void> {
+    const held = this.takeHardwareWatch(reason);
+    const frames: Frame[] = [];
+    try {
+      this.adoptCodecContext(await Decoder.create(this.stream, { ...this.options, hardware: undefined, hardwareFallback: false }));
+      for (const packet of held) {
+        await this.decode(packet);
+        let frame;
+        while ((frame = await this.receive()) && frame !== EOF) {
+          frames.push(frame);
+        }
+      }
+    } catch (error) {
+      for (const frame of frames) {
+        frame.free();
+      }
+      throw error;
+    } finally {
+      for (const packet of held) {
+        packet.free();
+      }
+    }
+    this.replayedFrames.push(...frames);
+  }
+
+  /**
+   * Reopen the decoder in software and decode the held packets again synchronously.
+   * Synchronous version of fallBackToSoftware.
+   *
+   * @param reason - Why the hardware decoder counts as stuck
+   *
+   * @throws {FFmpegError} If the software decoder fails to open or decode
+   *
+   * @internal
+   *
+   * @see {@link fallBackToSoftware} For async version
+   */
+  private fallBackToSoftwareSync(reason: string): void {
+    const held = this.takeHardwareWatch(reason);
+    const frames: Frame[] = [];
+    try {
+      this.adoptCodecContext(Decoder.createSync(this.stream, { ...this.options, hardware: undefined, hardwareFallback: false }));
+      for (const packet of held) {
+        this.decodeSync(packet);
+        let frame;
+        while ((frame = this.receiveSync()) && frame !== EOF) {
+          frames.push(frame);
+        }
+      }
+    } catch (error) {
+      for (const frame of frames) {
+        frame.free();
+      }
+      throw error;
+    } finally {
+      for (const packet of held) {
+        packet.free();
+      }
+    }
+    this.replayedFrames.push(...frames);
+  }
+
+  /**
+   * End the watch on the hardware decoder, which fell back once and for all.
+   *
+   * @param reason - Why the hardware decoder counts as stuck
+   *
+   * @returns The held packets, owned by the caller
+   *
+   * @internal
+   */
+  private takeHardwareWatch(reason: string): Packet[] {
+    const held = this.hardwareWatch?.held ?? [];
+    this.hardwareWatch = undefined;
+    Log.log(AV_LOG_WARNING, `Hardware decoder ${this.codec.name} failed (${reason}, ${this._decodeErrors} decode errors), decoding in software\n`);
+    return held;
+  }
+
+  /**
+   * Take over the codec context of a freshly opened decoder and close it with the old one.
+   *
+   * @param software - Decoder opened in software for the same stream
+   *
+   * @internal
+   */
+  private adoptCodecContext(software: Decoder): void {
+    [this.codecContext, software.codecContext] = [software.codecContext, this.codecContext];
+    [this.codec, software.codec] = [software.codec, this.codec];
+    this.options.hardware = undefined;
+    // Set up for the device's frames, the software frames may differ
+    this.hwTransferFormat = undefined;
+    this.videoScaler?.[Symbol.dispose]();
+    this.videoScaler = undefined;
+    software.close();
   }
 
   /**
@@ -2089,6 +2406,7 @@ export class Decoder implements Disposable {
     if (this.options.applyCropping) {
       const ret = frame.applyCropping(1); // AV_FRAME_CROP_UNALIGNED = 1
       if (ret < 0) {
+        this._decodeErrors++;
         if (this.options.exitOnError) {
           FFmpegError.throwIfError(ret, 'Error applying decoder cropping');
         }
@@ -2428,6 +2746,7 @@ export class Decoder implements Disposable {
     const ret = frame.hwframeTransferDataSync(swFrame, 0);
     if (ret < 0) {
       swFrame.free();
+      this._decodeErrors++;
       if (this.options.exitOnError) {
         FFmpegError.throwIfError(ret, 'Failed to transfer hardware frame data');
       }
@@ -2440,6 +2759,7 @@ export class Decoder implements Disposable {
     swFrame.free();
 
     if (refRet < 0) {
+      this._decodeErrors++;
       if (this.options.exitOnError) {
         FFmpegError.throwIfError(refRet, 'Failed to reference software frame');
       }
@@ -2505,6 +2825,7 @@ export class Decoder implements Disposable {
     out.height = dstH;
     const ret = this.videoScaler.scaleFrameSync(out, frame);
     if (ret < 0) {
+      this._decodeErrors++;
       if (this.options.exitOnError) {
         FFmpegError.throwIfError(ret, 'Failed to rescale video frame');
       }

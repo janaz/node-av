@@ -3,6 +3,7 @@
 
 #include <napi.h>
 #include "common.h"
+#include "borrow_registry.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -15,7 +16,9 @@ class CodecParameters;
 class Dictionary;
 class Packet;
 
-class Stream : public Napi::ObjectWrap<Stream> {
+// Points into its AVFormatContext, which invalidates it before freeing the
+// stream (see Borrower): afterwards it reads defaults and ignores writes
+class Stream : public Napi::ObjectWrap<Stream>, public Borrower {
 public:
   static thread_local Napi::FunctionReference constructor;
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
@@ -24,10 +27,16 @@ public:
 
   AVStream* Get() { return stream_; }
   const AVStream* Get() const { return stream_; }
-  void Set(AVStream* stream) { stream_ = stream; }
+  // `owner` is the registry of the format context the stream belongs to
+  void Set(AVStream* stream, const std::shared_ptr<BorrowRegistry>& owner) {
+    stream_ = stream;
+    BorrowFrom(owner);
+  }
 
 private:
   friend class FormatContext;
+
+  void Invalidate() override { stream_ = nullptr; }
 
 
   AVStream* stream_ = nullptr;

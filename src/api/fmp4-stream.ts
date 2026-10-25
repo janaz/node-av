@@ -6,13 +6,13 @@ import {
   AV_CODEC_ID_HEVC,
   AV_CODEC_ID_OPUS,
   AV_HWDEVICE_TYPE_NONE,
-  AV_PIX_FMT_YUV420P,
+  AV_SAMPLE_FMT_FLT,
   AV_SAMPLE_FMT_FLTP,
 } from '../constants/constants.js';
-import { FF_ENCODER_AAC, FF_ENCODER_LIBX264 } from '../constants/encoders.js';
+import { FF_ENCODER_AAC, FF_ENCODER_LIBOPUS, FF_ENCODER_LIBX264 } from '../constants/encoders.js';
 import { Codec } from '../lib/codec.js';
 import { Rational } from '../lib/rational.js';
-import { avGetCodecString, avGetMediaTypeString, avGetPixFmtName } from '../lib/utilities.js';
+import { avGetCodecString, avGetMediaTypeString } from '../lib/utilities.js';
 import { Decoder } from './decoder.js';
 import { Demuxer } from './demuxer.js';
 import { Encoder } from './encoder.js';
@@ -21,11 +21,12 @@ import { FilterAPI } from './filter.js';
 import { HardwareContext } from './hardware.js';
 import { Muxer } from './muxer.js';
 import { consumeStreamInParallel, interruptibleFrameSource, pipeline, PipelineControlImpl } from './pipeline.js';
-import { pickSupportedPixelFormat } from './utilities/codec-format.js';
+import { configureLiveDecoderThreading } from './utilities/live-decoding.js';
 import { PacketAgeWatchdog } from './utilities/packet-age-watchdog.js';
+import { transcodeScale } from './utilities/scale-size.js';
+import { applyVideoBitrate, createVideoTranscodeFilter, findUsableHardwareEncoder, openTranscodeDecoder } from './utilities/video-transcode.js';
 
-import type { AVCodecID, AVHWDeviceType, AVPixelFormat, FFHWDeviceType } from '../constants/index.js';
-import type { CodecContext } from '../lib/codec-context.js';
+import type { AVCodecID, AVHWDeviceType, FFHWDeviceType } from '../constants/index.js';
 import type { DemuxerOptions } from './demuxer.js';
 import type { EncoderOptions } from './encoder.js';
 import type { IOOutputCallbacks } from './io-stream.js';
@@ -240,6 +241,10 @@ export interface FMP4StreamOptions {
     height?: number;
     bitrate?: number;
     /**
+     * Transcode to H.264 even when the source codec is one of `supportedCodecs`, so `width`, `height`, `fps` and `bitrate` apply.
+     */
+    transcode?: boolean;
+    /**
      * FourCC sample entry tag for the HEVC video stream, e.g. `hvc1`. Only applied to HEVC output.
      */
     tag?: string;
@@ -382,7 +387,8 @@ const MIN_FRAGMENT_GOP = 0.5;
  * High-level fMP4 streaming with automatic codec detection and transcoding.
  *
  * Provides fragmented MP4 streaming for clients.
- * Automatically transcodes video to H.264 and audio to AAC if not supported by client.
+ * Automatically transcodes video to H.264 and audio to AAC (Opus when the client
+ * lists Opus but not AAC) if not supported by client.
  * Client sends supported codecs, server transcodes accordingly.
  * Essential component for building adaptive streaming servers.
  *
@@ -424,6 +430,7 @@ export class FMP4Stream {
   private options: Required<Omit<FMP4StreamOptions, 'signal'>>;
   private inputUrl: string | null;
   private inputOptions: DemuxerOptions;
+  private liveInput: boolean;
   private input?: Demuxer;
   private source?: MediaFrameSource;
   private output?: Muxer;
@@ -475,6 +482,7 @@ export class FMP4Stream {
    */
   private constructor(input: string | Demuxer | MediaFrameSource, options: FMP4StreamOptions) {
     const isLiveInput = typeof input === 'string' && /^(rtsps?|rtmp(?:e|s|t|te|ts)?|s?rtp|udp|srt|tcp|tls|sctp):/i.test(input);
+    this.liveInput = isLiveInput;
     const dtsBackwardThreshold = options.dtsBackwardThreshold ?? 10;
     // Only a source read in real time pairs a gap with the matching wait.
     const dtsForwardThreshold = options.dtsForwardThreshold ?? (isLiveInput ? 10 : 0);
@@ -522,6 +530,7 @@ export class FMP4Stream {
         width: options.video?.width,
         height: options.video?.height,
         bitrate: options.video?.bitrate,
+        transcode: options.video?.transcode,
         tag: options.video?.tag,
         encoderOptions: options.video?.encoderOptions ?? {},
       },
@@ -683,7 +692,7 @@ export class FMP4Stream {
         parts.push(FMP4_CODECS.H264);
       }
       if (this.source.audio) {
-        parts.push(FMP4_CODECS.AAC);
+        parts.push(this.audioTranscodeTarget());
       }
       return parts.join(',');
     }
@@ -701,7 +710,7 @@ export class FMP4Stream {
     // Determine video codec string
     let videoCodec: string | null = null;
     if (videoCodecId) {
-      const needsVideoTranscode = !this.isVideoCodecSupported(videoCodecId);
+      const needsVideoTranscode = this.transcodesVideo(videoCodecId);
 
       if (needsVideoTranscode) {
         // Transcoding to H.264
@@ -730,8 +739,7 @@ export class FMP4Stream {
       const needsAudioTranscode = !this.isAudioCodecSupported(audioCodecId);
 
       if (needsAudioTranscode) {
-        // Transcoding to AAC
-        audioCodec = FMP4_CODECS.AAC;
+        audioCodec = this.audioTranscodeTarget();
       } else if (audioCodecId === AV_CODEC_ID_AAC) {
         // AAC - use fixed codec string
         audioCodec = FMP4_CODECS.AAC;
@@ -785,17 +793,19 @@ export class FMP4Stream {
       return undefined;
     }
 
-    const codecId = videoStream.codecpar.codecId;
-    const transcode = !this.isVideoCodecSupported(codecId);
-    const codecString = transcode ? FMP4_CODECS.H264 : (avGetCodecString(videoStream.codecpar) ?? FMP4_CODECS.H264);
+    const { codecpar } = videoStream;
+    const codecId = codecpar.codecId;
+    const transcode = this.transcodesVideo(codecId);
+    const codecString = transcode ? FMP4_CODECS.H264 : (avGetCodecString(codecpar) ?? FMP4_CODECS.H264);
     const codec: FMP4VideoInfo['codec'] =
       transcode || codecId === AV_CODEC_ID_H264 ? 'h264' : codecId === AV_CODEC_ID_HEVC ? 'hevc' : codecId === AV_CODEC_ID_AV1 ? 'av1' : 'unknown';
+    const size = transcode ? transcodeScale(codecpar.width, codecpar.height, this.options.video.width, this.options.video.height).output : undefined;
     const rate = videoStream.avgFrameRate;
     return {
       codec,
       codecString,
-      width: transcode && this.options.video?.width ? this.options.video.width : videoStream.codecpar.width,
-      height: transcode && this.options.video?.height ? this.options.video.height : videoStream.codecpar.height,
+      width: size?.width ?? codecpar.width,
+      height: size?.height ?? codecpar.height,
       fps: transcode && this.options.video?.fps ? this.options.video.fps : rate.den ? rate.num / rate.den : 0,
     };
   }
@@ -806,7 +816,7 @@ export class FMP4Stream {
    * Begins the media processing pipeline, reading packets from input,
    * transcoding based on supported codecs, and generating fMP4 chunks.
    * Video transcodes to H.264 if H.264/H.265 not supported.
-   * Audio transcodes to AAC if AAC/FLAC/Opus not supported.
+   * Audio transcodes to AAC (Opus when only Opus is listed) if the input codec is not supported.
    * This method returns immediately after starting the pipeline.
    *
    * @returns Promise that resolves when pipeline is started
@@ -893,7 +903,7 @@ export class FMP4Stream {
     const audioStream = this.input.audio();
 
     // Check if video needs transcoding
-    const needsVideoTranscode = videoStream && !this.isVideoCodecSupported(videoStream.codecpar.codecId);
+    const needsVideoTranscode = videoStream && this.transcodesVideo(videoStream.codecpar.codecId);
 
     if (needsVideoTranscode) {
       // Check if we need hardware acceleration
@@ -904,63 +914,32 @@ export class FMP4Stream {
       }
 
       // Transcode to H.264
-      this.videoDecoder = await Decoder.create(videoStream, {
-        hardware: this.hardwareContext,
+      const currentFps = videoStream.avgFrameRate.num / videoStream.avgFrameRate.den;
+      const needsFps = this.options.video.fps !== undefined && isFinite(currentFps) && this.options.video.fps !== currentFps;
+
+      const { codecpar } = videoStream;
+      const scale = transcodeScale(codecpar.width, codecpar.height, this.options.video.width, this.options.video.height);
+      // a GPU encodes up to a size of its own, test it with the size it will get
+      const encoderCodec =
+        (await findUsableHardwareEncoder(this.hardwareContext, 'h264', this.options.video.encoderOptions, scale.output)) ?? Codec.findEncoderByName(FF_ENCODER_LIBX264)!;
+      this.throwIfStopRequested();
+
+      this.videoDecoder = await openTranscodeDecoder(videoStream, this.hardwareContext, {
         exitOnError: false,
+        // Frame threading holds back one frame per thread before the first output;
+        // files keep the full thread count for throughput
+        ...(this.liveInput ? { configure: configureLiveDecoderThreading } : {}),
       });
       this.throwIfStopRequested();
 
-      // Determine if we need filters by comparing with current stream properties
-      const currentWidth = videoStream.codecpar.width;
-      const currentHeight = videoStream.codecpar.height;
-      const currentFps = videoStream.avgFrameRate.num / videoStream.avgFrameRate.den;
-
-      const needsScale =
-        (this.options.video.width !== undefined && this.options.video.width !== currentWidth) ||
-        (this.options.video.height !== undefined && this.options.video.height !== currentHeight);
-
-      const needsFps = this.options.video.fps !== undefined && isFinite(currentFps) && this.options.video.fps !== currentFps;
-
-      const encoderCodec = this.hardwareContext?.getEncoderCodec('h264') ?? Codec.findEncoderByName(FF_ENCODER_LIBX264)!;
-
-      // Create filter chain only if needed
-      if (needsScale || needsFps) {
-        const filterChain = FilterPreset.chain(this.hardwareContext);
-
-        // Add scale filter if dimensions differ
-        if (needsScale) {
-          const targetWidth = this.options.video.width ?? -1;
-          const targetHeight = this.options.video.height ?? -1;
-          filterChain.scale(targetWidth, targetHeight);
-        }
-
-        // Add fps filter if fps differs
-        if (needsFps) {
-          filterChain.filter('fps', { fps: this.options.video.fps! });
-        }
-
-        // Software scaling leaves the graph output format unconstrained, so swscale keeps the
-        // source format on both sides of the scale. Packed formats like yuyv422 can't be scaled
-        // in place (yuyv422 -> yuyv422 fails with ENOSYS), and the encoder wouldn't accept them
-        // anyway. Pin the output to yuv420p so the graph negotiates a real conversion: it is the
-        // one format every browser/player can decode via MSE (unlike e.g. the 4:2:2 High profile
-        // that a least-loss pick would choose for a yuyv422 source). Fall back to a codec-supported
-        // format only if the encoder genuinely can't take yuv420p. Hardware chains negotiate their
-        // format through the frames context instead.
-        if (needsScale && !this.hardwareContext) {
-          const formats = encoderCodec.pixelFormats;
-          const targetFmt =
-            !formats || formats.includes(AV_PIX_FMT_YUV420P) ? AV_PIX_FMT_YUV420P : pickSupportedPixelFormat(videoStream.codecpar.format as AVPixelFormat, formats);
-          const targetFmtName = avGetPixFmtName(targetFmt);
-          if (targetFmtName) {
-            filterChain.filter('format', { pix_fmts: targetFmtName });
-          }
-        }
-
-        this.videoFilter = FilterAPI.create(filterChain.build(), {
-          hardware: this.hardwareContext,
-        });
-      }
+      // The graph follows the frames: whether they come from the device and in
+      // which format shows only once they are decoded
+      this.videoFilter = createVideoTranscodeFilter({
+        ...scale.target,
+        fps: needsFps ? this.options.video.fps : undefined,
+        encoder: encoderCodec,
+        hardware: this.hardwareContext,
+      });
 
       let encoderOptions: EncoderOptions['options'] = {};
       if (encoderCodec.name === FF_ENCODER_LIBX264) {
@@ -979,10 +958,14 @@ export class FMP4Stream {
 
       this.videoEncoder = await Encoder.create(encoderCodec, {
         decoder: this.videoDecoder,
+        filter: this.videoFilter,
+        // Hardware encoders default to B-frames, which delay every fragment and
+        // fail on some D3D12 drivers that report support for them
+        context: { maxBFrames: 0 },
         options: encoderOptions,
         configure: (ctx) => {
           ctx.gopSize = this.gopSize(fpsForGop);
-          this.applyBitrate(ctx, bitrate);
+          applyVideoBitrate(ctx, bitrate);
         },
       });
       this.throwIfStopRequested();
@@ -992,20 +975,11 @@ export class FMP4Stream {
     const needsAudioTranscode = audioStream && !this.isAudioCodecSupported(audioStream.codecpar.codecId);
 
     if (needsAudioTranscode) {
-      // Transcode to AAC
       this.audioDecoder = await Decoder.create(audioStream, {
         exitOnError: false,
       });
 
-      const targetSampleRate = 44100;
-      const filterChain = FilterPreset.chain().aformat(AV_SAMPLE_FMT_FLTP, targetSampleRate, 'stereo').build();
-      this.audioFilter = FilterAPI.create(filterChain);
-
-      this.audioEncoder = await Encoder.create(FF_ENCODER_AAC, {
-        decoder: this.audioDecoder,
-        filter: this.audioFilter,
-        options: this.options.audio.encoderOptions,
-      });
+      await this.createAudioEncoder(this.audioDecoder, audioStream.codecpar.channels);
       this.throwIfStopRequested();
     }
 
@@ -1031,32 +1005,6 @@ export class FMP4Stream {
     if (this.stopRequested) {
       throw new Error('FMP4Stream stopped during start');
     }
-  }
-
-  /**
-   * Cap the video bitrate on the encoder context.
-   *
-   * Applies a VBV rate cap (maxrate + a 1s buffer) WITHOUT setting a target
-   * bitrate, so the encoder keeps its default constant-quality mode but can
-   * never exceed the negotiated ceiling. Setting the bitrate as an ABR target
-   * instead would push a normally-lighter stream UP to fill it, overshooting on
-   * bursts - the opposite of what strict rate-capped consumers want.
-   * No-op when no bitrate was requested.
-   *
-   * @param ctx - Encoder codec context
-   *
-   * @param bitrate - Maximum bitrate in bits per second, or undefined
-   *
-   * @internal
-   */
-  private applyBitrate(ctx: CodecContext, bitrate: number | undefined): void {
-    if (!bitrate || bitrate <= 0) {
-      return;
-    }
-    ctx.rcMaxRate = BigInt(Math.round(bitrate));
-    // 1s buffer keeps per-fragment size close to the cap instead of allowing
-    // multi-second bursts over it.
-    ctx.rcBufferSize = Math.round(bitrate);
   }
 
   /**
@@ -1266,7 +1214,9 @@ export class FMP4Stream {
         this.hardwareContext = HardwareContext.create(this.options.hardware.deviceType, this.options.hardware.device, this.options.hardware.options);
       }
 
-      const encoderCodec = this.hardwareContext?.getEncoderCodec('h264') ?? Codec.findEncoderByName(FF_ENCODER_LIBX264)!;
+      const encoderCodec =
+        (await findUsableHardwareEncoder(this.hardwareContext, 'h264', this.options.video.encoderOptions)) ?? Codec.findEncoderByName(FF_ENCODER_LIBX264)!;
+      this.throwIfStopRequested();
 
       let encoderOptions: EncoderOptions['options'] = {};
       if (encoderCodec.name === FF_ENCODER_LIBX264) {
@@ -1285,24 +1235,21 @@ export class FMP4Stream {
       const bitrate = this.options.video.bitrate;
 
       this.videoEncoder = await Encoder.create(encoderCodec, {
+        context: { maxBFrames: 0 },
         options: encoderOptions,
         configure: (ctx) => {
           ctx.framerate = new Rational(Math.round(fps), 1);
           ctx.gopSize = this.gopSize(fps);
-          this.applyBitrate(ctx, bitrate);
+          applyVideoBitrate(ctx, bitrate);
         },
       });
+
+      // Source frames may sit on another device or in a format the encoder rejects
+      this.videoFilter = createVideoTranscodeFilter({ width: -1, height: -1, encoder: encoderCodec, hardware: this.hardwareContext });
     }
 
-    // Audio encoder (AAC), resampling via aformat like the demuxer path.
     if (source.audio) {
-      const filterChain = FilterPreset.chain().aformat(AV_SAMPLE_FMT_FLTP, 44100, 'stereo').build();
-      this.audioFilter = FilterAPI.create(filterChain);
-
-      this.audioEncoder = await Encoder.create(FF_ENCODER_AAC, {
-        filter: this.audioFilter,
-        options: this.options.audio.encoderOptions,
-      });
+      await this.createAudioEncoder();
     }
     this.throwIfStopRequested();
 
@@ -1318,10 +1265,10 @@ export class FMP4Stream {
     // a silent source releasable instead of blocking teardown forever.
     const stopped = this.stopSignal.promise;
 
-    if (source.video && this.videoEncoder) {
+    if (source.video && this.videoFilter && this.videoEncoder) {
       const streamIndex = this.output.addStream(this.videoEncoder);
       const video = interruptibleFrameSource(source.video, stopped);
-      tasks.push(consumeStreamInParallel(this.videoEncoder.packets(video), this.output, streamIndex, shouldStop));
+      tasks.push(consumeStreamInParallel(this.videoEncoder.packets(this.videoFilter.frames(video)), this.output, streamIndex, shouldStop));
     }
 
     if (source.audio && this.audioFilter && this.audioEncoder) {
@@ -1596,6 +1543,19 @@ export class FMP4Stream {
   }
 
   /**
+   * Check if the video is encoded again instead of passed through.
+   *
+   * @param codecId - Codec ID of the source video
+   *
+   * @returns True if `video.transcode` is set or the codec is not in supported codecs
+   *
+   * @internal
+   */
+  private transcodesVideo(codecId: AVCodecID): boolean {
+    return this.options.video.transcode === true || !this.isVideoCodecSupported(codecId);
+  }
+
+  /**
    * Check if video codec is supported.
    *
    * @param codecId - Codec ID
@@ -1618,6 +1578,52 @@ export class FMP4Stream {
     }
 
     return false;
+  }
+
+  /**
+   * Codec that unsupported audio is transcoded to.
+   *
+   * @returns Opus when the client lists Opus but not AAC, otherwise AAC
+   *
+   * @internal
+   */
+  private audioTranscodeTarget(): typeof FMP4_CODECS.AAC | typeof FMP4_CODECS.OPUS {
+    return this.supportedCodecs.has(FMP4_CODECS.OPUS) && !this.supportedCodecs.has(FMP4_CODECS.AAC) ? FMP4_CODECS.OPUS : FMP4_CODECS.AAC;
+  }
+
+  /**
+   * Create the audio filter and encoder for the transcode target.
+   *
+   * AAC is resampled to 44.1 kHz stereo. Opus is resampled to 48 kHz, the only
+   * rate it transmits, keeps mono input mono and uses 20 ms frames.
+   *
+   * @param decoder - Input audio decoder, absent for a frame source
+   *
+   * @param channels - Input channel count, 0 when unknown
+   *
+   * @internal
+   */
+  private async createAudioEncoder(decoder?: Decoder, channels = 0): Promise<void> {
+    if (this.audioTranscodeTarget() === FMP4_CODECS.OPUS) {
+      this.audioFilter = FilterAPI.create(
+        FilterPreset.chain()
+          .aformat(AV_SAMPLE_FMT_FLT, 48000, channels === 1 ? 'mono' : 'stereo')
+          .build(),
+      );
+      this.audioEncoder = await Encoder.create(FF_ENCODER_LIBOPUS, {
+        decoder,
+        filter: this.audioFilter,
+        options: { frame_duration: 20, ...this.options.audio.encoderOptions },
+      });
+      return;
+    }
+
+    this.audioFilter = FilterAPI.create(FilterPreset.chain().aformat(AV_SAMPLE_FMT_FLTP, 44100, 'stereo').build());
+    this.audioEncoder = await Encoder.create(FF_ENCODER_AAC, {
+      decoder,
+      filter: this.audioFilter,
+      options: this.options.audio.encoderOptions,
+    });
   }
 
   /**

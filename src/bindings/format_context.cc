@@ -97,6 +97,14 @@ FormatContext::~FormatContext() {
 
   // Clean up if user forgot to call freeContext()
   if (ctx_) {
+    borrowers_->InvalidateAll();
+
+    // An IOContext still holding this pb must not use or close it again
+    if (pb_io_) {
+      pb_io_->async_ops_.WaitIdle();
+    }
+    ReleasePbIO(ClosesPb());
+
     // Clear the interrupt callback opaque
     ctx_->interrupt_callback.opaque = nullptr;
 
@@ -118,6 +126,34 @@ FormatContext::~FormatContext() {
     }
     ctx_ = nullptr;
   }
+  ReleasePbIO(false);
+}
+
+bool FormatContext::ClosesPb() const {
+  if (!ctx_ || !ctx_->pb || (ctx_->flags & AVFMT_FLAG_CUSTOM_IO)) {
+    return false;
+  }
+  if (is_output_) {
+    return !ctx_->oformat || !(ctx_->oformat->flags & AVFMT_NOFILE);
+  }
+  // Mirrors avformat_close_input()
+  const AVInputFormat* ifmt = ctx_->iformat;
+  return !(ifmt && strcmp(ifmt->name, "image2") && (ifmt->flags & AVFMT_NOFILE));
+}
+
+void FormatContext::ReleasePbIO(bool closing) {
+  if (!pb_io_) {
+    return;
+  }
+  if (closing && ctx_ && ctx_->pb == pb_io_->ctx_) {
+    pb_io_->ctx_ = nullptr;
+  }
+  pb_io_->pb_of_ = nullptr;
+  pb_io_ = nullptr;
+}
+
+bool FormatContext::GuardPbIO(Napi::Env env) {
+  return !pb_io_ || pb_io_->GuardOps(env);
 }
 
 // === Methods ===
@@ -137,6 +173,7 @@ Napi::Value FormatContext::AllocContext(const Napi::CallbackInfo& info) {
   new_ctx->interrupt_callback.opaque = this;
   interrupt_requested_.store(false);
 
+  ReleasePbIO(false);
   ctx_ = new_ctx;
   is_output_ = false;
 
@@ -190,6 +227,7 @@ Napi::Value FormatContext::AllocOutputContext2(const Napi::CallbackInfo& info) {
   new_ctx->interrupt_callback.opaque = this;
   interrupt_requested_.store(false);
 
+  ReleasePbIO(false);
   ctx_ = new_ctx;
   is_output_ = true;
 
@@ -215,7 +253,7 @@ Napi::Value FormatContext::FreeContext(const Napi::CallbackInfo& info) {
   // a use-after-free; wait bounded, then error instead of crashing. Blocked
   // readers are not interrupted here - freeContext() has no abort semantics,
   // use closeInput()/interrupt() for that.
-  if (!GuardAsyncOps(env, async_ops_, "FormatContext")) {
+  if (!GuardAsyncOps(env, async_ops_, "FormatContext") || !GuardPbIO(env)) {
     return env.Undefined();
   }
 
@@ -228,6 +266,10 @@ Napi::Value FormatContext::FreeContext(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
+  // Closed below if it is ours to close; either way the IOContext it came
+  // from must not close it again
+  ReleasePbIO(ClosesPb());
+
   AVFormatContext* ctx = ctx_;
   ctx_ = nullptr;
 
@@ -235,6 +277,8 @@ Napi::Value FormatContext::FreeContext(const Napi::CallbackInfo& info) {
     // Already freed
     return env.Undefined();
   }
+
+  borrowers_->InvalidateAll();
 
   // Clear the interrupt callback opaque pointer
   ctx->interrupt_callback.opaque = nullptr;
@@ -286,7 +330,7 @@ Napi::Value FormatContext::NewStream(const Napi::CallbackInfo& info) {
   // Wrap AVStream and return it
   Napi::Object streamObj = Stream::constructor.New({});
   Stream* streamWrapper = UnwrapNativeObject<Stream>(env, streamObj, "Stream");
-  streamWrapper->Set(stream);
+  streamWrapper->Set(stream, borrowers_);
   
   return streamObj;
 }
@@ -592,7 +636,7 @@ Napi::Value FormatContext::GetStreams(const Napi::CallbackInfo& info) {
     // Wrap AVStream and add to array
     Napi::Object streamObj = Stream::constructor.New({});
     Stream* streamWrapper = UnwrapNativeObject<Stream>(env, streamObj, "Stream");
-    streamWrapper->Set(ctx->streams[i]);
+    streamWrapper->Set(ctx->streams[i], borrowers_);
     streams[i] = streamObj;
   }
   
@@ -885,6 +929,8 @@ void FormatContext::SetPb(const Napi::CallbackInfo& info, const Napi::Value& val
   
   AVFormatContext* ctx = ctx_;
   if (!ctx) {
+    // e.g. freed by a failed openInput(): only the link is left to drop
+    ReleasePbIO(false);
     return;
   }
 
@@ -897,6 +943,7 @@ void FormatContext::SetPb(const Napi::CallbackInfo& info, const Napi::Value& val
   }
   
   if (value.IsNull() || value.IsUndefined()) {
+    ReleasePbIO(false);
     ctx->pb = nullptr;
     custom_io_abort_.reset();
     return;
@@ -904,8 +951,24 @@ void FormatContext::SetPb(const Napi::CallbackInfo& info, const Napi::Value& val
   
   IOContext* io = UnwrapNativeObject<IOContext>(env, value, "IOContext");
   if (io) {
+    // One AVIOContext as the pb of two contexts would be closed twice
+    FormatContext* other = io->pb_of_;
+    if (other && other != this) {
+      if (other->ctx_ && other->ctx_->pb && other->ctx_->pb == io->Get()) {
+        Napi::Error::New(env, "IOContext is already the pb of another FormatContext").ThrowAsJavaScriptException();
+        return;
+      }
+      // Stale: that context no longer uses it
+      other->ReleasePbIO(false);
+    }
+
     // Set the custom IO context
+    ReleasePbIO(false);
     ctx->pb = io->Get();
+    if (ctx->pb) {
+      pb_io_ = io;
+      io->pb_of_ = this;
+    }
 
     // Close paths end a callback-backed input's callbacks (see AbortCustomIO);
     // an output keeps them to flush and write its trailer
@@ -921,7 +984,8 @@ void FormatContext::SetPb(const Napi::CallbackInfo& info, const Napi::Value& val
       ctx->flags |= AVFMT_FLAG_CUSTOM_IO;
     }
 
-    // We never own custom pb - IOContext keeps ownership
+    // A callback-backed pb stays the IOContext's; one opened via open2() is
+    // closed by whichever of the two closes it first (see pb_io_)
   }
 }
 
@@ -1060,6 +1124,13 @@ void FormatContext::FreeStreamOptions(std::vector<AVDictionary*>& options) {
 }
 
 int FormatContext::InterruptCallback(void* opaque) {
+  // process.exit() joins the threadpool after 'exit': an open, read or write
+  // stuck on a stalled network peer there would hold the exit until its
+  // timeout, and an open in flight has no handle to interrupt() it yet
+  if (IOContext::ProcessExiting()) {
+    return 1;
+  }
+
   // The opaque pointer might be invalid if FormatContext was destroyed
   if (!opaque) {
     return 0;

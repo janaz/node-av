@@ -3,6 +3,7 @@
 
 #include <napi.h>
 #include "common.h"
+#include "borrow_registry.h"
 
 extern "C" {
 #include <libavfilter/avfilter.h>
@@ -13,7 +14,7 @@ namespace ffmpeg {
 // Forward declaration
 class FilterContext;
 
-class FilterInOut : public Napi::ObjectWrap<FilterInOut> {
+class FilterInOut : public Napi::ObjectWrap<FilterInOut>, public Borrower {
 public:
   static thread_local Napi::FunctionReference constructor;
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
@@ -21,29 +22,21 @@ public:
   ~FilterInOut();
 
   AVFilterInOut* Get() { return inout_; }
+
+  // Takes ownership of a list, e.g. one FFmpeg returned to the caller
   void SetOwned(AVFilterInOut* inout) {
-    // Free old inout if exists and we own it
-    if (is_owned_) {
-      avfilter_inout_free(&inout_);
-    }
+    FreeList();
     inout_ = inout;
-    is_owned_ = true;  // SetOwned means we take ownership
+    is_owned_ = true;
+    StopBorrowing();
   }
 
-  void SetUnowned(AVFilterInOut* inout) {
-    // Free old inout if exists and we own it
-    if (is_owned_) {
-      avfilter_inout_free(&inout_);
-    }
-    inout_ = inout;
-    is_owned_ = false;  // SetUnowned means we don't own it
-  }
+  // Copies a whole list for FFmpeg functions that consume or rewrite theirs,
+  // so the FilterInOut passed in keeps its own
+  static int CopyList(const AVFilterInOut* list, AVFilterInOut** copy);
 
-  // Mark as consumed by FFmpeg (e.g., by avfilter_graph_parse)
-  void MarkAsConsumed() {
-    is_owned_ = false;
-    inout_ = nullptr;
-  }
+protected:
+  void Invalidate() override { inout_ = nullptr; }
 
 private:
   friend class FilterGraph;
@@ -51,6 +44,15 @@ private:
 
   AVFilterInOut* inout_ = nullptr;
   bool is_owned_ = true;
+
+  // Wrappers pointing into this list (its next elements, lists appended to it)
+  // while this wrapper owns it
+  std::shared_ptr<BorrowRegistry> borrowers_ = std::make_shared<BorrowRegistry>();
+
+  // Where wrappers into this list register: here if this wrapper owns it,
+  // else with the wrapper that does
+  std::shared_ptr<BorrowRegistry> ListOwner() { return is_owned_ ? borrowers_ : BorrowedFrom(); }
+  void FreeList();
 
   Napi::Value Alloc(const Napi::CallbackInfo& info);
   Napi::Value Free(const Napi::CallbackInfo& info);

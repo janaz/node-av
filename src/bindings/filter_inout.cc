@@ -35,22 +35,47 @@ FilterInOut::FilterInOut(const Napi::CallbackInfo& info)
 }
 
 FilterInOut::~FilterInOut() {
+  FreeList();
+}
+
+void FilterInOut::FreeList() {
   // Only free if we own it
-  if (is_owned_) {
+  if (is_owned_ && inout_) {
+    borrowers_->InvalidateAll();
     avfilter_inout_free(&inout_);
   }
+}
+
+int FilterInOut::CopyList(const AVFilterInOut* list, AVFilterInOut** copy) {
+  *copy = nullptr;
+  AVFilterInOut** tail = copy;
+  for (; list; list = list->next) {
+    AVFilterInOut* node = avfilter_inout_alloc();
+    if (!node) {
+      avfilter_inout_free(copy);
+      return AVERROR(ENOMEM);
+    }
+    *tail = node;
+    tail = &node->next;
+    if (list->name && !(node->name = av_strdup(list->name))) {
+      avfilter_inout_free(copy);
+      return AVERROR(ENOMEM);
+    }
+    node->filter_ctx = list->filter_ctx;
+    node->pad_idx = list->pad_idx;
+  }
+  return 0;
 }
 
 Napi::Value FilterInOut::Alloc(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
 
   // Free old inout if exists and we own it
-  if (is_owned_) {
-    avfilter_inout_free(&inout_);
-  }
+  FreeList();
 
   inout_ = avfilter_inout_alloc();
   is_owned_ = true;  // We allocated it, so we own it
+  StopBorrowing();
 
   if (!inout_) {
     Napi::Error::New(env, "Failed to allocate FilterInOut").ThrowAsJavaScriptException();
@@ -62,10 +87,11 @@ Napi::Value FilterInOut::Alloc(const Napi::CallbackInfo& info) {
 Napi::Value FilterInOut::Free(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
 
-  // Only free if we own it
-  if (is_owned_) {
-    avfilter_inout_free(&inout_);
-  }
+  // Only free if we own it; either way this wrapper is empty afterwards
+  FreeList();
+  inout_ = nullptr;
+  is_owned_ = true;
+  StopBorrowing();
 
   return env.Undefined();
 }
@@ -160,6 +186,7 @@ Napi::Value FilterInOut::GetNext(const Napi::CallbackInfo& info) {
   // The next element is part of our chain, so we don't own it separately
   wrapper->inout_ = inout->next;
   wrapper->is_owned_ = false;  // We don't own this - it's part of the parent's chain
+  wrapper->BorrowFrom(ListOwner());
 
   return nextObj;
 }
@@ -181,8 +208,10 @@ void FilterInOut::SetNext(const Napi::CallbackInfo& info, const Napi::Value& val
   if (next) {
     inout->next = next->Get();
     // Mark the next element as not owned - it's now part of our chain
-    // and will be freed when we free the head
+    // and will be freed when we free the head, as will the wrappers into it
+    next->borrowers_->MoveTo(ListOwner());
     next->is_owned_ = false;
+    next->BorrowFrom(ListOwner());
   }
 }
 

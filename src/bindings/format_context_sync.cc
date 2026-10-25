@@ -409,7 +409,7 @@ Napi::Value FormatContext::CloseInputSync(const Napi::CallbackInfo& info) {
   // Wait for in-flight async workers before freeing (use-after-free guard).
   // The interrupt above unblocks readers stuck in blocking I/O so they can
   // release the counter.
-  if (!GuardAsyncOps(env, async_ops_, "FormatContext")) {
+  if (!GuardAsyncOps(env, async_ops_, "FormatContext") || !GuardPbIO(env)) {
     return env.Undefined();
   }
 
@@ -437,6 +437,9 @@ Napi::Value FormatContext::CloseInputSync(const Napi::CallbackInfo& info) {
     // Freed concurrently while waiting
     return env.Undefined();
   }
+
+  borrowers_->InvalidateAll();
+  ReleasePbIO(!detachPb && ClosesPb());
 
   // Detach a caller-owned pb only now: until the guard above waited for it, an
   // open failed by the abort may still be freeing ctx_ on its threadpool thread
@@ -509,8 +512,11 @@ Napi::Value FormatContext::OpenOutputSync(const Napi::CallbackInfo& info) {
     return Napi::Number::New(env, 0);
   }
 
+  // Replaces ctx_->pb; one set from an IOContext stays with it
+  ReleasePbIO(false);
+
   // Direct synchronous call
-  int ret = avio_open(&ctx_->pb, ctx_->url, AVIO_FLAG_WRITE);
+  int ret = avio_open2(&ctx_->pb, ctx_->url, AVIO_FLAG_WRITE, &ctx_->interrupt_callback, nullptr);
 
   return Napi::Number::New(env, ret);
 }
@@ -550,9 +556,12 @@ Napi::Value FormatContext::CloseOutputSync(const Napi::CallbackInfo& info) {
 
   // avio_closep() frees the AVIOContext that in-flight async writes may still
   // be using on the threadpool - wait for them first (use-after-free guard)
-  if (!GuardAsyncOps(env, async_ops_, "FormatContext")) {
+  if (!GuardAsyncOps(env, async_ops_, "FormatContext") || !GuardPbIO(env)) {
     return env.Undefined();
   }
+
+  // Closed here, so the IOContext it came from must not close it again
+  ReleasePbIO(true);
 
   // Direct synchronous call
   avio_closep(&ctx_->pb);

@@ -3,6 +3,7 @@
 
 #include <napi.h>
 #include "common.h"
+#include "borrow_registry.h"
 #include "promise_worker.h"
 
 extern "C" {
@@ -15,7 +16,7 @@ namespace ffmpeg {
 class Filter;
 class FilterGraph;
 
-class FilterContext : public Napi::ObjectWrap<FilterContext> {
+class FilterContext : public Napi::ObjectWrap<FilterContext>, public Borrower {
 public:
   static thread_local Napi::FunctionReference constructor;
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
@@ -31,14 +32,13 @@ public:
     }
     ctx_ = ctx;
     unowned_ctx_ = nullptr;
+    StopBorrowing();
   }
-  void SetUnowned(AVFilterContext* ctx) {
-    if (ctx_) {
-      avfilter_free(ctx_);
-    }
-    ctx_ = nullptr;
-    unowned_ctx_ = ctx;
-  }
+  // Wraps a filter its graph owns, borrowing from the FilterGraph owning that
+  void SetUnowned(AVFilterContext* ctx);
+
+protected:
+  void Invalidate() override { unowned_ctx_ = nullptr; }
 
 private:
   friend class Filter;

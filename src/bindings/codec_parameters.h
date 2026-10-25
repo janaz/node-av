@@ -3,6 +3,7 @@
 
 #include <napi.h>
 #include "common.h"
+#include "borrow_registry.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -10,7 +11,9 @@ extern "C" {
 
 namespace ffmpeg {
 
-class CodecParameters : public Napi::ObjectWrap<CodecParameters> {
+// Either owns its parameters or borrows those of a stream or bitstream filter;
+// a borrowed one is invalidated before its owner frees them (see Borrower)
+class CodecParameters : public Napi::ObjectWrap<CodecParameters>, public Borrower {
 public:
   static thread_local Napi::FunctionReference constructor;
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
@@ -27,8 +30,10 @@ public:
     }
     params_ = params;
     is_owned_ = owned;
+    // a borrowing caller registers with the owner after this
+    StopBorrowing();
   }
-  
+
 
 private:
   friend class Stream;
@@ -37,6 +42,9 @@ private:
 
   AVCodecParameters* params_ = nullptr;
   bool is_owned_ = true;
+
+  // only borrowed parameters are registered with an owner
+  void Invalidate() override { params_ = nullptr; }
 
   Napi::Value Alloc(const Napi::CallbackInfo& info);
   Napi::Value Free(const Napi::CallbackInfo& info);

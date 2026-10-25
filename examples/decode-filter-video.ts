@@ -172,6 +172,9 @@ async function initFilters(filtersDescr: string): Promise<void> {
 
   // Parse the filter graph
   let configRet = filterGraph.parsePtr(filtersDescr, inputs, outputs);
+  // parsePtr works on copies of the lists, so ours are still ours to free
+  inputs.free();
+  outputs.free();
   FFmpegError.throwIfError(configRet, 'Cannot parse filter graph');
 
   // Configure the graph

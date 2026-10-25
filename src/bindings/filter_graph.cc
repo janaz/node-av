@@ -56,7 +56,37 @@ FilterGraph::FilterGraph(const Napi::CallbackInfo& info)
 }
 
 FilterGraph::~FilterGraph() {
-  avfilter_graph_free(&graph_);
+  // Its filter contexts can outlive this object and still run a
+  // buffersrc/buffersink worker on the graph
+  borrowers_->BorrowerOps().WaitIdle();
+  FreeGraph();
+}
+
+void FilterGraph::SetUnowned(AVFilterGraph* graph) {
+  FreeGraph();
+  unowned_graph_ = graph;
+  BorrowFrom(BorrowersOf(graph));
+}
+
+std::shared_ptr<BorrowRegistry> FilterGraph::BorrowersOf(const AVFilterGraph* graph) {
+  if (!graph || !graph->opaque) {
+    return nullptr;
+  }
+  return static_cast<FilterGraph*>(graph->opaque)->borrowers_;
+}
+
+bool FilterGraph::GuardWorkers(Napi::Env env) {
+  // config/requestOldest on the graph itself, buffersrc/buffersink on its
+  // filter contexts
+  return GuardAsyncOps(env, async_ops_, "FilterGraph") &&
+         GuardAsyncOps(env, borrowers_->BorrowerOps(), "FilterGraph");
+}
+
+void FilterGraph::FreeGraph() {
+  if (graph_) {
+    borrowers_->InvalidateAll();
+    avfilter_graph_free(&graph_);
+  }
 }
 
 Napi::Value FilterGraph::Alloc(const Napi::CallbackInfo& info) {
@@ -64,19 +94,24 @@ Napi::Value FilterGraph::Alloc(const Napi::CallbackInfo& info) {
 
   // Replacing the graph frees the old one - wait for in-flight async
   // operations first
-  if (graph_ && !GuardAsyncOps(env, async_ops_, "FilterGraph")) {
+  if (graph_ && !GuardWorkers(env)) {
     return env.Undefined();
   }
 
-  avfilter_graph_free(&graph_);
+  FreeGraph();
 
   graph_ = avfilter_graph_alloc();
   unowned_graph_ = nullptr;
+  StopBorrowing();
 
   if (!graph_) {
     Napi::Error::New(env, "Failed to allocate filter graph").ThrowAsJavaScriptException();
     return env.Undefined();
   }
+
+  // Lets wrappers of its filters find this owner (libavfilter never touches
+  // opaque)
+  graph_->opaque = this;
 
   return env.Undefined();
 }
@@ -84,16 +119,18 @@ Napi::Value FilterGraph::Alloc(const Napi::CallbackInfo& info) {
 Napi::Value FilterGraph::Free(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
 
-  if (graph_ || unowned_graph_) {
-    // Freeing (or detaching) while a config/requestOldest worker still uses
-    // the graph on the threadpool would be a use-after-free; wait bounded,
-    // then error instead of crashing
-    if (!GuardAsyncOps(env, async_ops_, "FilterGraph")) {
-      return env.Undefined();
-    }
+  // Freeing (or detaching) while a worker still uses the graph on the
+  // threadpool would be a use-after-free; wait bounded, then error instead of
+  // crashing
+  if (graph_ && !GuardWorkers(env)) {
+    return env.Undefined();
   }
-  avfilter_graph_free(&graph_);
+  if (unowned_graph_ && !GuardAsyncOps(env, async_ops_, "FilterGraph")) {
+    return env.Undefined();
+  }
+  FreeGraph();
   unowned_graph_ = nullptr;
+  StopBorrowing();
 
   return env.Undefined();
 }
@@ -211,6 +248,13 @@ Napi::Value FilterGraph::GetFilter(const Napi::CallbackInfo& info) {
   return ctxObj;
 }
 
+// Copies the list a FilterInOut argument holds; anything else means no list
+static int CopyInOutArg(Napi::Env env, const Napi::Value& value, AVFilterInOut** copy) {
+  *copy = nullptr;
+  FilterInOut* inout = UnwrapNativeObject<FilterInOut>(env, value, "FilterInOut");
+  return inout ? FilterInOut::CopyList(inout->Get(), copy) : 0;
+}
+
 Napi::Value FilterGraph::Parse(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   
@@ -227,42 +271,21 @@ Napi::Value FilterGraph::Parse(const Napi::CallbackInfo& info) {
   
   std::string filters = info[0].As<Napi::String>().Utf8Value();
   
-  // Extract inputs and outputs FilterInOut objects
+  // avfilter_graph_parse() frees the lists it gets: hand it copies so the
+  // FilterInOut objects keep theirs
   AVFilterInOut* inputs = nullptr;
   AVFilterInOut* outputs = nullptr;
-  
-  if (!info[1].IsNull() && !info[1].IsUndefined()) {
-    FilterInOut* inObj = UnwrapNativeObject<FilterInOut>(env, info[1], "FilterInOut");
-    if (inObj) {
-      inputs = inObj->Get();
-    }
+  int ret = CopyInOutArg(env, info[1], &inputs);
+  if (ret >= 0) {
+    ret = CopyInOutArg(env, info[2], &outputs);
   }
-  
-  if (!info[2].IsNull() && !info[2].IsUndefined()) {
-    FilterInOut* outObj = UnwrapNativeObject<FilterInOut>(env, info[2], "FilterInOut");
-    if (outObj) {
-      outputs = outObj->Get();
-    }
+  if (ret < 0) {
+    avfilter_inout_free(&inputs);
+    return Napi::Number::New(env, ret);
   }
-  
-  int ret = avfilter_graph_parse(graph, filters.c_str(), inputs, outputs, nullptr);
-  
-  // avfilter_graph_parse consumes the FilterInOut structures
-  // Mark them as consumed so JavaScript won't try to free them again
-  if (!info[1].IsNull() && !info[1].IsUndefined()) {
-    FilterInOut* inObj = UnwrapNativeObject<FilterInOut>(env, info[1], "FilterInOut");
-    if (inObj) {
-      inObj->MarkAsConsumed();
-    }
-  }
-  
-  if (!info[2].IsNull() && !info[2].IsUndefined()) {
-    FilterInOut* outObj = UnwrapNativeObject<FilterInOut>(env, info[2], "FilterInOut");
-    if (outObj) {
-      outObj->MarkAsConsumed();
-    }
-  }
-  
+
+  ret = avfilter_graph_parse(graph, filters.c_str(), inputs, outputs, nullptr);
+
   return Napi::Number::New(env, ret);
 }
 
@@ -311,52 +334,18 @@ Napi::Value FilterGraph::ParsePtr(const Napi::CallbackInfo& info) {
   std::string filters = info[0].As<Napi::String>().Utf8Value();
   const char* filter_ptr = filters.c_str();
   
+  // avfilter_graph_parse_ptr() consumes the lists it gets and returns the
+  // unlinked rest: hand it copies of the whole lists so the FilterInOut
+  // objects keep theirs
   AVFilterInOut* inputs = nullptr;
   AVFilterInOut* outputs = nullptr;
-  
-  // If FilterInOut objects are provided, create copies since avfilter_graph_parse_ptr 
-  // will take ownership and free them
-  if (info.Length() >= 3) {
-    // Get the inputs FilterInOut
-    if (!info[1].IsNull() && !info[1].IsUndefined()) {
-      FilterInOut* inObj = UnwrapNativeObject<FilterInOut>(env, info[1], "FilterInOut");
-      if (inObj && inObj->Get()) {
-        // Create a copy since avfilter_graph_parse_ptr will consume it
-        AVFilterInOut* orig = inObj->Get();
-        inputs = avfilter_inout_alloc();
-        if (inputs) {
-          inputs->name = orig->name ? av_strdup(orig->name) : nullptr;
-          inputs->filter_ctx = orig->filter_ctx;
-          inputs->pad_idx = orig->pad_idx;
-          inputs->next = nullptr; // Don't copy the chain for now
-        }
-        // Mark the original as consumed since we've taken its data
-        inObj->MarkAsConsumed();
-      }
-    }
-    
-    // Get the outputs FilterInOut
-    if (!info[2].IsNull() && !info[2].IsUndefined()) {
-      FilterInOut* outObj = UnwrapNativeObject<FilterInOut>(env, info[2], "FilterInOut");
-      if (outObj && outObj->Get()) {
-        // Create a copy since avfilter_graph_parse_ptr will consume it
-        AVFilterInOut* orig = outObj->Get();
-        outputs = avfilter_inout_alloc();
-        if (outputs) {
-          outputs->name = orig->name ? av_strdup(orig->name) : nullptr;
-          outputs->filter_ctx = orig->filter_ctx;
-          outputs->pad_idx = orig->pad_idx;
-          outputs->next = nullptr; // Don't copy the chain for now
-        }
-        // Mark the original as consumed since we've taken its data
-        outObj->MarkAsConsumed();
-      }
-    }
+  int ret = CopyInOutArg(env, info[1], &inputs);
+  if (ret >= 0) {
+    ret = CopyInOutArg(env, info[2], &outputs);
   }
-  
-  // Call avfilter_graph_parse_ptr with pointers to the pointers
-  // This function will modify/free the inputs and outputs pointers
-  int ret = avfilter_graph_parse_ptr(graph, filter_ptr, &inputs, &outputs, nullptr);
+  if (ret >= 0) {
+    ret = avfilter_graph_parse_ptr(graph, filter_ptr, &inputs, &outputs, nullptr);
+  }
   
   // Clean up any remaining structures (in case of error or unconnected pads)
   avfilter_inout_free(&inputs);

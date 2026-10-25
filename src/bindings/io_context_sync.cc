@@ -26,7 +26,8 @@ Napi::Value IOContext::Open2Sync(const Napi::CallbackInfo& info) {
 
   // Direct FFmpeg call
   AVIOContext* avio_ctx = nullptr;
-  int ret = avio_open2(&avio_ctx, url.c_str(), flags, nullptr, nullptr);
+  AVIOInterruptCB int_cb = {ExitInterruptCallback, nullptr};
+  int ret = avio_open2(&avio_ctx, url.c_str(), flags, &int_cb, nullptr);
 
   if (ret < 0) {
     return Napi::Number::New(env, ret);
@@ -127,7 +128,7 @@ Napi::Value IOContext::ClosepSync(const Napi::CallbackInfo& info) {
   }
 
   // Closing while an async op still uses the context would be a use-after-free
-  if (!GuardOps(env)) {
+  if (!GuardOps(env) || !DetachFromFormat(env)) {
     return env.Undefined();
   }
 

@@ -3,6 +3,7 @@
 
 #include <napi.h>
 #include "common.h"
+#include "borrow_registry.h"
 #include "promise_worker.h"
 
 extern "C" {
@@ -25,6 +26,10 @@ private:
   friend class AVOptionWrapper;
 
   AVBSFContext* context_ = nullptr;
+
+  // The par_in/par_out wrappers handed to JS point into context_: invalidated
+  // before it is freed (see Borrower)
+  std::shared_ptr<BorrowRegistry> borrowers_ = std::make_shared<BorrowRegistry>();
   bool is_initialized_ = false;
   AsyncOpCounter async_ops_;
 

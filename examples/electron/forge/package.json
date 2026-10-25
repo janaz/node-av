@@ -31,19 +31,16 @@
     "@types/electron-squirrel-startup": "^1.0.2",
     "@typescript-eslint/eslint-plugin": "^8.54.0",
     "@typescript-eslint/parser": "^8.54.0",
-    "electron": "40.0.0",
+    "electron": "42.11.16",
     "eslint": "^9.39.2",
     "eslint-plugin-import": "^2.32.0",
     "rimraf": "^6.1.2",
     "typescript": "~5.9.3",
     "updates": "^17.0.8",
-    "vite": "^7.3.1"
+    "vite": "^7.3.7"
   },
   "dependencies": {
     "electron-squirrel-startup": "^1.0.1",
     "node-av": "file:../../.."
-  },
-  "overrides": {
-    "@shinyoshiaki/binary-data": "npm:@seydx/binary-data@0.6.2"
   }
 }

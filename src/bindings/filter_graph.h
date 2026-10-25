@@ -3,6 +3,7 @@
 
 #include <napi.h>
 #include "common.h"
+#include "borrow_registry.h"
 #include "promise_worker.h"
 
 extern "C" {
@@ -17,7 +18,7 @@ namespace ffmpeg {
 class Filter;
 class FilterContext;
 
-class FilterGraph : public Napi::ObjectWrap<FilterGraph> {
+class FilterGraph : public Napi::ObjectWrap<FilterGraph>, public Borrower {
 public:
   static thread_local Napi::FunctionReference constructor;
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
@@ -27,16 +28,15 @@ public:
   AVFilterGraph* Get() { 
     return graph_ ? graph_ : unowned_graph_; 
   }
-  void SetOwned(AVFilterGraph* graph) {
-    avfilter_graph_free(&graph_);
-    graph_ = graph;
-    unowned_graph_ = nullptr;
-  }
-  void SetUnowned(AVFilterGraph* graph) {
-    avfilter_graph_free(&graph_);
-    graph_ = nullptr;
-    unowned_graph_ = graph;
-  }
+  // Wraps a graph another FilterGraph owns, borrowing from that owner
+  void SetUnowned(AVFilterGraph* graph);
+
+  // The registry of the FilterGraph that owns `graph`, for wrappers pointing
+  // into it (null if no FilterGraph owns it)
+  static std::shared_ptr<BorrowRegistry> BorrowersOf(const AVFilterGraph* graph);
+
+protected:
+  void Invalidate() override { unowned_graph_ = nullptr; }
 
 private:
   friend class AVOptionWrapper;
@@ -49,6 +49,13 @@ private:
   // In-flight threadpool operations (config/requestOldest); free/replace
   // paths wait on this so they cannot free graph_ under a worker.
   AsyncOpCounter async_ops_;
+
+  // Wrappers pointing into graph_ (its filter contexts, segments, unowned
+  // graph wrappers); graph_->opaque points back here so they can find it
+  std::shared_ptr<BorrowRegistry> borrowers_ = std::make_shared<BorrowRegistry>();
+
+  bool GuardWorkers(Napi::Env env);
+  void FreeGraph();
 
   Napi::Value Alloc(const Napi::CallbackInfo& info);
   Napi::Value Free(const Napi::CallbackInfo& info);

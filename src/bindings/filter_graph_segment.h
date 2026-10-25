@@ -3,6 +3,7 @@
 
 #include <napi.h>
 #include "common.h"
+#include "borrow_registry.h"
 
 extern "C" {
 #include <libavfilter/avfilter.h>
@@ -13,7 +14,7 @@ namespace ffmpeg {
 // Forward declarations
 class FilterGraph;
 
-class FilterGraphSegment : public Napi::ObjectWrap<FilterGraphSegment> {
+class FilterGraphSegment : public Napi::ObjectWrap<FilterGraphSegment>, public Borrower {
 public:
   static thread_local Napi::FunctionReference constructor;
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
@@ -22,10 +23,13 @@ public:
 
   AVFilterGraphSegment* Get() { return segment_; }
 
-  void SetSegment(AVFilterGraphSegment* segment) {
-    avfilter_graph_segment_free(&segment_);
-    segment_ = segment;
-  }
+  // Takes ownership of a segment parsed into a graph, borrowing from the
+  // FilterGraph owning that graph
+  void SetSegment(AVFilterGraphSegment* segment);
+
+protected:
+  // Useless without its graph; freeing it touches only its own allocations
+  void Invalidate() override { avfilter_graph_segment_free(&segment_); }
 
 private:
   friend class FilterGraph;

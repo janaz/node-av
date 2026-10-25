@@ -9,6 +9,7 @@
 #include <shared_mutex>
 #include <vector>
 #include "common.h"
+#include "borrow_registry.h"
 #include "promise_worker.h"
 
 extern "C" {
@@ -99,6 +100,7 @@ typedef struct RTSPState {
 namespace ffmpeg {
 
 class InputReader;
+class IOContext;
 struct IOExitState;
 
 class FormatContext : public Napi::ObjectWrap<FormatContext> {
@@ -115,9 +117,31 @@ public:
 private:
   friend class AVOptionWrapper;
   friend class InputReader;
+  friend class IOContext;
 
   AVFormatContext* ctx_ = nullptr;
   bool is_output_ = false;
+
+  // The IOContext whose AVIOContext ctx_->pb is (set through the pb setter).
+  // Both hold that pointer and either may close it - avio_closep(&ofmt->pb)
+  // in C goes through the IOContext here - so whichever closes it first clears
+  // the other's copy. Main thread only.
+  IOContext* pb_io_ = nullptr;
+
+  // Whether closing or freeing this context closes ctx_->pb as well:
+  // avformat_close_input() and our output paths do so unless it is custom IO
+  bool ClosesPb() const;
+  // Ends the pb link before ctx_->pb is replaced, detached, closed or freed;
+  // `closing` when this context closes it, which empties the IOContext
+  void ReleasePbIO(bool closing);
+  // Waits for in-flight operations of that IOContext before ctx_->pb is
+  // closed under it; false with a pending exception if they do not finish
+  bool GuardPbIO(Napi::Env env);
+
+  // The Stream wrappers handed to JS, and the codecpar/parser wrappers they
+  // hand out, point into ctx_: invalidated on the JS thread before every free
+  // of it, so a wrapper that outlives the context reads defaults
+  std::shared_ptr<BorrowRegistry> borrowers_ = std::make_shared<BorrowRegistry>();
 
   // Owner thread of an input context, started by the first async readFrame()
   // and the only thread touching ctx_ from then on (see input_reader.h).

@@ -1,4 +1,5 @@
 #include "io_context.h"
+#include "format_context.h"
 #include <libavutil/error.h>
 #include <libavutil/mem.h>
 #include <chrono>
@@ -316,20 +317,35 @@ IOContext::IOContext(const Napi::CallbackInfo& info)
 }
 
 IOContext::~IOContext() {
-  // Clean up callbacks first
+  // Never freed or closed explicitly (e.g. the input of a demuxer dropped
+  // without close()). Free ctx_ here unless the FormatContext using it as its
+  // pb closes it (an output's pb opened with open2()). Threadpool work still
+  // using it keeps it alive instead, as freeing it then would be a
+  // use-after-free; nothing can start new work from inside a finalizer.
+  bool format_closes = pb_of_ && pb_of_->ctx_ && pb_of_->ctx_->pb == ctx_ && pb_of_->ClosesPb();
+  bool busy = async_ops_.Active() > 0 || (pb_of_ && (pb_of_->reader_ || pb_of_->async_ops_.Active() > 0));
+  bool frees = ctx_ && !format_closes && !busy;
+  if (pb_of_) {
+    if (frees && pb_of_->ctx_ && pb_of_->ctx_->pb == ctx_) {
+      pb_of_->ctx_->pb = nullptr;
+    }
+    pb_of_->pb_io_ = nullptr;
+    pb_of_ = nullptr;
+  }
+
+  // Opened with avio_open2(): its opaque is the protocol handle to close
+  bool opened = ctx_ && !callback_data_ && ctx_->opaque;
   CleanupCallbacks();
-  
-  // Don't automatically free anything in destructor
-  // The user must explicitly call freeContext() or closep()
-  // This prevents double-free when FormatContext cleans up
-  
-  // if (ctx_) {
-  //   #ifdef DEBUG
-  //   fprintf(stderr, "WARNING: IOContext destructor called with non-null ctx_. Call freeContext() or closep() explicitly.\n");
-  //   #endif
-  // }
-  
-  // Clear pointer without freeing
+
+  if (frees) {
+    if (opened) {
+      avio_closep(&ctx_);
+    } else {
+      // avio_context_free does not free the I/O buffer
+      av_free(ctx_->buffer);
+      avio_context_free(&ctx_);
+    }
+  }
   ctx_ = nullptr;
 }
 
@@ -729,6 +745,35 @@ Napi::Value IOContext::MarkExiting(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+bool IOContext::ProcessExiting() {
+  return g_process_exiting.load(std::memory_order_acquire);
+}
+
+int IOContext::ExitInterruptCallback(void* /*opaque*/) {
+  return ProcessExiting() ? 1 : 0;
+}
+
+bool IOContext::DetachFromFormat(Napi::Env env) {
+  FormatContext* format = pb_of_;
+  if (!format) {
+    return true;
+  }
+  // The owner thread dereferences ctx->pb in every av_read_frame()
+  if (format->reader_) {
+    Napi::Error::New(env, "IOContext is the pb of a FormatContext with an active async reader - close the input first").ThrowAsJavaScriptException();
+    return false;
+  }
+  if (!GuardAsyncOps(env, format->async_ops_, "FormatContext")) {
+    return false;
+  }
+  if (format->ctx_ && format->ctx_->pb == ctx_) {
+    format->ctx_->pb = nullptr;
+  }
+  format->pb_io_ = nullptr;
+  pb_of_ = nullptr;
+  return true;
+}
+
 bool IOContext::GuardOps(Napi::Env env) {
   if (async_ops_.Active() == 0) {
     return true;
@@ -787,7 +832,7 @@ Napi::Value IOContext::AllocContext(const Napi::CallbackInfo& info) {
 
   // Replacing the context frees ctx_->buffer + context below - wait for
   // in-flight async operations (e.g. a racing open2) first
-  if (!GuardOps(env)) {
+  if (!GuardOps(env) || !DetachFromFormat(env)) {
     return env.Undefined();
   }
 
@@ -845,7 +890,7 @@ Napi::Value IOContext::AllocContextWithCallbacks(const Napi::CallbackInfo& info)
   // Replacing the context frees ctx_->buffer + context below and releases the
   // previous callbacks - wait for in-flight async operations first (or error
   // immediately when one is parked on a callback)
-  if (!GuardOps(env)) {
+  if (!GuardOps(env) || !DetachFromFormat(env)) {
     return env.Undefined();
   }
 
@@ -938,7 +983,7 @@ Napi::Value IOContext::FreeContext(const Napi::CallbackInfo& info) {
   // Freeing while a worker still uses the context on the threadpool would be
   // a use-after-free - wait bounded (or error immediately for callback-backed
   // contexts), then error instead of crashing
-  if (!GuardOps(env)) {
+  if (!GuardOps(env) || !DetachFromFormat(env)) {
     return env.Undefined();
   }
 
@@ -1087,7 +1132,7 @@ Napi::Value IOContext::AsyncDispose(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
     // Freeing while async operations are in flight would be a use-after-free
-    if (!GuardOps(env)) {
+    if (!GuardOps(env) || !DetachFromFormat(env)) {
       return env.Undefined();
     }
 
@@ -1115,7 +1160,7 @@ Napi::Value IOContext::SyncDispose(const Napi::CallbackInfo& info) {
   if (callback_data_) {
     // Created with allocContextWithCallbacks — use freeContext logic
     // Freeing while async operations are in flight would be a use-after-free
-    if (!GuardOps(info.Env())) {
+    if (!GuardOps(info.Env()) || !DetachFromFormat(info.Env())) {
       return info.Env().Undefined();
     }
 

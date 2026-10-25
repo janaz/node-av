@@ -182,13 +182,14 @@ async function initFilters(filtersDescr: string): Promise<void> {
   // Parse the filter graph - the filter string should NOT have [in]/[out] labels
   // as those are provided by the FilterInOut structures
   let ret = filterGraph.parsePtr(filtersDescr, inputs, outputs);
+  // parsePtr works on copies of the lists, so ours are still ours to free
+  inputs.free();
+  outputs.free();
   FFmpegError.throwIfError(ret, `Cannot parse filter graph: ${new FFmpegError(ret).message}`);
 
   // Configure the graph
   ret = await filterGraph.config();
   FFmpegError.throwIfError(ret, `Cannot configure filter graph: ${new FFmpegError(ret).message}`);
-
-  // FilterInOut structures are consumed by parsePtr, no need to free them
 
   // Log output format info
   Log.log(AV_LOG_INFO, `Filter graph configured: ${filtersDescr}`);

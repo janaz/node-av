@@ -372,9 +372,9 @@ export class FilterGraph extends OptionMember<NativeFilterGraph> implements Disp
    *
    * @param filters - Filter graph description string
    *
-   * @param inputs - Linked list of graph inputs
+   * @param inputs - Linked list of graph inputs (copied; still yours to free)
    *
-   * @param outputs - Linked list of graph outputs
+   * @param outputs - Linked list of graph outputs (copied; still yours to free)
    *
    * @returns 0 on success, negative AVERROR on error:
    *   - AVERROR_EINVAL: Parse error
@@ -446,9 +446,9 @@ export class FilterGraph extends OptionMember<NativeFilterGraph> implements Disp
    *
    * @param filters - Filter graph description string
    *
-   * @param inputs - Optional linked list of inputs
+   * @param inputs - Optional linked list of inputs (copied; still yours to free)
    *
-   * @param outputs - Optional linked list of outputs
+   * @param outputs - Optional linked list of outputs (copied; still yours to free)
    *
    * @returns 0 on success, negative AVERROR on error:
    *   - AVERROR_EINVAL: Parse error

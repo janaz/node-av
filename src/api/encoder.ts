@@ -7,7 +7,9 @@ import {
   AV_CODEC_FLAG_FRAME_DURATION,
   AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX,
   AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX,
+  AV_LOG_WARNING,
   AV_NOPTS_VALUE,
+  AV_PICTURE_TYPE_I,
   AV_PICTURE_TYPE_NONE,
   AV_PIX_FMT_NONE,
   AV_PKT_FLAG_TRUSTED,
@@ -26,6 +28,7 @@ import { Codec } from '../lib/codec.js';
 import { Dictionary } from '../lib/dictionary.js';
 import { FFmpegError } from '../lib/error.js';
 import { Frame } from '../lib/frame.js';
+import { Log } from '../lib/log.js';
 import { Packet } from '../lib/packet.js';
 import { Rational } from '../lib/rational.js';
 import { SoftwareResampleContext } from '../lib/software-resample-context.js';
@@ -40,7 +43,7 @@ import { SchedulerControl } from './utilities/scheduler.js';
 import { parseBitrate } from './utils.js';
 
 import type { AVCodecFlag, AVCodecID, AVPixelFormat, AVSampleFormat, AVThreadType, EncoderOptionsFor, EOFSignal, FFEncoderCodec } from '../constants/index.js';
-import type { ChannelLayout } from '../lib/types.js';
+import type { ChannelLayout, IRational } from '../lib/types.js';
 import type { AudioFrameBufferOptions } from './audio-frame-buffer.js';
 import type { Decoder } from './decoder.js';
 import type { FilterComplexAPI } from './filter-complex.js';
@@ -89,6 +92,33 @@ function normalizeBitrate(value: BitrateValue): bigint {
 }
 
 /**
+ * Highest rate taken as a frame rate, above it a rate is a stream clock.
+ *
+ * @internal
+ */
+const MAX_FRAME_RATE = 240;
+
+/**
+ * Frame rate declared when nothing knows the rate, FFmpeg CLI's default.
+ *
+ * @internal
+ */
+const FALLBACK_FRAME_RATE = 25;
+
+/**
+ * Whether a rate is a plausible frame rate rather than a stream clock.
+ *
+ * @param rate - The rate
+ *
+ * @returns True for a positive rate up to {@link MAX_FRAME_RATE}
+ *
+ * @internal
+ */
+function isFrameRate(rate: IRational): boolean {
+  return rate.num > 0 && rate.den > 0 && rate.num / rate.den <= MAX_FRAME_RATE;
+}
+
+/**
  * Options for encoder creation.
  */
 export interface EncoderOptions<C = unknown> {
@@ -98,7 +128,7 @@ export interface EncoderOptions<C = unknown> {
    * Can be specified as number, bigint, or string with suffix (e.g., '5M', '128k').
    * Used for rate control in video and audio encoding.
    *
-   * @default 128k for audio, 1M for video
+   * @default The codec's default for audio, 1M for video
    *
    * @deprecated Use the {@link EncoderOptions.context} option instead, e.g. `context: { bitRate: '5M' }`.
    */
@@ -411,6 +441,9 @@ export class Encoder implements Disposable {
   private videoTargetFormat?: AVPixelFormat;
   private supportsParamChange?: boolean;
   private encoderChannels?: number;
+  private nextVideoPts?: bigint;
+  private droppedKeyframe = false;
+  private keyframeRequested = false;
 
   // Worker pattern for push-based processing
   private inputQueue: AsyncQueue<Frame>;
@@ -501,6 +534,9 @@ export class Encoder implements Disposable {
    * @see {@link createSync} For synchronous version
    */
   static async create<const C extends FFEncoderCodec | AVCodecID | Codec>(encoderCodec: C, options: EncoderOptions<C> = {}): Promise<Encoder> {
+    // Copied: defaults (e.g. bitrate) are filled in below
+    options = { ...options };
+
     let codec: Codec | null = null;
 
     if (encoderCodec instanceof Codec) {
@@ -532,15 +568,16 @@ export class Encoder implements Disposable {
       codecContext.maxBFrames = options.maxBFrames;
     }
 
-    // Apply common options with codec-type-specific defaults
-    if (options.bitrate === undefined) {
-      // Set codec-type-specific default bitrate
-      const isAudio = codec.type === AVMEDIA_TYPE_AUDIO;
-      options.bitrate = isAudio ? 128_000 : 1_000_000;
+    // Audio bitrate is left to the codec's default like FFmpeg CLI does: it
+    // depends on codec, channels and rate (AAC 69k per mono channel, G.726 32k),
+    // and some codecs only open at specific rates (G.723.1: 6.3k/5.3k)
+    if (options.bitrate === undefined && codec.type !== AVMEDIA_TYPE_AUDIO) {
+      options.bitrate = 1_000_000;
     }
 
-    const bitrate = typeof options.bitrate === 'string' ? parseBitrate(options.bitrate) : BigInt(options.bitrate);
-    codecContext.bitRate = bitrate;
+    if (options.bitrate !== undefined) {
+      codecContext.bitRate = typeof options.bitrate === 'string' ? parseBitrate(options.bitrate) : BigInt(options.bitrate);
+    }
 
     if (options.minRate !== undefined) {
       const minRate = typeof options.minRate === 'string' ? parseBitrate(options.minRate) : BigInt(options.minRate);
@@ -638,6 +675,9 @@ export class Encoder implements Disposable {
    * @see {@link create} For async version
    */
   static createSync<const C extends FFEncoderCodec | AVCodecID | Codec>(encoderCodec: C, options: EncoderOptions<C> = {}): Encoder {
+    // Copied: defaults (e.g. bitrate) are filled in below
+    options = { ...options };
+
     let codec: Codec | null = null;
 
     if (encoderCodec instanceof Codec) {
@@ -661,15 +701,13 @@ export class Encoder implements Disposable {
     const codecContext = new CodecContext();
     codecContext.allocContext3(codec);
 
-    // Apply common options with codec-type-specific defaults
-    if (options.bitrate === undefined) {
-      // Set codec-type-specific default bitrate
-      const isAudio = codec.type === AVMEDIA_TYPE_AUDIO;
-      options.bitrate = isAudio ? 128_000 : 1_000_000;
+    if (options.bitrate === undefined && codec.type !== AVMEDIA_TYPE_AUDIO) {
+      options.bitrate = 1_000_000;
     }
 
-    const bitrate = typeof options.bitrate === 'string' ? parseBitrate(options.bitrate) : BigInt(options.bitrate);
-    codecContext.bitRate = bitrate;
+    if (options.bitrate !== undefined) {
+      codecContext.bitRate = typeof options.bitrate === 'string' ? parseBitrate(options.bitrate) : BigInt(options.bitrate);
+    }
 
     if (options.gopSize !== undefined) {
       codecContext.gopSize = options.gopSize;
@@ -986,6 +1024,25 @@ export class Encoder implements Disposable {
   }
 
   /**
+   * Encode the next frame as a keyframe.
+   *
+   * Answers receiver feedback such as an RTCP PLI, so a receiver that lost
+   * packets resyncs on the next frame instead of waiting for the next GOP.
+   * Set the encoder's `forced-idr` option where it has one, otherwise some
+   * encoders (libx264, NVENC, QSV, AMF) emit an I frame that is not an IDR.
+   *
+   * @example
+   * ```typescript
+   * sender.onPictureLossIndication.subscribe(() => {
+   *   encoder.requestKeyframe();
+   * });
+   * ```
+   */
+  requestKeyframe(): void {
+    this.keyframeRequested = true;
+  }
+
+  /**
    * Send a frame to the encoder.
    *
    * Sends a raw frame to the encoder for encoding.
@@ -995,6 +1052,10 @@ export class Encoder implements Disposable {
    *
    * **Important**: This method only SENDS the frame to the encoder.
    * You must call {@link receive} separately (potentially multiple times) to get encoded packets.
+   *
+   * Like FFmpeg CLI, a video frame whose timestamp lands on the previous frame's
+   * in the encoder time base moves to the next tick, and one that lies entirely
+   * before it is dropped, since encoders need strictly increasing timestamps.
    *
    * Direct mapping to avcodec_send_frame().
    *
@@ -1065,8 +1126,11 @@ export class Encoder implements Disposable {
     // Convert to the codec's format first (audio resample / video pixfmt).
     const input = this.audioResampler ? this.resampleAudio(frame) : this.videoScaler ? this.scaleVideo(frame) : frame;
 
-    // Prepare frame for encoding (set quality, validate channel count)
-    this.prepareFrameForEncoding(input);
+    // Prepare frame for encoding (timestamps, quality, channel count); a video
+    // frame that falls behind the previous one is dropped
+    if (!this.prepareFrameForEncoding(input)) {
+      return;
+    }
 
     const encode = async (newFrame: Frame) => {
       const sendRet = await this.codecContext.sendFrame(newFrame);
@@ -1095,6 +1159,10 @@ export class Encoder implements Disposable {
    *
    * **Important**: This method only SENDS the frame to the encoder.
    * You must call {@link receiveSync} separately (potentially multiple times) to get encoded packets.
+   *
+   * Like FFmpeg CLI, a video frame whose timestamp lands on the previous frame's
+   * in the encoder time base moves to the next tick, and one that lies entirely
+   * before it is dropped, since encoders need strictly increasing timestamps.
    *
    * Direct mapping to avcodec_send_frame().
    *
@@ -1147,8 +1215,9 @@ export class Encoder implements Disposable {
     // Convert to the codec's format first (audio resample / video pixfmt).
     const input = this.audioResampler ? this.resampleAudio(frame) : this.videoScaler ? this.scaleVideo(frame) : frame;
 
-    // Prepare frame for encoding (set quality, validate channel count)
-    this.prepareFrameForEncoding(input);
+    if (!this.prepareFrameForEncoding(input)) {
+      return;
+    }
 
     const encode = (newFrame: Frame) => {
       const sendRet = this.codecContext.sendFrameSync(newFrame);
@@ -2053,9 +2122,6 @@ export class Encoder implements Disposable {
 
         await this.initializePromise;
 
-        // Prepare frame for encoding (set quality, validate channel count)
-        this.prepareFrameForEncoding(frame);
-
         await this.encode(frame);
 
         // Receive packets
@@ -2166,6 +2232,62 @@ export class Encoder implements Disposable {
   }
 
   /**
+   * Set the frame rate and time base of a video encoder from its first frame.
+   *
+   * Shared by both initialize variants.
+   *
+   * @param frame - First frame to encode
+   *
+   * @internal
+   */
+  private setupVideoTiming(frame: Frame): void {
+    // Get framerate from filter if available, otherwise from decoder
+    // This matches FFmpeg CLI behavior where encoder gets frame_rate_filter from FrameData
+    const filterFrameRate = this.options.filter?.frameRate;
+    if (filterFrameRate) {
+      this.codecContext.framerate = new Rational(filterFrameRate.num, filterFrameRate.den);
+    }
+
+    // If no filter framerate, try to get from decoder stream
+    if ((!this.codecContext.framerate || this.codecContext.framerate.num === 0) && this.options.decoder) {
+      const decoderCtx = this.options.decoder.getCodecContext();
+      if (decoderCtx?.framerate && decoderCtx.framerate.num > 0) {
+        this.codecContext.framerate = decoderCtx.framerate;
+      } else {
+        // The bitstream carries no rate (e.g. MJPEG, or an H.264 camera without
+        // VUI timing): guess it from the stream like FFmpeg CLI does. A stream
+        // probed too briefly to see two frames (RTPStream reads with
+        // analyzeduration 0) offers only its clock as rate (e.g. 90000/1).
+        const guessed = this.options.decoder.getGuessedFrameRate();
+        if (isFrameRate(guessed)) {
+          this.codecContext.framerate = new Rational(guessed.num, guessed.den);
+        }
+      }
+    }
+
+    // FFmpeg CLI sets encoder time_base to 1/framerate (inverse of framerate)
+    // This allows encoder to produce sequential PTS (0, 1, 2, 3...) which enables
+    // proper B-frame DTS generation (negative DTS values)
+    if (this.codecContext.framerate && this.codecContext.framerate.num > 0) {
+      // Use inverse of framerate (e.g., framerate=30/1 → timebase=1/30)
+      this.codecContext.timeBase = new Rational(this.codecContext.framerate.den, this.codecContext.framerate.num);
+      return;
+    }
+
+    // Fallback: use frame timebase if framerate not available
+    this.codecContext.timeBase = frame.timeBase;
+
+    // Without a framerate encoders read the inverse time base as one: for a
+    // 90 kHz clock x264 picks level 6.2 and VAAPI and QSV fail to encode.
+    // Declare FFmpeg CLI's default rate and keep the clock, so the timestamps
+    // stay apart whatever the real rate is.
+    if (!isFrameRate({ num: frame.timeBase.den, den: frame.timeBase.num })) {
+      Log.log(AV_LOG_WARNING, `No information about the input frame rate is available, encoding as ${FALLBACK_FRAME_RATE} fps\n`);
+      this.codecContext.framerate = new Rational(FALLBACK_FRAME_RATE, 1);
+    }
+  }
+
+  /**
    * Initialize encoder from first frame.
    *
    * Sets codec context parameters from frame properties.
@@ -2187,34 +2309,8 @@ export class Encoder implements Disposable {
       }
     }
 
-    // Get framerate from filter if available, otherwise from decoder
-    // This matches FFmpeg CLI behavior where encoder gets frame_rate_filter from FrameData
-    if (this.options.filter && frame.isVideo()) {
-      const filterFrameRate = this.options.filter.frameRate;
-      if (filterFrameRate) {
-        this.codecContext.framerate = new Rational(filterFrameRate.num, filterFrameRate.den);
-      }
-    }
-
-    // If no filter framerate, try to get from decoder stream
-    if ((!this.codecContext.framerate || this.codecContext.framerate.num === 0) && this.options.decoder && frame.isVideo()) {
-      const decoderCtx = this.options.decoder.getCodecContext();
-      if (decoderCtx?.framerate && decoderCtx.framerate.num > 0) {
-        this.codecContext.framerate = decoderCtx.framerate;
-      }
-    }
-
     if (frame.isVideo()) {
-      // FFmpeg CLI sets encoder time_base to 1/framerate (inverse of framerate)
-      // This allows encoder to produce sequential PTS (0, 1, 2, 3...) which enables
-      // proper B-frame DTS generation (negative DTS values)
-      if (this.codecContext.framerate && this.codecContext.framerate.num > 0) {
-        // Use inverse of framerate (e.g., framerate=30/1 → timebase=1/30)
-        this.codecContext.timeBase = new Rational(this.codecContext.framerate.den, this.codecContext.framerate.num);
-      } else {
-        // Fallback: use frame timebase if framerate not available
-        this.codecContext.timeBase = frame.timeBase;
-      }
+      this.setupVideoTiming(frame);
       this.codecContext.width = frame.width;
       this.codecContext.height = frame.height;
       // Pick a codec-supported pixel format (converting on demand when autoFormat).
@@ -2296,34 +2392,8 @@ export class Encoder implements Disposable {
       }
     }
 
-    // Get framerate from filter if available, otherwise from decoder
-    // This matches FFmpeg CLI behavior where encoder gets frame_rate_filter from FrameData
-    if (this.options.filter && frame.isVideo()) {
-      const filterFrameRate = this.options.filter.frameRate;
-      if (filterFrameRate) {
-        this.codecContext.framerate = new Rational(filterFrameRate.num, filterFrameRate.den);
-      }
-    }
-
-    // If no filter framerate, try to get from decoder stream
-    if ((!this.codecContext.framerate || this.codecContext.framerate.num === 0) && this.options.decoder && frame.isVideo()) {
-      const decoderCtx = this.options.decoder.getCodecContext();
-      if (decoderCtx?.framerate && decoderCtx.framerate.num > 0) {
-        this.codecContext.framerate = decoderCtx.framerate;
-      }
-    }
-
     if (frame.isVideo()) {
-      // FFmpeg CLI sets encoder time_base to 1/framerate (inverse of framerate)
-      // This allows encoder to produce sequential PTS (0, 1, 2, 3...) which enables
-      // proper B-frame DTS generation (negative DTS values)
-      if (this.codecContext.framerate && this.codecContext.framerate.num > 0) {
-        // Use inverse of framerate (e.g., framerate=30/1 → timebase=1/30)
-        this.codecContext.timeBase = new Rational(this.codecContext.framerate.den, this.codecContext.framerate.num);
-      } else {
-        // Fallback: use frame timebase if framerate not available
-        this.codecContext.timeBase = frame.timeBase;
-      }
+      this.setupVideoTiming(frame);
       this.codecContext.width = frame.width;
       this.codecContext.height = frame.height;
       // Pick a codec-supported pixel format (converting on demand when autoFormat).
@@ -2739,23 +2809,30 @@ export class Encoder implements Disposable {
    * Prepare frame for encoding.
    *
    * Implements FFmpeg's frame_encode() pre-encoding logic:
-   * 1. Video: Sets frame.quality from encoder's globalQuality (like -qscale)
-   * 2. Audio: Validates channel count consistency for encoders without PARAM_CHANGE capability
+   * 1. Video: Keeps timestamps strictly increasing like the CLI's VFR sync
+   * 2. Video: Sets frame.quality from encoder's globalQuality (like -qscale)
+   * 3. Audio: Validates channel count consistency for encoders without PARAM_CHANGE capability
    *
    * This matches FFmpeg CLI behavior where these properties are automatically managed.
    *
    * @param frame - Frame to prepare for encoding
    *
+   * @returns False if the frame must be dropped
+   *
    * @throws {Error} If audio channel count changed and encoder doesn't support parameter changes
    *
    * @internal
    */
-  private prepareFrameForEncoding(frame: Frame): void {
+  private prepareFrameForEncoding(frame: Frame): boolean {
     // Clear pict_type - encoder will determine frame types based on its own settings.
     // Input stream's frame type hints are irrelevant when re-encoding. Opt out with
     // { preserveFramePictType: true } to force keyframes via frame.pictType = I.
     if (!this.options.preserveFramePictType) {
       frame.pictType = AV_PICTURE_TYPE_NONE;
+    }
+    if (this.keyframeRequested) {
+      this.keyframeRequested = false;
+      frame.pictType = AV_PICTURE_TYPE_I;
     }
 
     // Adjust frame PTS and timebase to encoder timebase
@@ -2808,6 +2885,28 @@ export class Encoder implements Disposable {
 
     const codecType = this.codecContext.codecType;
     if (codecType === AVMEDIA_TYPE_VIDEO) {
+      // Encoders need strictly increasing pts, but frames arriving in a burst can
+      // round onto the same tick of the encoder time base (e.g. 1/25). Like FFmpeg
+      // CLI's VFR sync (video_sync_process): a frame that still reaches the next
+      // free tick moves there, one that ends before it is dropped.
+      if (frame.pts !== AV_NOPTS_VALUE) {
+        const nextPts = this.nextVideoPts;
+        if (nextPts !== undefined && frame.pts < nextPts) {
+          if (frame.pts + frameDuration < nextPts) {
+            // A requested keyframe goes to the next frame instead, as in the CLI
+            this.droppedKeyframe ||= frame.pictType === AV_PICTURE_TYPE_I;
+            return false;
+          }
+          frame.pts = nextPts;
+        }
+        this.nextVideoPts = frame.pts + 1n;
+      }
+
+      if (this.droppedKeyframe) {
+        frame.pictType = AV_PICTURE_TYPE_I;
+        this.droppedKeyframe = false;
+      }
+
       // Video: Set frame quality from encoder's global quality
       // Only set if encoder has globalQuality configured and frame doesn't already have quality set
       const globalQuality = this.codecContext.globalQuality;
@@ -2832,6 +2931,8 @@ export class Encoder implements Disposable {
         }
       }
     }
+
+    return true;
   }
 
   /**

@@ -1,6 +1,8 @@
 import {
   AV_CODEC_FLAG_QSCALE,
   AV_HWDEVICE_TYPE_CUDA,
+  AV_HWDEVICE_TYPE_D3D11VA,
+  AV_HWDEVICE_TYPE_D3D12VA,
   AV_HWDEVICE_TYPE_OPENCL,
   AV_HWDEVICE_TYPE_QSV,
   AV_HWDEVICE_TYPE_VAAPI,
@@ -21,7 +23,7 @@ import { EncoderPool, Mutex } from './encoder-pool.js';
 import { FilterPreset } from './filter-presets.js';
 import { FilterAPI } from './filter.js';
 
-import type { AVPixelFormat, SwsFlags } from '../constants/index.js';
+import type { AVHWDeviceType, AVPixelFormat, SwsFlags } from '../constants/index.js';
 import type { NativeScaler } from '../lib/native-types.js';
 import type { HardwareContext } from './hardware.js';
 
@@ -116,6 +118,13 @@ const FORMAT_TO_PIXFMT: Record<ScaledImageFormat, AVPixelFormat> = {
   nv12: AV_PIX_FMT_NV12,
   yuv420p: AV_PIX_FMT_YUV420P,
 };
+
+/**
+ * Devices whose GPU scaler ignores the crop metadata (scale_d3d11, scale_d3d12).
+ *
+ * @internal
+ */
+const CROP_BLIND_DEVICES: readonly AVHWDeviceType[] = [AV_HWDEVICE_TYPE_D3D11VA, AV_HWDEVICE_TYPE_D3D12VA];
 
 /**
  * Last crop applied to a cached GPU graph, so identical crops skip a reconfigure.
@@ -273,9 +282,9 @@ export class Scaler implements Disposable {
 
     if (frame.isHwFrame()) {
       // With a hardware context, crop/scale/convert on the GPU and download only
-      // the small result. Without one, fall back to downloading the full frame
-      // and processing it in software.
-      if (this.hardware) {
+      // the small result. Without one, or where the GPU cannot do it, fall back to
+      // downloading the full frame and processing it in software.
+      if (!this.needsDownload(frame, options.crop)) {
         const out = await this.toFrame(frame, options.crop, options.resize, options.format ?? 'nv12');
         try {
           return out.toBuffer(options.output);
@@ -325,7 +334,7 @@ export class Scaler implements Disposable {
     }
 
     if (frame.isHwFrame()) {
-      if (this.hardware) {
+      if (!this.needsDownload(frame, options.crop)) {
         const out = this.toFrameSync(frame, options.crop, options.resize, options.format ?? 'nv12');
         try {
           return out.toBuffer(options.output);
@@ -373,7 +382,7 @@ export class Scaler implements Disposable {
     }
 
     const quality = options.quality ?? 90;
-    const downloaded = frame.isHwFrame() && !this.hardware ? await this.downloadToSoftware(frame) : null;
+    const downloaded = this.needsDownload(frame, options.crop) ? await this.downloadToSoftware(frame) : null;
     try {
       // mjpeg wants planar YUV; tag it full-range so colors are correct without the
       // deprecated yuvj* formats.
@@ -414,7 +423,7 @@ export class Scaler implements Disposable {
     }
 
     const quality = options.quality ?? 90;
-    const downloaded = frame.isHwFrame() && !this.hardware ? this.downloadToSoftwareSync(frame) : null;
+    const downloaded = this.needsDownload(frame, options.crop) ? this.downloadToSoftwareSync(frame) : null;
     try {
       const out = this.toFrameSync(downloaded ?? frame, options.crop, options.resize, 'yuv420p');
       try {
@@ -456,7 +465,7 @@ export class Scaler implements Disposable {
     }
 
     const format = options.format ?? 'rgb';
-    const downloaded = frame.isHwFrame() && !this.hardware ? await this.downloadToSoftware(frame) : null;
+    const downloaded = this.needsDownload(frame, options.crop) ? await this.downloadToSoftware(frame) : null;
     try {
       const out = await this.toFrame(downloaded ?? frame, options.crop, options.resize, format);
       try {
@@ -494,7 +503,7 @@ export class Scaler implements Disposable {
     }
 
     const format = options.format ?? 'rgb';
-    const downloaded = frame.isHwFrame() && !this.hardware ? this.downloadToSoftwareSync(frame) : null;
+    const downloaded = this.needsDownload(frame, options.crop) ? this.downloadToSoftwareSync(frame) : null;
     try {
       const out = this.toFrameSync(downloaded ?? frame, options.crop, options.resize, format);
       try {
@@ -542,7 +551,33 @@ export class Scaler implements Disposable {
   }
 
   /**
-   * Download a hardware frame to system memory (no hardware context available).
+   * Whether a frame has to be downloaded before it is cropped and scaled.
+   *
+   * Without a hardware context, or on a device without a GPU scaler, hardware
+   * frames are processed in software. The D3D11VA and D3D12VA scalers run on
+   * the GPU but ignore the crop, so only uncropped frames stay there.
+   *
+   * @param frame - Source frame
+   *
+   * @param crop - Requested crop region
+   *
+   * @returns True for a hardware frame the GPU graph cannot handle
+   *
+   * @internal
+   */
+  private needsDownload(frame: Frame, crop?: ScalerCrop): boolean {
+    if (!frame.isHwFrame()) {
+      return false;
+    }
+    if (!this.hardware || !FilterPreset.chain(this.hardware).supports('scale')) {
+      return true;
+    }
+    const cropped = crop !== undefined && (crop.x !== 0 || crop.y !== 0 || crop.width !== frame.width || crop.height !== frame.height);
+    return cropped && CROP_BLIND_DEVICES.includes(this.hardware.deviceType);
+  }
+
+  /**
+   * Download a hardware frame to system memory for the software path.
    *
    * Allocates a fresh target per call - concurrent downloads must not share a
    * staging frame. The frame's own hwframe context selects a supported software

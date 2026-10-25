@@ -382,6 +382,11 @@ Napi::Value FormatContext::OpenOutputAsync(const Napi::CallbackInfo& info) {
     return env.Null();
   }
 
+  // The worker replaces ctx->pb; one set from an IOContext stays with it
+  if (!(ctx->oformat->flags & AVFMT_NOFILE)) {
+    ReleasePbIO(false);
+  }
+
   FormatContext* self = this;
   return PromiseWorker::Run(env, &async_ops_, {info.This().As<Napi::Object>()}, [self]() {
     // Serializes FFmpeg calls on this context and pins it against close/free
@@ -394,7 +399,9 @@ Napi::Value FormatContext::OpenOutputAsync(const Napi::CallbackInfo& info) {
 
     // Check if we need to open the file (not NOFILE format)
     if (!(ctx->oformat->flags & AVFMT_NOFILE)) {
-      return avio_open(&ctx->pb, ctx->url, AVIO_FLAG_WRITE);
+      // With the context's interrupt callback, as the ffmpeg CLI does: lets
+      // interrupt() and process exit abort a blocking network output
+      return avio_open2(&ctx->pb, ctx->url, AVIO_FLAG_WRITE, &ctx->interrupt_callback, nullptr);
     }
     return 0;
   });
@@ -415,8 +422,18 @@ Napi::Value FormatContext::CloseOutputAsync(const Napi::CallbackInfo& info) {
 
   // avio_closep() frees the AVIOContext that in-flight writes may still be
   // using on the threadpool - wait for them first (use-after-free guard)
-  if (!GuardAsyncOps(env, async_ops_, "FormatContext")) {
+  if (!GuardAsyncOps(env, async_ops_, "FormatContext") || !GuardPbIO(env)) {
     return env.Undefined();
+  }
+
+  // Custom IO stays with its IOContext, as in closeOutputSync(); a pb from
+  // open2() is closed here and its IOContext emptied
+  bool closes = ClosesPb();
+  ReleasePbIO(closes);
+  if (!closes) {
+    auto deferred = Napi::Promise::Deferred::New(env);
+    deferred.Resolve(env.Undefined());
+    return deferred.Promise();
   }
 
   FormatContext* self = this;
@@ -429,9 +446,7 @@ Napi::Value FormatContext::CloseOutputAsync(const Napi::CallbackInfo& info) {
         }
         AVFormatContext* ctx = self->ctx_;
         if (ctx && ctx->pb) {
-          if (!ctx->oformat || !(ctx->oformat->flags & AVFMT_NOFILE)) {
-            avio_closep(&ctx->pb);
-          }
+          avio_closep(&ctx->pb);
         }
         return 0;
       },
@@ -460,9 +475,14 @@ Napi::Value FormatContext::CloseInputAsync(const Napi::CallbackInfo& info) {
 
   // Wait for remaining in-flight async operations (read/seek/write/...) so
   // the close below cannot free the context under a threadpool op
-  if (!GuardAsyncOps(env, async_ops_, "FormatContext")) {
+  if (!GuardAsyncOps(env, async_ops_, "FormatContext") || !GuardPbIO(env)) {
     return env.Undefined();
   }
+
+  // Here, not in the worker: the wrappers are read on this thread, so after
+  // this no JS access can reach the context the worker frees
+  borrowers_->InvalidateAll();
+  ReleasePbIO(!detachPb && ClosesPb());
 
   FormatContext* self = this;
   return PromiseWorker::Run(
@@ -552,9 +572,13 @@ Napi::Value FormatContext::DisposeAsync(const Napi::CallbackInfo& info) {
 
     // The worker below frees the context - wait for in-flight async
     // operations that may still use it (use-after-free guard)
-    if (!GuardAsyncOps(env, async_ops_, "FormatContext")) {
+    if (!GuardAsyncOps(env, async_ops_, "FormatContext") || !GuardPbIO(env)) {
       return env.Undefined();
     }
+
+    // On this thread, before the worker frees the context (see CloseInputAsync)
+    borrowers_->InvalidateAll();
+    ReleasePbIO(ClosesPb());
 
     FormatContext* self = this;
     return PromiseWorker::Run(

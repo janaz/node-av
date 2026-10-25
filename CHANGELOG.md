@@ -4,10 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [6.2.0-beta.26] - 2026-10-06
+## [6.2.0-beta.35] - 2026-10-25
+
+### Performance
+
+- **`Muxer` writes packets with less overhead.** The timestamp fixup reads each timestamp once and per-stream state once per stream instead of from native code on every access; remuxing is 7–14 % faster with identical output.
+- **Rational getters are about 2.5× faster** (`Frame.timeBase`, `Stream.timeBase`, `CodecContext.framerate`, …): the `{ num, den }` object is created in JS instead of natively.
+- **`Scaler` writes scaled output directly into the result buffer** when the packed layout allows it, skipping the staging copy.
+- **`FilterAPI.create()` accepts a function that builds the description from a frame.** It runs for the first frame and again whenever the graph is rebuilt for frames with other properties, so the graph can follow what the frames turn out to be, e.g. hardware frames, or software frames after a decoder fell back. When the graph fails to configure, the function is asked once more with the error and can return another description, e.g. one without the device filter the driver refused.
+
 
 ### Added
 
+- **`Encoder.requestKeyframe()`** encodes the next frame as a keyframe, e.g. to answer an RTCP PLI. With `forced-idr` set it is an IDR.
 - **`AV_PKT_DATA_RTP_TIMESTAMP` packet side data.** The bundled FFmpeg's RTP demuxer attaches each packet's raw 32-bit RTP timestamp (little-endian `uint32`), so packets can be correlated by the sender's clock instead of the rebased `pts`. Read it with `packet.getSideData(AV_PKT_DATA_RTP_TIMESTAMP)`.
 - **`RTPStream`, `WebRTCStream` and `FMP4Stream` accept a frame source.** Besides a URL or `Demuxer`, `create()` takes `{ video?, audio? }` as `AsyncIterable<Frame | null>` (`MediaFrameSource`) and encodes the frames directly, e.g. a composited `FilterComplexAPI` output. See `examples/api-webrtc-pip.ts` and `examples/api-fmp4-pip.ts`.
 - **`WebRTCStream` handles the peer lifecycle.** It answers RTCP PLI with a keyframe (new `RTPStream.requestVideoKeyframe()`), starts streaming after `setOffer()` (`start()` stays valid and idempotent) and stops with `onClose` when the peer disconnects (ICE consent, RFC 7675).
@@ -19,12 +28,12 @@ All notable changes to this project will be documented in this file.
 - **`maxPacketAge` on `FMP4Stream`** (seconds, `0` = off). A packet held in the muxer longer than this, measured in real time, ends the session, so broken or missing timestamps can no longer pile up packets without output until memory runs out.
 - **`audioFrameBuffer` option on `Encoder`** (`AudioFrameBufferOptions`, also accepted by `AudioFrameBuffer.create()`). `maxGapFill` (seconds, default 1) is the largest input gap filled with silence; `timestamps: 'samples'` counts the output from 0 as before. Real-time RTP outputs should use `maxGapFill: 0`, as `RTPStream` does.
 - **`output` option on `Scaler.toBuffer()`/`toBufferSync()` and `Frame.toBuffer()`.** The result is written into the caller's `Buffer` instead of a new one; the returned buffer is a view of its first bytes.
-
-### Performance
-
-- **`Muxer` writes packets with less overhead.** The timestamp fixup reads each timestamp once and per-stream state once per stream instead of from native code on every access; remuxing is 7–14 % faster with identical output.
-- **Rational getters are about 2.5× faster** (`Frame.timeBase`, `Stream.timeBase`, `CodecContext.framerate`, …): the `{ num, den }` object is created in JS instead of natively.
-- **`Scaler` writes scaled output directly into the result buffer** when the packed layout allows it, skipping the staging copy.
+- **`FMP4Stream` transcodes audio to Opus when the client lists Opus but not AAC.** Unsupported input audio is encoded with libopus at 48 kHz in 20 ms frames, mono input stays mono, and `getCodecString()` reports `opus`. With AAC in `supportedCodecs` the target stays AAC as before.
+- **`Decoder.decodeErrors`** counts the packets and frames that failed to decode, like the ffmpeg CLI's decode error count; useful with `exitOnError: false`, where these errors are skipped.
+- **`FilterPreset.supports(operation)`** tells whether a chain's hardware has a filter for an operation (e.g. `scale` on D3D11VA or MediaCodec), since the builder methods skip unsupported ones and leave the chain unchanged.
+- **`hardwareFallback` on `Decoder`.** A hardware decoder that produces nothing (no frame within 16 packets plus its thread count after the first keyframe, or two keyframes in a row without output later) is replaced by a software decoder, and the packets since the last silent keyframe are decoded again, so no picture is lost. `RTPStream` and `FMP4Stream` turn it on.
+- **`OutputFormat.getCodecTag()`/`getCodecId()`** look up a format's codec tag table (`av_codec_get_tag2`, `av_codec_get_id`), and **`avGuessFrameRate(stream)`** wraps `av_guess_frame_rate`.
+- **`video.transcode` on `RTPStream` and `FMP4Stream`.** The video is encoded again even when its codec is one of `supportedVideoCodecs` (`supportedCodecs` for `FMP4Stream`), so `width`, `height`, `fps` and `bitrate` apply to a stream that would otherwise pass through.
 
 ### Changed
 
@@ -50,6 +59,16 @@ All notable changes to this project will be documented in this file.
 - **`FMP4Stream` drops buffered output when a session fails.** No `onData` follows the error and no trailer is written, so a failed session no longer ends with a fragment placed after a timestamp jump. `stop()` and a clean end still emit everything.
 - **Exceptions thrown by `onClose` in `FMP4Stream` and `RTPStream` are logged with `console.error`** instead of propagating, and `onClose` fires exactly once per session (a throwing callback used to fire it twice and cause an unhandled rejection).
 - **Encoded audio keeps the input timing.** Fixed-frame-size encoders (AAC, Opus, MP3, …) and `autoResample` re-stamped their output from 0 by sample count, so audio that started late or had gaps drifted against the video. Frames now carry their first input sample's timestamp; gaps up to 1 s are filled with silence, overlaps up to 1 s are dropped and larger jumps restart the timeline (`audioFrameBuffer: { timestamps: 'samples' }` restores the old behavior).
+- **Decoders with `exitOnError: false` pass corrupt frames on** with their `decodeErrorFlags`/`AV_FRAME_FLAG_CORRUPT` set instead of dropping them, as the ffmpeg CLI does; with `exitOnError: true` they still throw.
+- **Audio encoders use the codec's default bitrate** when none is set, as the ffmpeg CLI does, instead of a fixed 128 kbit/s: G.726 encodes the standard 32 kbit/s instead of 40, G.723.1 opens at all, AAC gets 69 kbit/s per mono channel and Opus 64 (mono) or 96 kbit/s (stereo). Video keeps the 1 Mbit/s default.
+- **`FMP4Stream` encodes video without B-frames**, like `RTPStream` and libx264 with `zerolatency`. Hardware encoders default to B-frames, which delay every fragment, and `h264_d3d12va` failed with them on a driver that reports support for them (GTX 1080).
+- **`RTPStream` and `FMP4Stream` start decoding live video sooner.** Frame threading held back one frame per thread (up to 16) before the first output, ~0.6 s at 25 fps. Hardware decoding now uses slice threading and software decoding at most 4 frame threads; `FMP4Stream` keeps the full thread count for file inputs.
+- **`RTPStream` derives the video bitrate from the picture when none is given.** A transcode without `video.bitrate` encoded at the encoder's 1 Mbps default, which blocks up at camera resolutions. The target now follows size and frame rate (0.1 bit per pixel for H.264, 0.06 for HEVC) and is capped like an explicit bitrate.
+- **`RTPStream` never scales the video up.** A `video.width` or `video.height` larger than the source keeps the source size, since a bigger picture only raises the bitrate.
+- **`RTPStream` sends a keyframe every 2 seconds when it transcodes a URL or `Demuxer` input.** Frame sources and `FMP4Stream` already did. Before, the encoder default applied, 120 frames for VAAPI and 250 for libx264 and NVENC, so a receiver that lost a packet showed a still picture for up to 8 s at 15 fps.
+- **`RTPStream.requestVideoKeyframe()` also works when a URL or `Demuxer` input is transcoded.** It only applied to frame sources, so a receiver that lost packets waited for the next scheduled keyframe. A passed-through stream keeps the source's keyframes.
+- **`FMP4Stream` never scales the video up**, like `RTPStream`. A `video.width` or `video.height` larger than the source keeps the source size.
+- **`FMP4Stream` tests a hardware encoder with the size it will encode**, like `RTPStream`, so a GPU that cannot encode that size falls back to software before the stream starts.
 
 ### Fixed
 
@@ -94,6 +113,34 @@ All notable changes to this project will be documented in this file.
 - **Ending a process or worker no longer aborts or hangs** while a `Demuxer` is still reading or a callback-backed `IOContext` is still allocated.
 - **Closing a `Demuxer` no longer hangs on a stalled custom-IO source** (`Readable` or `IOInputCallbacks`). Closing or interrupting fails the pending read, seek or probe with `AVERROR_EXIT`, and the context does not call its callbacks again; `closeSync()` no longer throws on an active reader.
 - **`FormatContext.closeInputSync(true)` no longer crashes while `openInput()` is still running.**
+- **`process.exit()` no longer waits for stalled network I/O.** An open, read or write blocked on a peer that stopped answering (e.g. a `Demuxer.open()` reconnect in flight) held the exit until its socket timeout; it now aborts with `AVERROR_EXIT` once the process exits. Outputs opened with `FormatContext.openOutput()` now also honor `interrupt()`.
+- **Streams no longer read freed memory after their input or output is closed.** A `Stream`, its `codecpar` and `parser`, and a `BitStreamFilterContext`'s `inputCodecParameters`/`outputCodecParameters` pointed into memory the owning context frees; reading them afterwards (e.g. `stream.index` in a callback still running after `Demuxer.close()`) could crash the process on Windows. They now read their defaults (`index` -1) and ignore writes once the owner is closed or freed.
+- **Filter contexts no longer use freed memory once their graph is freed.** A `FilterContext` (from `createFilter()`, `getFilter()`, `filters` or `FilterInOut.filterCtx`) and a `FilterGraphSegment` point into their `FilterGraph`; using them after `graph.free()`, or after the graph was garbage-collected while only the buffer source and sink were kept, crashed the process. They now read their defaults (`name` null), sync frame operations throw and async ones resolve `AVERROR_EINVAL`. `graph.free()` also waits for buffersrc/buffersink operations still running on its contexts.
+- **`FilterGraph.parsePtr()` passes whole input/output lists.** It handed FFmpeg only the first entry of each list, so a second labeled input or output stayed unconnected, and leaked the lists. `parse()` and `parsePtr()` now pass copies; the `FilterInOut` lists stay valid and are freed with `free()` (or by GC) as usual.
+- **`FilterGraphSegment.apply()` no longer leaks the pad lists it returns**, which cost every `FilterAPI` and `FilterComplexAPI` initialization a few hundred bytes. `free()` on them now releases them.
+- **`FilterInOut` nodes no longer use freed memory once the head of their list is freed.** Nodes reached through `next` and lists appended to another read their defaults (`name` null) and ignore writes afterwards.
+- **An `IOContext` opened with `open2()` and set as an output's `pb` is closed exactly once.** Both the `IOContext` and the `FormatContext` closed it, so `closep()` followed by `freeContext()` (the order of FFmpeg's `transcode.c`, and of `examples/transcode.ts`) or the reverse freed it twice and crashed the process. Whichever closes it first now clears the other's copy: `closep()` also clears the context's `pb`, as `avio_closep(&ctx->pb)` does in C. An `IOContext` can be the `pb` of only one `FormatContext` at a time; assigning it to a second one throws.
+- **`closeOutput()` leaves a callback-backed `pb` to its `IOContext`**, as `closeOutputSync()` already did. It closed it with `avio_closep()`, which treats the callback opaque as a protocol handle.
+- **A `Demuxer` opened from a `Readable` and dropped without `close()` no longer leaks its I/O context.** The demuxer itself was garbage collected, but the `IOContext` reading the stream stayed reachable through its own read callback, together with the stream and its buffered data ([#372](https://github.com/seydx/node-av/issues/372)).
+- **An `IOContext` that is never freed or closed is released once it is garbage collected.** Its finalizer freed nothing, so its I/O buffer leaked, and an `open2()` context also kept its file or connection open with unwritten data. It now frees it as `freeContext()` does, or closes it (flushing first) as `closep()` does, unless the output whose `pb` it is closes it or threadpool work still uses it.
+- **Stream copy into another container resets foreign codec tags** like the ffmpeg CLI. Remuxing MP4 into Matroska kept tags such as `mp4a`, which the Matroska muxer rejects; tags the target format knows for the codec (e.g. `hvc1` in MP4/MOV) are kept.
+- **Encoders created from a decoder without a frame rate guess it from the stream** (`av_guess_frame_rate`, e.g. VP9 in WebM). They used the stream time base (often 1/90000) instead, so libx264 picked level 6.2 and the rate control was off.
+- **Encoders keep video timestamps strictly increasing**, like the ffmpeg CLI's VFR sync. Frames that rounded onto the same tick of the encoder time base (e.g. a burst from a source timed by wallclock, at 1/25) reached the encoder with duplicate pts (x264: "non-strictly-monotonic PTS"); such a frame now moves to the next tick, or is dropped if it ends before it, and a keyframe requested on a dropped frame goes to the next one.
+- **`FMP4Stream` and `RTPStream` scale on hardware without a scaler.** On D3D11VA or MediaCodec the scale filter was skipped and the source size kept; D3D11VA and D3D12VA now scale on the GPU, devices without a scaler on the CPU after the frames leave the GPU.
+- **`FilterPreset` scales on D3D11VA and D3D12VA** with `scale_d3d11` and `scale_d3d12`; `scaleFormat()` emitted `scale_d3d11va`, which does not exist.
+- **`Scaler` handles hardware frames on D3D11VA, D3D12VA and devices without a GPU scaler.** Every call failed there ("Filter not found"); D3D11VA and D3D12VA now scale on the GPU, and since their scalers ignore the crop, cropped calls download the frame and crop in software, as devices without a scaler (DXVA2, MediaCodec, DRM, VDPAU) now always do.
+- **`Decoder.create()`/`Encoder.create()` (and the `Sync` variants) no longer modify the options object passed in**, so one object can be reused, e.g. a shared `hardware` option for an audio and a video decoder.
+- **`Muxer` encoders created lazily keep the input stream's metadata, disposition, side data and duration** when the input `Demuxer` is closed before the first packet; they were read from the closed stream and came out empty.
+- **`RTPStream` and `FMP4Stream` transcode on the GPU where they used to fail.** The filters between decoder and encoder are chosen from the decoded frames: they stay on the GPU and are converted to NV12 there when the encoder needs it (VAAPI decodes JPEG into surfaces `h264_vaapi` cannot encode, 10-bit sources arrive as P010), software frames are converted and uploaded for the hardware encoder (MJPEG on VideoToolbox and D3D11VA, 4:2:2 JPEG that NVDEC hands back in software), and scaling runs on the GPU where it can.
+- **`RTPStream` and `FMP4Stream` fall back to software when the GPU cannot encode.** A hardware encoder has to encode a test frame first (once per process; a failed one is tried again after a minute), so an NVENC whose driver is older than the bundled API, or a GPU without an encoder, encodes with libx264 instead of ending the stream, while decoding and scaling stay on the GPU. A hardware decoder that fails to open or produces no frames decodes in software, and device filters that fail to configure are replaced by a conversion in software. Devices without an encoder of their own (D3D11VA, DXVA2, OpenCL, VDPAU, DRM) try NVENC, QSV and AMF in turn.
+- **Transcoded video is 8-bit 4:2:0 in software too.** A 4:2:2 JPEG camera or a 10-bit source was encoded as High 4:2:2 or High 10, which browsers and HomeKit cannot decode.
+- **`FMP4Stream` with `video.fps` gives the encoder that frame rate** instead of the source's.
+- **Encoders no longer take a stream clock for the frame rate.** After a short probe (`RTPStream` opens RTSP with `analyzeduration 0`), `av_guess_frame_rate` returns the inverse time base for MJPEG, 90000 fps: `h264_vaapi` failed with an internal encoding error, `h264_qsv` with "Function not implemented" and libx264 picked level 6.2. Guesses above 240 fps are ignored, and frames on such a clock with no known rate are encoded as 25 fps, as the ffmpeg CLI does.
+- **`RTPStream.requestVideoKeyframe()` works for frame sources.** The encoder cleared the requested picture type, and only libx264 was told to make it an IDR; NVENC, QSV and AMF get their forced-IDR option now.
+- **`HardwareContext.testEncoder()` and `getEncoderCodec(…, true)` accept VAAPI, Vulkan and D3D12 encoders.** The test downloaded the frames to the CPU, and encoders that take only device frames rejected them.
+- **`HardwareContext.testDecoder()` tests HEVC, AV1 and VP9 in common profiles.** The bundled test bitstreams were HEVC Main Intra, AV1 High 4:4:4 and VP9 Profile 1, which most GPUs cannot decode, so these codecs were reported as unsupported on GPUs that decode them (VAAPI, QSV and Vulkan on Intel, VideoToolbox).
+- **`FMP4Stream` encodes at the set bitrate.** `video.bitrate` only capped the encoder's 1 Mbps default target, so a transcode came out at about 1 Mbps whatever was set. The bitrate is now target and cap, and without one the target follows size and frame rate as in `RTPStream`.
+- **`FMP4Stream.getVideoInfo()` reports the size the video is encoded at.** With only `video.width` set it gave the source height.
 
 ## [6.1.1] - 2026-07-06
 

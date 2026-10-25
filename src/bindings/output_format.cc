@@ -16,6 +16,9 @@ Napi::Object OutputFormat::Init(Napi::Env env, Napi::Object exports) {
     InstanceAccessor<&OutputFormat::GetVideoCodec>("videoCodec"),
     InstanceAccessor<&OutputFormat::GetSubtitleCodec>("subtitleCodec"),
     InstanceAccessor<&OutputFormat::GetFlags>("flags"),
+
+    InstanceMethod<&OutputFormat::GetCodecTag>("getCodecTag"),
+    InstanceMethod<&OutputFormat::GetCodecId>("getCodecId"),
   });
   
   constructor = Napi::Persistent(func);
@@ -137,6 +140,36 @@ Napi::Value OutputFormat::GetFlags(const Napi::CallbackInfo& info) {
     return Napi::Number::New(env, 0);
   }
   return Napi::Number::New(env, format_->flags);
+}
+
+Napi::Value OutputFormat::GetCodecTag(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (info.Length() < 1 || !info[0].IsNumber()) {
+    Napi::TypeError::New(env, "codecId (number) required").ThrowAsJavaScriptException();
+    return env.Null();
+  }
+  if (!format_) {
+    return env.Null();
+  }
+  unsigned int tag = 0;
+  const AVCodecID id = static_cast<AVCodecID>(info[0].As<Napi::Number>().Int32Value());
+  if (!av_codec_get_tag2(format_->codec_tag, id, &tag)) {
+    return env.Null();
+  }
+  return Napi::Number::New(env, tag);
+}
+
+Napi::Value OutputFormat::GetCodecId(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (info.Length() < 1 || !info[0].IsNumber()) {
+    Napi::TypeError::New(env, "tag (number) required").ThrowAsJavaScriptException();
+    return env.Null();
+  }
+  if (!format_) {
+    return Napi::Number::New(env, AV_CODEC_ID_NONE);
+  }
+  const unsigned int tag = info[0].As<Napi::Number>().Uint32Value();
+  return Napi::Number::New(env, av_codec_get_id(format_->codec_tag, tag));
 }
 
 } // namespace ffmpeg

@@ -146,6 +146,31 @@ export class FilterPreset {
   }
 
   /**
+   * Checks if an operation is available for this chain's hardware.
+   *
+   * Operations the hardware has no filter for (e.g. scaling on MediaCodec) are
+   * skipped when added, so check first where skipping would be wrong and fall
+   * back to software, e.g. by scaling in the decoder.
+   *
+   * @param operation - Operation to check
+   *
+   * @returns True if the operation is applied; always true without hardware
+   *
+   * @example
+   * ```typescript
+   * const chain = FilterPreset.chain(hw);
+   * if (chain.supports('scale')) {
+   *   chain.scale(1280, 720);
+   * } else {
+   *   // e.g. Decoder.create(stream, { hardware: hw, rescale: { width: 1280, height: 720 } })
+   * }
+   * ```
+   */
+  supports(operation: keyof FilterSupport): boolean {
+    return this.support[operation];
+  }
+
+  /**
    * Adds a custom filter string to the chain.
    *
    * @param filter - Custom filter string
@@ -240,7 +265,7 @@ export class FilterPreset {
    *
    * @param options - Additional scaling options (e.g., flags for algorithm)
    *
-   * @returns This instance for chaining
+   * @returns This instance for chaining (unchanged if the hardware has no scaler, see {@link supports})
    *
    * @example
    * ```typescript
@@ -276,6 +301,16 @@ export class FilterPreset {
       } else if (this.hardware.deviceType === AV_HWDEVICE_TYPE_QSV) {
         filterName = 'vpp_qsv'; // QSV uses vpp_qsv for scaling with w= and h= parameters
         filter = `${filterName}=w=${width}:h=${height}`;
+      } else if (this.hardware.deviceType === AV_HWDEVICE_TYPE_D3D11VA) {
+        // scale_d3d11 fails without an output format and takes no -1/-2 sizes
+        filterName = 'scale_d3d11';
+        filter = `${filterName}=${width}:${height}`;
+        if (options?.format === undefined) {
+          filter += ':format=nv12';
+        }
+      } else if (this.hardware.deviceType === AV_HWDEVICE_TYPE_D3D12VA) {
+        filterName = 'scale_d3d12';
+        filter = `${filterName}=${width}:${height}`;
       } else {
         filterName = `scale_${this.hardware.deviceTypeName}`;
         filter = `${filterName}=${width}:${height}`;
@@ -301,6 +336,8 @@ export class FilterPreset {
   /**
    * Adds a GPU format conversion filter without scaling.
    * Only available for hardware contexts. Uses hardware-specific scale filter with format parameter.
+   * Skipped without hardware; on hardware without a scaler (see {@link supports}) the
+   * graph fails to build.
    *
    * @param format - Target pixel format (e.g., 'nv12', 'p010')
    *
@@ -345,6 +382,10 @@ export class FilterPreset {
       filterName = 'scale_vt';
     } else if (this.hardware.deviceType === AV_HWDEVICE_TYPE_QSV) {
       filterName = 'vpp_qsv';
+    } else if (this.hardware.deviceType === AV_HWDEVICE_TYPE_D3D11VA) {
+      filterName = 'scale_d3d11';
+    } else if (this.hardware.deviceType === AV_HWDEVICE_TYPE_D3D12VA) {
+      filterName = 'scale_d3d12';
     } else {
       filterName = `scale_${this.hardware.deviceTypeName}`;
     }
@@ -1436,11 +1477,28 @@ export class FilterPreset {
           stack: false,
         };
 
+      case AV_HWDEVICE_TYPE_D3D11VA: // Windows video processor
+      case AV_HWDEVICE_TYPE_D3D12VA:
+        return {
+          scale: true, // scale_d3d11 / scale_d3d12
+          overlay: false,
+          transpose: false,
+          tonemap: false,
+          deinterlace: false,
+          denoise: false,
+          flip: false,
+          blur: false,
+          sharpen: false,
+          sobel: false,
+          chromakey: false,
+          colorspace: false,
+          pad: false,
+          stack: false,
+        };
+
       // These hardware types don't have dedicated filters - they're mainly for decode/encode
       case AV_HWDEVICE_TYPE_VDPAU: // Decode-only, deprecated in favor of VAAPI
       case AV_HWDEVICE_TYPE_DXVA2: // Windows decode-only
-      case AV_HWDEVICE_TYPE_D3D11VA: // Windows decode-only
-      case AV_HWDEVICE_TYPE_D3D12VA: // Has HEVC encoder but no filters
       case AV_HWDEVICE_TYPE_DRM: // Linux DRM buffer sharing, not processing
         return {
           scale: false,

@@ -305,6 +305,35 @@ export function avGetMimeTypeDash(codecpar: NativeWrapper<NativeCodecParameters>
 }
 
 /**
+ * Guess the frame rate of a stream.
+ *
+ * Picks between the stream's real base frame rate, its average frame rate and
+ * the codec frame rate the way FFmpeg CLI does to configure filters and
+ * encoders. A stream whose format context was freed returns 0/1.
+ *
+ * Direct mapping to av_guess_frame_rate().
+ *
+ * @param stream - Stream to guess the frame rate of
+ *
+ * @returns Guessed frame rate, or 0/1 if unknown
+ *
+ * @example
+ * ```typescript
+ * import { avGuessFrameRate } from 'node-av/lib';
+ *
+ * const fr = avGuessFrameRate(input.video());
+ * if (fr.num > 0) {
+ *   console.log(`${fr.num / fr.den} fps`);
+ * }
+ * ```
+ *
+ * @see [av_guess_frame_rate](https://ffmpeg.org/doxygen/trunk/group__lavf__misc.html) - FFmpeg Doxygen
+ */
+export function avGuessFrameRate(stream: NativeWrapper<NativeStream>): IRational {
+  return bindings.avGuessFrameRate(stream.getNative());
+}
+
+/**
  * Get pixel format name.
  *
  * Returns the name of the pixel format as a string.

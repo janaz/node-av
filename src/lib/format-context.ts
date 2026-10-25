@@ -270,7 +270,9 @@ export class FormatContext extends OptionMember<NativeFormatContext> implements 
    *
    * For custom I/O operations instead of file I/O.
    * Assigning a callback-backed context also sets AVFMT_FLAG_CUSTOM_IO so libavformat never closes it.
-   * A context opened with open2() keeps its protocol handle and must be released with closep().
+   * A context opened with open2() is closed once, by whichever comes first: its closep(), which
+   * also clears this pb like `avio_closep(&ctx->pb)` in C, or closing or freeing this output context.
+   * An IOContext can be the pb of one FormatContext at a time.
    *
    * Direct mapping to AVFormatContext->pb.
    */
@@ -279,8 +281,8 @@ export class FormatContext extends OptionMember<NativeFormatContext> implements 
   }
 
   set pb(value: IOContext | null) {
-    this._ioContext = value;
     this.native.pb = value?.getNative() ?? null;
+    this._ioContext = value;
   }
 
   /**

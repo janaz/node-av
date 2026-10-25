@@ -540,16 +540,6 @@ NodeAV fully supports Electron applications. The prebuilt binaries are ABI-compa
 
 NodeAV also supports Electron's [offscreen rendering with shared textures](https://www.electronjs.org/docs/latest/tutorial/offscreen-rendering), enabling zero-copy GPU texture import for hardware-accelerated encoding. See the [Electron Builder](https://github.com/seydx/node-av/tree/main/examples/electron/builder) and [Electron Forge](https://github.com/seydx/node-av/tree/main/examples/electron/forge) examples for complete implementations.
 
-If you encounter module resolution errors like `Cannot find module 'lib/binary-stream'`, add this override to your project's `package.json`:
-
-```json
-{
-  "overrides": {
-    "@shinyoshiaki/binary-data": "npm:@seydx/binary-data@0.6.2"
-  }
-}
-```
-
 ## Examples
 
 The repository ships 60+ runnable examples covering both API levels — high-level (`api-*`: transcoding, hardware acceleration, RTSP, fMP4/DASH, RTP, Whisper, device capture, …) and low-level ports of the official FFmpeg C examples.
