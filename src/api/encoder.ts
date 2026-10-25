@@ -443,6 +443,7 @@ export class Encoder implements Disposable {
   private encoderChannels?: number;
   private nextVideoPts?: bigint;
   private droppedKeyframe = false;
+  private keyframeRequested = false;
 
   // Worker pattern for push-based processing
   private inputQueue: AsyncQueue<Frame>;
@@ -1020,6 +1021,25 @@ export class Encoder implements Disposable {
    */
   isReady(): boolean {
     return this.initialized && !this.isClosed;
+  }
+
+  /**
+   * Encode the next frame as a keyframe.
+   *
+   * Answers receiver feedback such as an RTCP PLI, so a receiver that lost
+   * packets resyncs on the next frame instead of waiting for the next GOP.
+   * Set the encoder's `forced-idr` option where it has one, otherwise some
+   * encoders (libx264, NVENC, QSV, AMF) emit an I frame that is not an IDR.
+   *
+   * @example
+   * ```typescript
+   * sender.onPictureLossIndication.subscribe(() => {
+   *   encoder.requestKeyframe();
+   * });
+   * ```
+   */
+  requestKeyframe(): void {
+    this.keyframeRequested = true;
   }
 
   /**
@@ -2809,6 +2829,10 @@ export class Encoder implements Disposable {
     // { preserveFramePictType: true } to force keyframes via frame.pictType = I.
     if (!this.options.preserveFramePictType) {
       frame.pictType = AV_PICTURE_TYPE_NONE;
+    }
+    if (this.keyframeRequested) {
+      this.keyframeRequested = false;
+      frame.pictType = AV_PICTURE_TYPE_I;
     }
 
     // Adjust frame PTS and timebase to encoder timebase

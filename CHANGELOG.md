@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`Encoder.requestKeyframe()`** encodes the next frame as a keyframe, e.g. to answer an RTCP PLI. With `forced-idr` set it is an IDR.
 - **`AV_PKT_DATA_RTP_TIMESTAMP` packet side data.** The bundled FFmpeg's RTP demuxer attaches each packet's raw 32-bit RTP timestamp (little-endian `uint32`), so packets can be correlated by the sender's clock instead of the rebased `pts`. Read it with `packet.getSideData(AV_PKT_DATA_RTP_TIMESTAMP)`.
 - **`RTPStream`, `WebRTCStream` and `FMP4Stream` accept a frame source.** Besides a URL or `Demuxer`, `create()` takes `{ video?, audio? }` as `AsyncIterable<Frame | null>` (`MediaFrameSource`) and encodes the frames directly, e.g. a composited `FilterComplexAPI` output. See `examples/api-webrtc-pip.ts` and `examples/api-fmp4-pip.ts`.
 - **`WebRTCStream` handles the peer lifecycle.** It answers RTCP PLI with a keyframe (new `RTPStream.requestVideoKeyframe()`), starts streaming after `setOffer()` (`start()` stays valid and idempotent) and stops with `onClose` when the peer disconnects (ICE consent, RFC 7675).
@@ -61,6 +62,9 @@ All notable changes to this project will be documented in this file.
 - **`FMP4Stream` encodes video without B-frames**, like `RTPStream` and libx264 with `zerolatency`. Hardware encoders default to B-frames, which delay every fragment, and `h264_d3d12va` failed with them on a driver that reports support for them (GTX 1080).
 - **`RTPStream` and `FMP4Stream` start decoding live video sooner.** Frame threading held back one frame per thread (up to 16) before the first output, ~0.6 s at 25 fps. Hardware decoding now uses slice threading and software decoding at most 4 frame threads; `FMP4Stream` keeps the full thread count for file inputs.
 - **`RTPStream` derives the video bitrate from the picture when none is given.** A transcode without `video.bitrate` encoded at the encoder's 1 Mbps default, which blocks up at camera resolutions. The target now follows size and frame rate (0.1 bit per pixel for H.264, 0.06 for HEVC) and is capped like an explicit bitrate.
+- **`RTPStream` never scales the video up.** A `video.width` or `video.height` larger than the source keeps the source size, since a bigger picture only raises the bitrate.
+- **`RTPStream` sends a keyframe every 2 seconds when it transcodes a URL or `Demuxer` input.** Frame sources and `FMP4Stream` already did. Before, the encoder default applied, 120 frames for VAAPI and 250 for libx264 and NVENC, so a receiver that lost a packet showed a still picture for up to 8 s at 15 fps.
+- **`RTPStream.requestVideoKeyframe()` also works when a URL or `Demuxer` input is transcoded.** It only applied to frame sources, so a receiver that lost packets waited for the next scheduled keyframe. A passed-through stream keeps the source's keyframes.
 
 ### Fixed
 

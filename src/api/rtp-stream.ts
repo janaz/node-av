@@ -1,6 +1,6 @@
 import { isRtcp, RtpPacket } from 'werift';
 
-import { AV_CODEC_ID_HEVC, AV_HWDEVICE_TYPE_NONE, AV_PICTURE_TYPE_I, AV_SAMPLE_FMT_FLTP } from '../constants/constants.js';
+import { AV_CODEC_ID_HEVC, AV_HWDEVICE_TYPE_NONE, AV_SAMPLE_FMT_FLTP } from '../constants/constants.js';
 import { FF_ENCODER_LIBOPUS, FF_ENCODER_LIBX264, FF_ENCODER_LIBX265 } from '../constants/encoders.js';
 import { Codec } from '../lib/codec.js';
 import { Rational } from '../lib/rational.js';
@@ -22,7 +22,6 @@ import { createVideoTranscodeFilter, findSoftwareEncoder, findUsableHardwareEnco
 
 import type { AVCodecID, AVHWDeviceType, AVSampleFormat, FFAudioEncoder, FFHWDeviceType, FFVideoEncoder } from '../constants/index.js';
 import type { CodecContext } from '../lib/codec-context.js';
-import type { Frame } from '../lib/frame.js';
 import type { DemuxerOptions } from './demuxer.js';
 import type { EncoderOptions } from './encoder.js';
 import type { PipelineControl, PipelineProgress } from './pipeline.js';
@@ -223,7 +222,6 @@ export class RTPStream {
   private signal?: AbortSignal;
   private supportedVideoCodecs: Set<AVCodecID | FFVideoEncoder>;
   private supportedAudioCodecs: Set<AVCodecID | FFAudioEncoder>;
-  private videoKeyframeRequested = false;
   private abortHandler?: () => void;
   private stopRequested = false;
   private stopPromise?: Promise<void>;
@@ -385,9 +383,9 @@ export class RTPStream {
    *
    * Used to answer receiver feedback (e.g. a WebRTC PLI) so a receiver that
    * missed the stream start or lost packets can resync without waiting for the
-   * next scheduled GOP keyframe. Currently effective for frame-source inputs
-   * ({@link MediaFrameSource}); for demuxer inputs the encoder's regular GOP
-   * cadence applies.
+   * next scheduled GOP keyframe. Effective whenever the video is encoded, from
+   * frame sources and from a transcoded URL or {@link Demuxer} input; a stream
+   * passed through keeps the source's keyframes.
    *
    * @example
    * ```typescript
@@ -397,32 +395,7 @@ export class RTPStream {
    * ```
    */
   requestVideoKeyframe(): void {
-    this.videoKeyframeRequested = true;
-  }
-
-  /**
-   * Pass video frames through, forcing a keyframe when one was requested.
-   *
-   * Sets `pictType = I` on the next frame after {@link requestVideoKeyframe};
-   * combined with the encoder's `forced-idr` option this produces an IDR the
-   * receiver can resync on.
-   *
-   * @param src - The user-provided video frame source
-   *
-   * @yields {Frame | null} The unchanged frames (with pictType forced when requested)
-   *
-   * @internal
-   */
-  private async *wrapVideoSource(src: AsyncIterable<Frame | null>): AsyncGenerator<Frame | null> {
-    // Pull through the interruptible wrapper: a frame source has no demuxer for
-    // stop() to interrupt, so without it a silent source blocks teardown.
-    for await (const frame of interruptibleFrameSource(src, this.stopSignal.promise)) {
-      if (frame && this.videoKeyframeRequested) {
-        this.videoKeyframeRequested = false;
-        frame.pictType = AV_PICTURE_TYPE_I;
-      }
-      yield frame;
-    }
+    this.videoEncoder?.requestKeyframe();
   }
 
   /**
@@ -535,9 +508,11 @@ export class RTPStream {
         throw new Error('No supported video codec specified for transcoding');
       }
 
-      const width = this.options.video.width ?? -1;
-      const height = this.options.video.height ?? -1;
       const { codecpar } = videoStream;
+      // a picture larger than the source only costs bitrate
+      const upscales = codecpar.width > 0 && ((this.options.video.width ?? 0) > codecpar.width || (this.options.video.height ?? 0) > codecpar.height);
+      const width = upscales ? -1 : (this.options.video.width ?? -1);
+      const height = upscales ? -1 : (this.options.video.height ?? -1);
       // a GPU encodes up to a size of its own, test it with the size it will get
       const outputSize = codecpar.width > 0 && codecpar.height > 0 ? resolveScaleSize(codecpar.width, codecpar.height, width, height) : undefined;
       const encoderCodec = await this.findVideoEncoder(targetCodecId, outputSize);
@@ -562,17 +537,7 @@ export class RTPStream {
         hardware: this.hardwareContext,
       });
 
-      let encoderOptions: EncoderOptions['options'] = {};
-      if (encoderCodec.name === FF_ENCODER_LIBX264 || encoderCodec.name === FF_ENCODER_LIBX265) {
-        encoderOptions.preset = 'ultrafast';
-        encoderOptions.tune = 'zerolatency';
-      }
-
-      encoderOptions = {
-        ...encoderOptions,
-        ...this.options.video.encoderOptions,
-      };
-
+      const encoderOptions = liveVideoEncoderOptions(encoderCodec.name, this.options.video.encoderOptions);
       const bitrate = this.options.video.bitrate;
 
       this.videoEncoder = await Encoder.create(encoderCodec, {
@@ -581,6 +546,10 @@ export class RTPStream {
         maxBFrames: 0,
         options: encoderOptions,
         configure: (ctx) => {
+          // encoder defaults are 120 (VAAPI) or 250 frames (libx264, NVENC), a receiver that lost a packet waits that long;
+          // after the short probe the input rate is often unknown, the context has it from the frames
+          const fps = ctx.framerate.num > 0 ? ctx.framerate.num / ctx.framerate.den : 30;
+          ctx.gopSize = Math.max(1, Math.round(fps * 2));
           this.applyBitrate(ctx, bitrate);
         },
       });
@@ -825,19 +794,7 @@ export class RTPStream {
       }
       this.throwIfStopRequested();
 
-      let encoderOptions: EncoderOptions['options'] = {};
-      if (encoderCodec.name === FF_ENCODER_LIBX264 || encoderCodec.name === FF_ENCODER_LIBX265) {
-        encoderOptions.preset = 'ultrafast';
-        encoderOptions.tune = 'zerolatency';
-      }
-      // Make a requested keyframe (frame.pictType = I) an actual IDR, so a
-      // receiver that missed the stream start can resync (PLI handling).
-      // VAAPI, D3D12 and VideoToolbox do so without an option
-      const forcedIdr = forcedIdrOption(encoderCodec.name);
-      if (forcedIdr) {
-        encoderOptions[forcedIdr] = true;
-      }
-      encoderOptions = { ...encoderOptions, ...this.options.video.encoderOptions };
+      const encoderOptions = liveVideoEncoderOptions(encoderCodec.name, this.options.video.encoderOptions);
 
       let fps = this.options.video.fps ?? 20;
       if (!isFinite(fps) || fps <= 0 || isNaN(fps)) {
@@ -854,8 +811,6 @@ export class RTPStream {
       const bitrate = this.options.video.bitrate;
       this.videoEncoder = await Encoder.create(encoderCodec, {
         maxBFrames: 0,
-        // the encoder would clear the pictType a keyframe request sets
-        preserveFramePictType: true,
         options: encoderOptions,
         configure: (ctx) => {
           ctx.framerate = new Rational(Math.round(fps), 1);
@@ -869,7 +824,9 @@ export class RTPStream {
 
       this.videoOutput = await this.createVideoOutput();
       this.throwIfStopRequested();
-      controls.push(pipeline(this.wrapVideoSource(source.video), this.videoFilter, this.videoEncoder, this.videoOutput, opts));
+      // a frame source has no demuxer for stop() to interrupt, a silent one would block teardown
+      const video = interruptibleFrameSource(source.video, this.stopSignal.promise);
+      controls.push(pipeline(video, this.videoFilter, this.videoEncoder, this.videoOutput, opts));
     }
 
     // Audio
@@ -1381,6 +1338,32 @@ function defaultVideoBitrate(ctx: CodecContext): number {
   const rate = ctx.framerate.num > 0 ? ctx.framerate : new Rational(ctx.timeBase.den, ctx.timeBase.num);
   const bitsPerPixel = ctx.codecId === AV_CODEC_ID_HEVC ? 0.06 : 0.1;
   return ctx.width * ctx.height * (rate.num / rate.den) * bitsPerPixel;
+}
+
+/**
+ * Encoder options for live video: low-latency presets for x264/x265 and an IDR
+ * for every requested keyframe, so a receiver that lost packets can resync.
+ *
+ * @param name - The encoder's name
+ *
+ * @param overrides - Caller options, applied last
+ *
+ * @returns The encoder options
+ *
+ * @internal
+ */
+function liveVideoEncoderOptions(name: string | null, overrides: EncoderOptions['options']): EncoderOptions['options'] {
+  const options: EncoderOptions['options'] = {};
+  if (name === FF_ENCODER_LIBX264 || name === FF_ENCODER_LIBX265) {
+    options.preset = 'ultrafast';
+    options.tune = 'zerolatency';
+  }
+  // VAAPI, D3D12 and VideoToolbox make a forced I frame an IDR without an option
+  const forcedIdr = forcedIdrOption(name);
+  if (forcedIdr) {
+    options[forcedIdr] = true;
+  }
+  return { ...options, ...overrides };
 }
 
 /**

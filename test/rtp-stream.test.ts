@@ -243,6 +243,55 @@ describe('RTPStream', skipWerift, () => {
         await stream.stop();
       }
     });
+
+    it('sets a keyframe every 2 seconds', async () => {
+      const { RTPStream } = await import('../src/webrtc/index.js');
+
+      let sawPacket!: () => void;
+      const firstPacket = new Promise<void>((resolve) => (sawPacket = resolve));
+
+      const stream = RTPStream.create(getInputFile('hevc-short.mp4'), {
+        supportedVideoCodecs: [FF_ENCODER_LIBX264],
+        onVideoPacket: () => sawPacket(),
+      });
+
+      await stream.start();
+      try {
+        await withTimeout(firstPacket, 15000);
+
+        const encoder = (stream as unknown as { videoEncoder?: unknown }).videoEncoder;
+        const ctx = (encoder as { codecContext: { gopSize: number; framerate: { num: number; den: number } } }).codecContext;
+        assert.equal(ctx.gopSize, Math.round((ctx.framerate.num / ctx.framerate.den) * 2));
+      } finally {
+        await stream.stop();
+      }
+    });
+
+    it('keeps the source size instead of scaling up', async () => {
+      const { RTPStream } = await import('../src/webrtc/index.js');
+
+      let sawPacket!: () => void;
+      const firstPacket = new Promise<void>((resolve) => (sawPacket = resolve));
+
+      const stream = RTPStream.create(getInputFile('hevc-short.mp4'), {
+        supportedVideoCodecs: [FF_ENCODER_LIBX264],
+        video: { width: 7680 },
+        onVideoPacket: () => sawPacket(),
+      });
+
+      await stream.start();
+      try {
+        await withTimeout(firstPacket, 15000);
+
+        const source = stream.getInput()!.video()!.codecpar;
+        const encoder = (stream as unknown as { videoEncoder?: unknown }).videoEncoder;
+        const ctx = (encoder as { codecContext: { width: number; height: number } }).codecContext;
+        assert.equal(ctx.width, source.width);
+        assert.equal(ctx.height, source.height);
+      } finally {
+        await stream.stop();
+      }
+    });
   });
 
   describe('abort handling', () => {
@@ -388,6 +437,31 @@ describe('RTPStream', skipWerift, () => {
       await closed.promise;
       await stream.stop();
       assert.equal(idrs, 2, 'the first frame and the requested one');
+    });
+
+    it('should encode a requested keyframe for a transcoded input', skipWerift, async () => {
+      const { RTPStream } = await import('../src/webrtc/index.js');
+      // x264 splits each frame into slices, count the frames by timestamp
+      const idrs = new Set<number>();
+      let frames = 0;
+      let timestamp: number | undefined;
+      const closed = Promise.withResolvers<void>();
+      // 60 frames at 15 fps, the 2 s GOP adds a keyframe at frame 30
+      const stream = RTPStream.create(getInputFile('hevc-short.mp4'), {
+        supportedVideoCodecs: [FF_ENCODER_LIBX264],
+        onVideoPacket: (rtp: RtpPacket) => {
+          if (rtp.header.timestamp !== timestamp) {
+            timestamp = rtp.header.timestamp;
+            if (++frames === 10) stream.requestVideoKeyframe();
+          }
+          if (startsIdr(rtp.payload)) idrs.add(rtp.header.timestamp);
+        },
+        onClose: (error) => (error ? closed.reject(error) : closed.resolve()),
+      });
+      await stream.start();
+      await withTimeout(closed.promise, 15000);
+      await stream.stop();
+      assert.equal(idrs.size, 3, 'the first frame, the requested one and the GOP keyframe');
     });
   });
 
