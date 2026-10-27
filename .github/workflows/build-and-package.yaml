@@ -126,13 +126,13 @@ jobs:
               --disable-libvpl --disable-ffnvcodec --disable-cuda-llvm \
               --disable-hwaccels \
               --enable-zlib --enable-iconv \
-              --enable-libdav1d --enable-libwebp \
+              --enable-libdav1d --enable-libwebp --enable-libsvtav1 \
               --disable-encoders \
-              --enable-encoder=gif,apng,libwebp,libwebp_anim,png,rawvideo,wrapped_avframe \
+              --enable-encoder=gif,apng,libwebp,libwebp_anim,png,rawvideo,wrapped_avframe,libsvtav1 \
               --disable-decoders \
               --enable-decoder=h264,hevc,vp9,av1,libdav1d,png,apng,gif,webp,rawvideo,wrapped_avframe \
               --disable-muxers \
-              --enable-muxer=gif,apng,webp,image2,mov,mp4,matroska,webm,rawvideo,null \
+              --enable-muxer=gif,apng,webp,image2,mov,mp4,matroska,webm,rawvideo,null,avif \
               --disable-demuxers \
               --enable-demuxer=mov,matroska,image2,gif,apng,concat,rawvideo \
               --disable-parsers \
@@ -156,7 +156,7 @@ jobs:
           echo "=== Contents of $FFBUILD_PREFIX/lib/ (dependency libs): ==="
           ls -la $FFBUILD_PREFIX/lib/lib{webp,webpmux,sharpyuv,dav1d,z,iconv}* 2>/dev/null || echo "Some libs not found"
 
-          for lib in libwebp.a libwebpmux.a libsharpyuv.a libdav1d.a libz.a libiconv.a; do
+          for lib in libwebp.a libwebpmux.a libsharpyuv.a libdav1d.a libSvtAv1Enc.a libz.a libiconv.a; do
               if [ -f "$FFBUILD_PREFIX/lib/$lib" ]; then
                   cp "$FFBUILD_PREFIX/lib/$lib" /ffbuild/prefix/lib/
                   echo "Copied $lib to output prefix"

@@ -159,6 +159,7 @@
                             "/opt/ffbuild/prefix/lib/libswresample.a",
                             "/opt/ffbuild/prefix/lib/libavutil.a",
                             "/opt/ffbuild/prefix/lib/libdav1d.a",
+                            "/opt/ffbuild/prefix/lib/libSvtAv1Enc.a",
                             "/opt/ffbuild/prefix/lib/libwebp.a",
                             "/opt/ffbuild/prefix/lib/libwebpmux.a",
                             "/opt/ffbuild/prefix/lib/libsharpyuv.a",
