@@ -1,0 +1,1302 @@
+name: "🏗️ Build Prebuilds"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CACHE_VERSION_WINDOWS: "v18"
+  CACHE_VERSION_LINUX: "v33"
+  CACHE_VERSION_MACOS: "v17"
+  FFMPEG_MSVC_PREBUILT_TAG: "autobuild-2026-11-13-17-13"
+  XCODE_VERSION: "26.5"
+  # Bump to rebuild the native addon although none of its inputs changed (see addon_key)
+  CACHE_VERSION_ADDON: "v1"
+  # JELLYFIN_FFMPEG_HASH: "5cd65f8388fbcd2f87088d3b10fe53fc5ea81ed5"
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload_caches:
+        description: "Upload FFmpeg caches as artifacts for debugging"
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    secrets:
+      NPM_TOKEN:
+        required: false
+        description: "NPM token for publishing packages"
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "test/**"
+      - "scripts/**"
+      - "externals/jellyfin-ffmpeg"
+      - ".github/workflows/build-prebuilds.yaml"
+      - "binding.gyp"
+      - "binding-jellyfin.gyp"
+      - "binding-msvc.gyp"
+      - "package.json"
+  pull_request:
+    paths:
+      - "src/**"
+      - "test/**"
+      - "scripts/**"
+      - "externals/jellyfin-ffmpeg"
+      - ".github/workflows/build-prebuilds.yaml"
+      - "binding.gyp"
+      - "binding-jellyfin.gyp"
+      - "binding-msvc.gyp"
+      - "package.json"
+
+jobs:
+  check_gyp:
+    name: "Check gyp consistency"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Check gyp files are in sync
+        run: node scripts/check-gyp-sync.js
+
+  # MinGW builds are discontinued (MSVC only). The job is kept commented
+  # out so it can be revived without archaeology.
+  #   build_windows_mingw:
+  #     name: "Windows MinGW ${{ matrix.os.arch }}"
+  #     runs-on: ${{ matrix.os.runner }}
+  #     strategy:
+  #       fail-fast: false
+  #       matrix:
+  #         os:
+  #           - name: CLANG64
+  #             arch: x64
+  #             runner: windows-2022
+  #             msystem: CLANG64
+  #             toolchain: mingw-w64-clang-x86_64-toolchain
+  #             nasm: mingw-w64-clang-x86_64-nasm
+  #             build_script: ./msys2/build.sh
+  #           - name: CLANGARM64
+  #             arch: arm64
+  #             runner: windows-11-arm
+  #             msystem: CLANGARM64
+  #             toolchain: mingw-w64-clang-aarch64-toolchain
+  #             nasm: mingw-w64-clang-aarch64-nasm
+  #             build_script: ./msys2/buildarm64.sh
+  #     defaults:
+  #       run:
+  #         shell: msys2 {0}
+  #     steps:
+  #       - uses: msys2/setup-msys2@v2
+  #         with:
+  #           update: true
+  #           msystem: ${{ matrix.os.msystem }}
+  #           install: >-
+  #             git
+  #             curl
+  #             wget
+  #             zip
+  #             ${{ matrix.os.toolchain }}
+  #             quilt
+  #             diffstat
+  #             ${{ matrix.os.nasm }}
+  #             mingw-w64-${{ matrix.os.msystem == 'CLANG64' && 'clang-x86_64' || 'clang-aarch64' }}-python
+  #             mingw-w64-${{ matrix.os.msystem == 'CLANG64' && 'clang-x86_64' || 'clang-aarch64' }}-nodejs
+  #             mingw-w64-${{ matrix.os.msystem == 'CLANG64' && 'clang-x86_64' || 'clang-aarch64' }}-gcc
+
+  #       - uses: actions/checkout@v7
+  #         with:
+  #           submodules: true
+
+  #       - uses: actions/setup-node@v7
+  #         with:
+  #           node-version: "24"
+
+  #       - name: Read FFmpeg version
+  #         id: ffmpeg-version
+  #         shell: bash
+  #         run: |
+  #           FFMPEG_VERSION=$(cat externals/jellyfin-ffmpeg/FFMPEG_VERSION)
+  #           echo "version=$FFMPEG_VERSION" >> $GITHUB_OUTPUT
+  #           echo "FFmpeg version: $FFMPEG_VERSION"
+
+  #       - name: Get Jellyfin FFmpeg commit hash
+  #         id: ffmpeg-hash
+  #         shell: bash
+  #         run: |
+  #           if [ -n "${{ env.JELLYFIN_FFMPEG_HASH }}" ]; then
+  #             echo "hash=${{ env.JELLYFIN_FFMPEG_HASH }}" >> $GITHUB_OUTPUT
+  #           else
+  #             echo "hash=$(git -C externals/jellyfin-ffmpeg rev-parse HEAD)" >> $GITHUB_OUTPUT
+  #           fi
+
+  #       - name: Prepare directories
+  #         run: |
+  #           mkdir -p /${{ matrix.os.msystem == 'CLANG64' && 'clang64' || 'clangarm64' }}/ffbuild/lib/pkgconfig
+  #           mkdir -p /${{ matrix.os.msystem == 'CLANG64' && 'clang64' || 'clangarm64' }}/ffbuild/include
+  #           mkdir -p /${{ matrix.os.msystem == 'CLANG64' && 'clang64' || 'clangarm64' }}/ffbuild/bin
+
+  #       - name: Restore FFmpeg cache
+  #         id: cache-ffmpeg
+  #         uses: actions/cache@v6
+  #         with:
+  #           path: |
+  #             C:\ffmpeg-cache-${{ matrix.os.arch }}
+  #             externals/jellyfin-ffmpeg/config*.h
+  #           key: ffmpeg-windows-${{ matrix.os.arch }}-${{ env.CACHE_VERSION_WINDOWS }}-${{ steps.ffmpeg-hash.outputs.hash }}
+
+  #       - name: Copy cache to MSYS2 location
+  #         if: steps.cache-ffmpeg.outputs.cache-hit == 'true'
+  #         shell: msys2 {0}
+  #         run: |
+  #           CACHE_DIR="C:/ffmpeg-cache-${{ matrix.os.arch }}"
+  #           MSYS_PREFIX="/${{ matrix.os.msystem == 'CLANG64' && 'clang64' || 'clangarm64' }}/ffbuild"
+
+  #           if [ -d "${CACHE_DIR}" ]; then
+  #             echo "Restoring FFmpeg cache from ${CACHE_DIR} to ${MSYS_PREFIX}"
+  #             rm -rf "${MSYS_PREFIX}" 2>/dev/null || true
+  #             mkdir -p "${MSYS_PREFIX}"
+  #             cp -r "${CACHE_DIR}"/* "${MSYS_PREFIX}/"
+  #             echo "Cache restored successfully"
+  #           else
+  #             echo "Cache directory ${CACHE_DIR} not found!"
+  #             exit 1
+  #           fi
+
+  #       - name: Build FFmpeg
+  #         id: build-ffmpeg
+  #         if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+  #         shell: msys2 {0}
+  #         run: |
+  #           # Clear out MSYS2 ffbuild to avoid conflicts
+  #           rm -rf /${{ matrix.os.msystem == 'CLANG64' && 'clang64' || 'clangarm64' }}/ffbuild
+  #           mkdir -p /${{ matrix.os.msystem == 'CLANG64' && 'clang64' || 'clangarm64' }}/ffbuild/lib/pkgconfig
+  #           mkdir -p /${{ matrix.os.msystem == 'CLANG64' && 'clang64' || 'clangarm64' }}/ffbuild/include
+  #           mkdir -p /${{ matrix.os.msystem == 'CLANG64' && 'clang64' || 'clangarm64' }}/ffbuild/bin
+
+  #           # Harden source downloads. The stock DLAGENTS pass --retry, but curl only
+  #           # retries transient HTTP/timeout failures - a TLS handshake abort (curl 35),
+  #           # which upstream hosts like downloads.xiph.org throw regularly, aborts the
+  #           # whole build on the first try. --retry-all-errors covers those too.
+  #           cat >> /etc/makepkg.conf <<'MAKEPKG_DLAGENTS'
+
+  #           DLAGENTS=('file::/usr/bin/curl -qgC - -o %o %u'
+  #                     'ftp::/usr/bin/curl -qgfC - --ftp-pasv --connect-timeout 30 --retry 5 --retry-delay 5 --retry-all-errors -o %o %u'
+  #                     'http::/usr/bin/curl -qgb "" -fLC - --connect-timeout 30 --retry 5 --retry-delay 5 --retry-all-errors -o %o %u'
+  #                     'https::/usr/bin/curl -qgb "" -fLC - --connect-timeout 30 --retry 5 --retry-delay 5 --retry-all-errors -o %o %u'
+  #                     'rsync::/usr/bin/rsync --no-motd -z %u %o'
+  #                     'scp::/usr/bin/scp -C %u %o')
+  #           MAKEPKG_DLAGENTS
+
+  #           cd externals/jellyfin-ffmpeg/msys2
+
+  #           # Run Jellyfin build script
+  #           if [ "${{ matrix.os.arch }}" = "arm64" ]; then
+  #             ./buildarm64.sh
+  #           else
+  #             ./build.sh
+  #           fi
+
+  #           PREFIX="/${{ matrix.os.msystem == 'CLANG64' && 'clang64' || 'clangarm64' }}/ffbuild"
+
+  #           # Install FFmpeg libraries
+  #           cd ..
+  #           make install
+
+  #           # Copy FFmpeg libraries to main lib directory
+  #           if [ -d "${PREFIX}/jellyfin-ffmpeg/lib" ]; then
+  #             cp ${PREFIX}/jellyfin-ffmpeg/lib/*.a ${PREFIX}/lib/ 2>/dev/null || true
+  #             cp -r ${PREFIX}/jellyfin-ffmpeg/include/* ${PREFIX}/include/ 2>/dev/null || true
+
+  #             if [ -d "${PREFIX}/jellyfin-ffmpeg/lib/pkgconfig" ]; then
+  #               mkdir -p ${PREFIX}/lib/pkgconfig
+  #               cp ${PREFIX}/jellyfin-ffmpeg/lib/pkgconfig/*.pc ${PREFIX}/lib/pkgconfig/ 2>/dev/null || true
+  #             fi
+  #           fi
+
+  #           echo "Verifying config files from FFmpeg build..."
+  #           if [ ! -f config.h ]; then
+  #             echo "Error: config.h not found in FFmpeg build directory!"
+  #             exit 1
+  #           fi
+
+  #           if [ ! -f config_components.h ]; then
+  #             echo "Error: config_components.h not found in FFmpeg build directory!"
+  #             exit 1
+  #           fi
+
+  #           # List all config files for debugging
+  #           ls -la config*.h || true
+  #           echo "✓ Config files verified in externals/jellyfin-ffmpeg/"
+
+  #       - name: Copy FFmpeg build to cache-friendly location
+  #         if: steps.cache-ffmpeg.outputs.cache-hit != 'true' && steps.build-ffmpeg.outcome == 'success'
+  #         shell: msys2 {0}
+  #         run: |
+  #           MSYS_PREFIX="/${{ matrix.os.msystem == 'CLANG64' && 'clang64' || 'clangarm64' }}/ffbuild"
+  #           CACHE_DIR="C:/ffmpeg-cache-${{ matrix.os.arch }}"
+
+  #           if [ -d "${MSYS_PREFIX}" ]; then
+  #             echo "Copying FFmpeg build to cache location"
+  #             rm -rf "${CACHE_DIR}" 2>/dev/null || true
+  #             mkdir -p "${CACHE_DIR}"
+  #             cp -r "${MSYS_PREFIX}"/* "${CACHE_DIR}/"
+  #             echo "FFmpeg build cached successfully"
+  #           else
+  #             echo "FFmpeg build directory does not exist!"
+  #             exit 1
+  #           fi
+  #       - name: Save FFmpeg cache
+  #         if: steps.cache-ffmpeg.outputs.cache-hit != 'true' && steps.build-ffmpeg.outcome == 'success'
+  #         uses: actions/cache/save@v6
+  #         with:
+  #           path: |
+  #             C:\ffmpeg-cache-${{ matrix.os.arch }}
+  #             externals/jellyfin-ffmpeg/config*.h
+  #           key: ffmpeg-windows-${{ matrix.os.arch }}-${{ env.CACHE_VERSION_WINDOWS }}-${{ steps.ffmpeg-hash.outputs.hash }}
+
+  #       - name: Upload FFmpeg cache as artifact
+  #         if: inputs.upload_caches == true
+  #         uses: actions/upload-artifact@v7
+  #         with:
+  #           name: ffmpeg-cache-windows-${{ matrix.os.arch }}
+  #           path: C:\ffmpeg-cache-${{ matrix.os.arch }}
+  #           retention-days: 7
+
+  #       - name: Package FFmpeg binary
+  #         shell: msys2 {0}
+  #         run: |
+  #           if [ "${{ matrix.os.msystem }}" = "CLANG64" ]; then
+  #             FFMPEG_BIN="/clang64/ffbuild/jellyfin-ffmpeg/bin/ffmpeg.exe"
+  #           else
+  #             FFMPEG_BIN="/clangarm64/ffbuild/jellyfin-ffmpeg/bin/ffmpeg.exe"
+  #           fi
+
+  #           if [ -f "$FFMPEG_BIN" ]; then
+  #             mkdir -p ffmpeg-binary-win-${{ matrix.os.arch }}-jellyfin
+  #             cp "$FFMPEG_BIN" ffmpeg-binary-win-${{ matrix.os.arch }}-jellyfin/ffmpeg.exe
+  #             llvm-strip ffmpeg-binary-win-${{ matrix.os.arch }}-jellyfin/ffmpeg.exe
+  #             echo "Packaged FFmpeg binary for win-${{ matrix.os.arch }}-jellyfin"
+  #           else
+  #             echo "Warning: FFmpeg binary not found at $FFMPEG_BIN"
+  #           fi
+
+  #       - name: Install Node dependencies
+  #         run: npm install --ignore-scripts
+
+  #       - name: Setup custom node-gyp
+  #         shell: msys2 {0}
+  #         run: |
+  #           # Install and configure custom node-gyp from submodule
+  #           pushd externals/node-gyp
+  #           npm install
+  #           npm link
+  #           popd
+
+  #           # Verify node-gyp is available
+  #           which node-gyp
+  #           node-gyp --version
+
+  #       - name: Build Native Addon
+  #         shell: msys2 {0}
+  #         run: |
+  #           cp binding-jellyfin.gyp binding.gyp
+
+  #           if [ "${{ matrix.os.msystem }}" = "CLANG64" ]; then
+  #             PREFIX="/clang64/ffbuild"
+  #           else
+  #             PREFIX="/clangarm64/ffbuild"
+  #           fi
+
+  #           # Set environment for MSYS2/Clang build
+  #           export CC="clang"
+  #           export CXX="clang++"
+  #           export AR="llvm-ar"
+
+  #           # Set pkg-config path
+  #           export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH}"
+
+  #           # Set include and lib paths
+  #           export CFLAGS="-I${PREFIX}/include"
+  #           export CXXFLAGS="-I${PREFIX}/include"
+  #           export LDFLAGS="-L${PREFIX}/lib"
+
+  #           # Use our custom node-gyp directly for better control
+  #           NODE_GYP_PATH="$(pwd)/externals/node-gyp/bin/node-gyp.js"
+  #           NODE_GYP_WIN_PATH="$(cygpath -w $NODE_GYP_PATH)"
+
+  #           # Use --nodedir to point to MSYS2's Node.js installation
+  #           NODE_PATH="/$(echo ${{ matrix.os.msystem }} | tr '[:upper:]' '[:lower:]')"
+  #           NODE_WIN_PATH="$(cygpath -w $NODE_PATH)"
+
+  #           # In MSYS2, make is usually called mingw32-make
+  #           # Use --make to point to the correct make binary
+  #           MAKE_PATH="/${{ matrix.os.msystem == 'CLANG64' && 'clang64' || 'clangarm64' }}/bin/mingw32-make.exe"
+  #           MAKE_WIN_PATH="$(cygpath -w $MAKE_PATH)"
+
+  #           node "${NODE_GYP_WIN_PATH}" rebuild \
+  #             --verbose \
+  #             --arch=${{ matrix.os.arch }} \
+  #             --nodedir="${NODE_WIN_PATH}" \
+  #             --make="${MAKE_WIN_PATH}" \
+  #             --release
+
+  #           # Create prebuilds directory structure
+  #           PREBUILD_DIR="prebuilds/win32-${{ matrix.os.arch }}-mingw"
+  #           mkdir -p "$PREBUILD_DIR"
+
+  #           # Find the built .node file and copy it with consistent naming
+  #           NODE_FILE=$(find build/Release -name "*.node" -type f | head -1)
+  #           if [ -n "$NODE_FILE" ]; then
+  #             cp "$NODE_FILE" "$PREBUILD_DIR/node-av.node"
+  #             echo "Copied $(basename $NODE_FILE) -> node-av.node"
+
+  #             # Strip the binary
+  #             llvm-strip "$PREBUILD_DIR/node-av.node"
+
+  #             # Copy binary for tests
+  #             mkdir -p binary
+  #             cp "$PREBUILD_DIR/node-av.node" binary/node-av.node
+  #             echo "Copied binary for tests"
+
+  #             # Copy FFmpeg binary to binary folder
+  #             if [ -f "ffmpeg-binary-win-${{ matrix.os.arch }}-jellyfin/ffmpeg.exe" ]; then
+  #               cp "ffmpeg-binary-win-${{ matrix.os.arch }}-jellyfin/ffmpeg.exe" binary/ffmpeg.exe
+  #               echo "Copied FFmpeg binary for tests"
+  #             fi
+  #           else
+  #             echo "Error: No .node file found in build/Release"
+  #             exit 1
+  #           fi
+
+  #       - name: Check DLL dependencies
+  #         shell: msys2 {0}
+  #         run: |
+  #           echo "=== Checking node-av.node dependencies ==="
+  #           if [ -f "build/Release/node-av.node" ]; then
+  #             objdump -p "build/Release/node-av.node" | grep "DLL Name:"
+  #           fi
+
+  #           echo ""
+  #           echo "=== Checking FFmpeg binary dependencies ==="
+  #           if [ -f "binary/ffmpeg.exe" ]; then
+  #             objdump -p "binary/ffmpeg.exe" | grep "DLL Name:"
+  #           fi
+
+  #       # Cache the Whisper test models so runners don't re-download them from
+  #       # Hugging Face on every build (parallel jobs sharing the runner IP pool
+  #       # get rate-limited with HTTP 429).
+  #       - name: Cache Whisper Models
+  #         uses: actions/cache@v6
+  #         with:
+  #           path: models
+  #           key: whisper-models-v1
+
+  #       - name: Run Tests
+  #         env:
+  #           AV_FROM_SOURCE: 1
+  #         run: npm run test:all
+
+  #       - name: Upload Prebuild
+  #         if: always()
+  #         uses: actions/upload-artifact@v7
+  #         with:
+  #           name: prebuild-windows-mingw-${{ matrix.os.arch }}
+  #           path: prebuilds/
+  #           if-no-files-found: ignore
+
+  #       - name: Upload FFmpeg binary
+  #         if: always()
+  #         uses: actions/upload-artifact@v7
+  #         with:
+  #           name: ffmpeg-v${{ steps.ffmpeg-version.outputs.version }}-win-${{ matrix.os.arch }}-jellyfin.zip
+  #           path: ffmpeg-binary-win-${{ matrix.os.arch }}-jellyfin/
+  #           if-no-files-found: ignore
+
+  # The native addon is cached like FFmpeg: a job whose addon inputs and FFmpeg are unchanged
+  # reuses the addon built from them instead of compiling it again
+  addon_key:
+    name: "Native addon cache key"
+    runs-on: ubuntu-latest
+    outputs:
+      inputs: ${{ steps.key.outputs.inputs }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Hash the native addon inputs
+        id: key
+        run: |
+          # Everything the addon is compiled from besides FFmpeg's libraries, which each job adds
+          # with its FFmpeg key: the bindings, the gyp files with the variant's library filter,
+          # node-addon-api, and the jellyfin-ffmpeg submodule (internal headers, sync_queue.c).
+          # Not package-lock.json as a whole: the release bump changes it, and the tag build
+          # should reuse the addons of the commit before.
+          NAPI=$(node -p "require('./package-lock.json').packages['node_modules/node-addon-api'].version")
+          SUBMODULE=$(git ls-tree HEAD --object-only externals/jellyfin-ffmpeg)
+          echo "inputs=${CACHE_VERSION_ADDON}-${{ hashFiles('src/bindings/**', 'binding*.gyp', 'scripts/ffmpeg-variant.js') }}-napi${NAPI}-${SUBMODULE:0:12}" >> "$GITHUB_OUTPUT"
+
+  build_windows_msvc:
+    # Disabled: this fork ships glibc linux x64/arm64 only.
+    if: ${{ false }}
+    name: "Windows MSVC ${{ matrix.os.arch }} (${{ matrix.variant }})"
+    needs: addon_key
+    runs-on: ${{ matrix.os.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # gpl is node-av, lgpl node-av-lgpl and light node-av-light (scripts/ffmpeg-variant.js)
+        variant: [gpl, lgpl, light]
+        os:
+          - arch: x64
+            runner: windows-2022
+          - arch: arm64
+            runner: windows-11-arm
+    env:
+      SDK_VER: 10.0.22621.0
+      NODE_AV_VARIANT: ${{ matrix.variant }}
+      # Prebuild folder prefix and artifact suffix, empty for gpl (lgpl-win32-x64-msvc, ffmpeg-v8.1.3-win-x64-lgpl.zip)
+      VARIANT_PREFIX: ${{ matrix.variant != 'gpl' && format('{0}-', matrix.variant) || '' }}
+      VARIANT_SUFFIX: ${{ matrix.variant != 'gpl' && format('-{0}', matrix.variant) || '' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Read FFmpeg version
+        id: ffmpeg-version
+        shell: bash
+        run: |
+          FFMPEG_VERSION=$(cat externals/jellyfin-ffmpeg/FFMPEG_VERSION)
+          echo "version=$FFMPEG_VERSION" >> $GITHUB_OUTPUT
+          echo "FFmpeg version: $FFMPEG_VERSION"
+
+      - name: Prepare directories
+        shell: bash
+        run: |
+          mkdir -p ffmpeg-msvc
+
+      - name: Download FFmpeg MSVC Prebuilt
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Determine architecture suffix
+          if [ "${{ matrix.os.arch }}" = "x64" ]; then
+            ARCH_SUFFIX="amd64"
+          else
+            ARCH_SUFFIX="arm64"
+          fi
+
+          # Get pinned release info instead of releases/latest, so builds are
+          # reproducible (see FFMPEG_MSVC_PREBUILT_TAG at the workflow top).
+          RELEASE_URL="https://api.github.com/repos/seydx/ffmpeg-msvc-prebuilt/releases/tags/${FFMPEG_MSVC_PREBUILT_TAG}"
+
+          # Find the correct asset URL (ffmpeg-gpl-amd64-static.zip, ffmpeg-lgpl-amd64-static.zip, ...)
+          ASSET_URL=$(curl -s -H "Authorization: Bearer ${GITHUB_TOKEN}" "$RELEASE_URL" | \
+            grep "browser_download_url.*/ffmpeg-${NODE_AV_VARIANT}-${ARCH_SUFFIX}-static.zip" | \
+            cut -d '"' -f 4)
+
+          if [ -z "$ASSET_URL" ]; then
+            echo "Error: Could not find FFmpeg MSVC prebuilt asset"
+            exit 1
+          fi
+
+          echo "Downloading FFmpeg MSVC prebuilt: $ASSET_URL"
+
+          # Download and extract to project root
+          curl -L -H "Authorization: Bearer ${GITHUB_TOKEN}" "$ASSET_URL" -o ffmpeg-msvc-prebuilt.zip
+
+          # Extract ZIP contents directly into ffmpeg-msvc directory
+          unzip -q ffmpeg-msvc-prebuilt.zip -d ffmpeg-msvc
+
+          echo "FFmpeg MSVC prebuilt extracted to ffmpeg-msvc/"
+          ls -la ffmpeg-msvc/
+
+      - name: Upload FFmpeg cache as artifact
+        if: inputs.upload_caches == true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-cache-windows-msvc-${{ matrix.os.arch }}${{ env.VARIANT_SUFFIX }}
+          path: ffmpeg-msvc/
+          retention-days: 7
+
+      - name: Install Node dependencies
+        run: npm install --ignore-scripts
+
+      - name: Restore native addon cache
+        id: cache-addon
+        uses: actions/cache/restore@v6
+        with:
+          path: .addon-cache
+          key: addon-win32-${{ matrix.os.arch }}${{ env.VARIANT_SUFFIX }}-${{ needs.addon_key.outputs.inputs }}-${{ env.FFMPEG_MSVC_PREBUILT_TAG }}
+
+      - name: Build Native Addon
+        id: build-addon
+        if: steps.cache-addon.outputs.cache-hit != 'true'
+        shell: powershell
+        run: |
+          # Use the MSVC-compatible binding.gyp
+          Copy-Item binding.gyp binding.gyp.bak
+          Copy-Item binding-msvc.gyp binding.gyp
+
+          # Build N-API binary directly with node-gyp
+          npx node-gyp configure --arch=${{ matrix.os.arch }} --verbose --release
+          npx node-gyp build --arch=${{ matrix.os.arch }} --verbose --release
+
+          New-Item -ItemType Directory -Path ".addon-cache" -Force
+          Copy-Item "build\Release\*.node" ".addon-cache\node-av.node"
+
+          Write-Host "Build completed successfully"
+
+      # Saved right after the build, whatever the tests say: the key covers everything the
+      # addon is built from, so a fix outside the bindings reuses it and one inside rebuilds
+      - name: Save native addon cache
+        if: steps.cache-addon.outputs.cache-hit != 'true' && steps.build-addon.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: .addon-cache
+          key: addon-win32-${{ matrix.os.arch }}${{ env.VARIANT_SUFFIX }}-${{ needs.addon_key.outputs.inputs }}-${{ env.FFMPEG_MSVC_PREBUILT_TAG }}
+
+      - name: Collect Native Addon
+        shell: powershell
+        run: |
+          # Create prebuilds directory structure
+          $prebuildDir = "prebuilds\${env:VARIANT_PREFIX}win32-${{ matrix.os.arch }}-msvc"
+          New-Item -ItemType Directory -Path "binary" -Force
+          New-Item -ItemType Directory -Path $prebuildDir -Force
+
+          Copy-Item ".addon-cache\node-av.node" "binary\node-av.node"
+          Copy-Item ".addon-cache\node-av.node" "$prebuildDir\node-av.node"
+
+      - name: Check DLL dependencies
+        shell: powershell
+        run: |
+          Write-Host "=== Checking node-av.node dependencies ==="
+          $dumpbin = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Host*\${{ matrix.os.arch }}\dumpbin.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dumpbin) {
+            Write-Host "dumpbin not found, skipping the dependency check"
+            exit 0
+          }
+          & $dumpbin.FullName /DEPENDENTS ".addon-cache\node-av.node"
+
+          Write-Host "`n=== Checking FFmpeg binary dependencies ==="
+          if (Test-Path "ffmpeg-msvc\bin\ffmpeg.exe") {
+            & $dumpbin.FullName /DEPENDENTS "ffmpeg-msvc\bin\ffmpeg.exe"
+          }
+
+      - name: Package FFmpeg binary
+        shell: powershell
+        run: |
+          $ffmpegBin = "ffmpeg-msvc\bin\ffmpeg.exe"
+          if (Test-Path $ffmpegBin) {
+            New-Item -ItemType Directory -Path "ffmpeg-binary-win-${{ matrix.os.arch }}" -Force
+            Copy-Item $ffmpegBin "ffmpeg-binary-win-${{ matrix.os.arch }}\ffmpeg.exe"
+
+            # Copy FFmpeg binary to binary folder for tests
+            Copy-Item $ffmpegBin "binary\ffmpeg.exe"
+            Write-Host "Copied FFmpeg binary for tests"
+
+            Write-Host "Packaged FFmpeg binary for win-${{ matrix.os.arch }}"
+          } else {
+            Write-Host "Warning: FFmpeg binary not found at $ffmpegBin"
+          }
+
+      # Cache the Whisper test models so runners don't re-download them from
+      # Hugging Face on every build (parallel jobs sharing the runner IP pool
+      # get rate-limited with HTTP 429).
+      - name: Cache Whisper Models
+        if: matrix.variant == 'gpl'
+        uses: actions/cache@v6
+        with:
+          path: models
+          key: whisper-models-v1
+
+      # Every variant runs the full suite, a test that needs a component the variant
+      # leaves out (libx264, whisper, ...) skips itself (requires() in test/index.ts)
+      - name: Run Tests
+        env:
+          AV_FROM_SOURCE: 1
+        run: npm run test:all
+
+      - name: Upload prebuilds
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: prebuild-${{ env.VARIANT_PREFIX }}win32-msvc-${{ matrix.os.arch }}
+          path: prebuilds/
+          if-no-files-found: ignore
+
+      - name: Upload FFmpeg binary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-v${{ steps.ffmpeg-version.outputs.version }}-win-${{ matrix.os.arch }}${{ env.VARIANT_SUFFIX }}.zip
+          path: ffmpeg-binary-win-${{ matrix.os.arch }}/
+          if-no-files-found: ignore
+
+  build_linux:
+    name: "Linux ${{ matrix.arch }}${{ matrix.suffix }} (${{ matrix.variant }})"
+    needs: addon_key
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # This fork publishes a single trimmed variant (@revizly/node-av, scripts/ffmpeg-variant.js),
+        # glibc linux only (x64 + arm64). No lgpl/light, no musl, no windows/mac.
+        variant: [revizly]
+        target: [linux64, linuxarm64]
+        include:
+          - target: linux64
+            arch: x64
+            runner: ubuntu-latest
+          - target: linuxarm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      NODE_AV_VARIANT: ${{ matrix.variant }}
+      # Single variant published as @revizly/node-av-linux-<arch>, so no folder prefix / artifact suffix.
+      VARIANT_PREFIX: ""
+      VARIANT_SUFFIX: ""
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Read FFmpeg version
+        id: ffmpeg-version
+        run: |
+          FFMPEG_VERSION=$(cat externals/jellyfin-ffmpeg/FFMPEG_VERSION)
+          echo "version=$FFMPEG_VERSION" >> $GITHUB_OUTPUT
+          echo "FFmpeg version: $FFMPEG_VERSION"
+
+      - name: Get Jellyfin FFmpeg commit hash
+        id: ffmpeg-hash
+        run: |
+          if [ -n "${{ env.JELLYFIN_FFMPEG_HASH }}" ]; then
+            echo "hash=${{ env.JELLYFIN_FFMPEG_HASH }}" >> $GITHUB_OUTPUT
+          else
+            echo "hash=$(git -C externals/jellyfin-ffmpeg rev-parse HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Prepare directories
+        run: |
+          sudo mkdir -p /opt/ffbuild/prefix
+          sudo chown -R $USER:$USER /opt/ffbuild
+          sudo chmod -R 755 /opt/ffbuild
+
+      - name: Restore FFmpeg cache
+        id: cache-ffmpeg
+        uses: actions/cache@v6
+        with:
+          path: |
+            /opt/ffbuild/prefix
+            externals/jellyfin-ffmpeg/config*.h
+          key: ffmpeg-linux-${{ matrix.arch }}${{ matrix.suffix }}${{ env.VARIANT_SUFFIX }}-${{ env.CACHE_VERSION_LINUX }}-${{ steps.ffmpeg-hash.outputs.hash }}
+
+      - name: Build FFmpeg
+        id: build-ffmpeg
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          # Clear out /opt/ffbuild to avoid conflicts
+          sudo rm -rf /opt/ffbuild
+          sudo mkdir -p /opt/ffbuild/prefix
+          sudo chown -R $USER:$USER /opt/ffbuild
+          sudo chmod -R 755 /opt/ffbuild
+
+          # Drop the fork's trimmed FFmpeg variant into the (upstream-pinned) builder, so
+          # `build.sh <target> revizly` finds variants/<target>-revizly.sh (in-tree patch, no
+          # jellyfin-ffmpeg fork). See patches/builder-variants/.
+          cp patches/builder-variants/*.sh externals/jellyfin-ffmpeg/builder/variants/
+          # revizly, like lgpl/light, builds in the shared gpl toolchain image (it only configures
+          # FFmpeg differently); map it so vars.sh doesn't look for a nonexistent -revizly image.
+          sed -i 's/\[\[ \$VARIANT == lgpl || \$VARIANT == light \]\] \&\& IMAGE_VARIANT="gpl"/[[ $VARIANT == lgpl || $VARIANT == light || $VARIANT == revizly ]] \&\& IMAGE_VARIANT="gpl"/' externals/jellyfin-ffmpeg/builder/util/vars.sh
+
+          cd externals/jellyfin-ffmpeg/builder
+
+          TARGET="${{ matrix.target }}"
+
+          # Determine Docker image to use. Every variant builds in the gpl image, they
+          # only configure FFmpeg differently (see builder/util/vars.sh).
+          IMAGE="ghcr.io/seydx/jellyfin-ffmpeg/${TARGET}-gpl:latest"
+
+          # Try to pull image from registry first
+          if docker pull "${IMAGE}" 2>/dev/null; then
+            echo "✓ Using Docker image from registry: ${IMAGE}"
+          else
+            # If not available, build it locally
+            echo "Docker image not in registry, building locally..."
+            # Override GITHUB_REPOSITORY for makeimage.sh
+            GITHUB_REPOSITORY="seydx/jellyfin-ffmpeg" ./makeimage.sh "${TARGET}" gpl
+          fi
+
+          # Override GITHUB_REPOSITORY to use seydx/jellyfin-ffmpeg images
+          export GITHUB_REPOSITORY="seydx/jellyfin-ffmpeg"
+
+          # Run Jellyfin build script
+          ./build.sh "${TARGET}" "${NODE_AV_VARIANT}"
+
+          # Now extract the prefix directory which contains all headers and static libraries
+          if [ -d ffbuild/prefix ]; then
+            sudo mkdir -p /opt/ffbuild/prefix
+            sudo cp -r ffbuild/prefix/* /opt/ffbuild/prefix/
+
+            # Copy all config*.h files from FFmpeg build directory (required for internal headers)
+            echo "Copying config files from FFmpeg build directory..."
+            for config_file in ffbuild/ffmpeg/config*.h; do
+              if [ -f "$config_file" ]; then
+                filename=$(basename "$config_file")
+                sudo cp "$config_file" "../$filename"
+                echo "✓ Copied $filename"
+              fi
+            done
+
+            if [ ! -f ../config.h ]; then
+              echo "Error: config.h not found in FFmpeg build directory!"
+              exit 1
+            fi
+
+            if [ ! -f ../config_components.h ]; then
+              echo "Error: config_components.h not found in FFmpeg build directory!"
+              exit 1
+            fi
+
+            # Also check if codec libraries are in /opt/ffbuild inside container
+            # We might need to extract them from our Docker image
+            CONTAINER_ID=$(docker create "ghcr.io/seydx/jellyfin-ffmpeg/${TARGET}-gpl:latest")
+            # Try to copy codec libraries if they exist
+            docker cp "${CONTAINER_ID}:/opt/ffbuild/lib" /tmp/codec-libs 2>/dev/null && {
+              sudo cp -n /tmp/codec-libs/*.a /opt/ffbuild/prefix/lib/ 2>/dev/null || true
+              rm -rf /tmp/codec-libs
+            }
+            docker cp "${CONTAINER_ID}:/opt/ffbuild/include" /tmp/codec-includes 2>/dev/null && {
+              sudo cp -rn /tmp/codec-includes/* /opt/ffbuild/prefix/include/ 2>/dev/null || true
+              rm -rf /tmp/codec-includes
+            }
+            docker rm "${CONTAINER_ID}"
+
+            # Clean up the preserved ffbuild directory now
+            rm -rf ffbuild
+
+            sudo chown -R $USER:$USER /opt/ffbuild
+          else
+            echo "Error: ffbuild/prefix not found!"
+            exit 1
+          fi
+
+          cd ../..
+
+      - name: Save FFmpeg cache
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true' && steps.build-ffmpeg.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            /opt/ffbuild/prefix
+            externals/jellyfin-ffmpeg/config*.h
+          key: ffmpeg-linux-${{ matrix.arch }}${{ matrix.suffix }}${{ env.VARIANT_SUFFIX }}-${{ env.CACHE_VERSION_LINUX }}-${{ steps.ffmpeg-hash.outputs.hash }}
+
+      - name: Upload FFmpeg cache as artifact
+        if: inputs.upload_caches == true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-cache-linux-${{ matrix.arch }}${{ matrix.suffix }}${{ env.VARIANT_SUFFIX }}
+          path: /opt/ffbuild/prefix
+          retention-days: 7
+
+      - name: Package FFmpeg binary
+        run: |
+          FFMPEG_BIN="/opt/ffbuild/prefix/bin/ffmpeg"
+          if [ -f "$FFMPEG_BIN" ]; then
+            mkdir -p ffmpeg-binary-linux-${{ matrix.arch }}${{ matrix.suffix }}-jellyfin
+            cp "$FFMPEG_BIN" ffmpeg-binary-linux-${{ matrix.arch }}${{ matrix.suffix }}-jellyfin/ffmpeg
+            strip ffmpeg-binary-linux-${{ matrix.arch }}${{ matrix.suffix }}-jellyfin/ffmpeg
+            echo "Packaged FFmpeg binary for linux-${{ matrix.arch }}${{ matrix.suffix }}-jellyfin"
+          else
+            echo "Warning: FFmpeg binary not found at $FFMPEG_BIN"
+          fi
+
+      - name: Restore native addon cache
+        id: cache-addon
+        uses: actions/cache/restore@v6
+        with:
+          path: .addon-cache
+          key: addon-linux-${{ matrix.arch }}${{ matrix.suffix }}${{ env.VARIANT_SUFFIX }}-${{ needs.addon_key.outputs.inputs }}-${{ env.CACHE_VERSION_LINUX }}
+
+      - name: Build Native Addon in Docker
+        id: build-addon
+        if: steps.cache-addon.outputs.cache-hit != 'true'
+        run: |
+          cp binding-jellyfin.gyp binding.gyp
+
+          TARGET="${{ matrix.target }}"
+
+          # Determine Docker image to use
+          IMAGE="ghcr.io/seydx/jellyfin-ffmpeg/${TARGET}-gpl:latest"
+
+          # Pull image if not already cached locally
+          if ! docker image inspect "${IMAGE}" > /dev/null 2>&1; then
+            echo "Pulling Docker image: ${IMAGE}"
+            docker pull "${IMAGE}"
+          else
+            echo "Using locally cached Docker image: ${IMAGE}"
+          fi
+
+          # Run the build inside the Docker container
+          docker run --rm \
+            -v "$(pwd)":/workspace \
+            -v /opt/ffbuild:/opt/ffbuild \
+            -w /workspace \
+            -e PKG_CONFIG_PATH="/opt/ffbuild/prefix/lib/pkgconfig" \
+            -e NODE_AV_VARIANT \
+            "${IMAGE}" \
+            bash -c "
+              set -e
+
+              # Install Node.js in the container
+              curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+              apt-get install -y nodejs
+
+              # Verify Node.js installation
+              node --version
+              npm --version
+
+              # Install dependencies
+              npm install --ignore-scripts
+
+              # Build with GCC from crosstool-ng (native GCC 15.2.0)
+              npx prebuildify \
+                --napi \
+                --strip \
+                --arch=${{ matrix.arch }} \
+                --tag-libc
+
+              # Fix ownership (Docker runs as root)
+              chown -R 1001:127 prebuilds node_modules build 2>/dev/null || true
+            "
+
+          BUILT_FILE=$(find prebuilds -name "*.node" -type f | head -1)
+          if [ -z "$BUILT_FILE" ]; then
+            echo "Error: No .node file found in prebuilds directory"
+            exit 1
+          fi
+          mkdir -p .addon-cache
+          mv "$BUILT_FILE" .addon-cache/node-av.node
+          rm -rf prebuilds
+
+      # Saved right after the build, whatever the tests say: the key covers everything the
+      # addon is built from, so a fix outside the bindings reuses it and one inside rebuilds
+      - name: Save native addon cache
+        if: steps.cache-addon.outputs.cache-hit != 'true' && steps.build-addon.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: .addon-cache
+          key: addon-linux-${{ matrix.arch }}${{ matrix.suffix }}${{ env.VARIANT_SUFFIX }}-${{ needs.addon_key.outputs.inputs }}-${{ env.CACHE_VERSION_LINUX }}
+
+      # The addon build installs them inside its container
+      - name: Install Node dependencies
+        if: steps.cache-addon.outputs.cache-hit == 'true'
+        run: npm install --ignore-scripts
+
+      - name: Collect Native Addon
+        run: |
+          # prebuildify names the folder linux-<arch> for either C library and variant
+          DIR="prebuilds/${VARIANT_PREFIX}linux-${{ matrix.arch }}${{ matrix.suffix }}"
+          mkdir -p "$DIR" binary
+          cp .addon-cache/node-av.node "$DIR/node-av.node"
+
+          # Copy binaries for tests
+          cp .addon-cache/node-av.node binary/node-av.node
+          if [ -f "ffmpeg-binary-linux-${{ matrix.arch }}${{ matrix.suffix }}-jellyfin/ffmpeg" ]; then
+            cp "ffmpeg-binary-linux-${{ matrix.arch }}${{ matrix.suffix }}-jellyfin/ffmpeg" binary/ffmpeg
+            echo "Copied FFmpeg binary for tests"
+          fi
+
+      # Cache the Whisper test models so runners don't re-download them from
+      # Hugging Face on every build (parallel jobs sharing the runner IP pool
+      # get rate-limited with HTTP 429).
+      - name: Cache Whisper Models
+        if: matrix.variant == 'gpl'
+        uses: actions/cache@v6
+        with:
+          path: models
+          key: whisper-models-v1
+
+      # Every variant runs the full suite, a test that needs a component the variant
+      # leaves out (libx264, whisper, ...) skips itself (requires() in test/index.ts)
+      - name: Run Tests
+        if: matrix.suffix != '-musl'
+        env:
+          AV_FROM_SOURCE: 1
+        run: npm run test:all
+
+      # The musl build only loads on a musl system. The container has no Vulkan
+      # loader, so the whisper tests also cover ggml's CPU fallback.
+      - name: Run Tests (Alpine)
+        if: matrix.suffix == '-musl'
+        run: |
+          docker run --rm \
+            -v "$(pwd)":/workspace \
+            -w /workspace \
+            -e AV_FROM_SOURCE=1 \
+            -e NODE_AV_VARIANT \
+            node:24-alpine \
+            sh -c 'npm run test:all; status=$?; chown -R 1001:127 /workspace; exit $status'
+
+      - name: Upload Prebuild
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: prebuild-${{ env.VARIANT_PREFIX }}linux-${{ matrix.arch }}${{ matrix.suffix }}
+          path: prebuilds/
+          if-no-files-found: ignore
+
+      - name: Upload FFmpeg binary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-v${{ steps.ffmpeg-version.outputs.version }}-linux-${{ matrix.arch }}${{ matrix.suffix }}-jellyfin${{ env.VARIANT_SUFFIX }}.zip
+          path: ffmpeg-binary-linux-${{ matrix.arch }}${{ matrix.suffix }}-jellyfin/
+          if-no-files-found: ignore
+
+  build_macos:
+    # Disabled: this fork ships glibc linux x64/arm64 only.
+    if: ${{ false }}
+    name: "macOS ${{ matrix.arch }} (${{ matrix.variant }})"
+    needs: addon_key
+    # Pinned image generation: macos-latest resolves to different images during
+    # GitHub's label rollouts (mixed Xcode sets across the pool), which broke
+    # both the FFmpeg cache key and the XCODE_VERSION pin. Bump together with
+    # XCODE_VERSION when a new image generation is adopted.
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        # gpl is node-av, lgpl node-av-lgpl and light node-av-light (scripts/ffmpeg-variant.js)
+        variant: [gpl, lgpl, light]
+        arch: [x64, arm64]
+    env:
+      NODE_AV_VARIANT: ${{ matrix.variant }}
+      # Prebuild folder prefix and artifact suffix, empty for gpl (lgpl-darwin-arm64, ffmpeg-v8.1.3-macos-arm64-jellyfin-lgpl.zip)
+      VARIANT_PREFIX: ${{ matrix.variant != 'gpl' && format('{0}-', matrix.variant) || '' }}
+      VARIANT_SUFFIX: ${{ matrix.variant != 'gpl' && format('-{0}', matrix.variant) || '' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Set up Homebrew
+        uses: Homebrew/actions/setup-homebrew@main
+
+      - name: Read FFmpeg version
+        id: ffmpeg-version
+        run: |
+          FFMPEG_VERSION=$(cat externals/jellyfin-ffmpeg/FFMPEG_VERSION)
+          echo "version=$FFMPEG_VERSION" >> $GITHUB_OUTPUT
+          echo "FFmpeg version: $FFMPEG_VERSION"
+
+      - name: Get Jellyfin FFmpeg commit hash
+        id: ffmpeg-hash
+        run: |
+          if [ -n "${{ env.JELLYFIN_FFMPEG_HASH }}" ]; then
+            echo "hash=${{ env.JELLYFIN_FFMPEG_HASH }}" >> $GITHUB_OUTPUT
+          else
+            echo "hash=$(git -C externals/jellyfin-ffmpeg rev-parse HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Select pinned Xcode
+        run: |
+          # The bundle name may carry a patch suffix (Xcode_26.5.0.app), so match
+          # by prefix. Fails loudly when the runner image no longer carries the
+          # pinned version - bump XCODE_VERSION at the top of the workflow
+          # deliberately (that invalidates the FFmpeg cache exactly once).
+          APP=$(ls -d "/Applications/Xcode_${XCODE_VERSION}"*.app 2>/dev/null | grep -iv beta | sort -V | tail -1)
+          if [ -z "$APP" ]; then
+            echo "Pinned Xcode ${XCODE_VERSION} not found on this runner image. Available:"
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          sudo xcode-select -s "$APP"
+          xcodebuild -version
+
+      - name: Prepare directories
+        run: |
+          sudo mkdir -p /opt/ffbuild/prefix
+          sudo chown -R $USER:staff /opt/ffbuild
+          sudo chmod -R 755 /opt/ffbuild
+
+      - name: Restore FFmpeg cache
+        id: cache-ffmpeg
+        uses: actions/cache@v6
+        with:
+          path: |
+            /opt/ffbuild/prefix
+            externals/jellyfin-ffmpeg/config*.h
+          key: ffmpeg-macos-${{ matrix.arch }}${{ env.VARIANT_SUFFIX }}-${{ env.CACHE_VERSION_MACOS }}-xcode${{ env.XCODE_VERSION }}-${{ steps.ffmpeg-hash.outputs.hash }}
+
+      - name: Ensure Metal Toolchain
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          # Since Xcode 26 the Metal Toolchain is a separate download. Without it,
+          # FFmpeg drops its Metal-based filters (overlay_videotoolbox, ...) - the
+          # build requires it now via --enable-metal, so install it up front.
+          if ! xcrun -sdk macosx metal -v >/dev/null 2>&1; then
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+
+      - name: Build FFmpeg
+        id: build-ffmpeg
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          # Clear out /opt/ffbuild to avoid conflicts
+          sudo rm -rf /opt/ffbuild
+          sudo mkdir -p /opt/ffbuild/prefix
+          sudo chown -R $USER:staff /opt/ffbuild
+          sudo chmod -R 755 /opt/ffbuild
+
+          cd externals/jellyfin-ffmpeg/builder
+
+          # Map our arch names to Jellyfin's
+          ARCH_NAME="${{ matrix.arch }}"
+          if [ "$ARCH_NAME" = "x64" ]; then
+            ARCH_NAME="x86_64"
+          fi
+
+          # Run Jellyfin build script
+          ./buildmac.sh $ARCH_NAME "${NODE_AV_VARIANT}"
+
+          # The build script uses /ffbuild/prefix but we need /opt/ffbuild/prefix
+          # Also need to run make install to get FFmpeg libraries
+          cd ..
+          make install DESTDIR="" prefix="/opt/ffbuild/prefix"
+
+          echo "Verifying config files from FFmpeg build..."
+          if [ ! -f config.h ]; then
+            echo "Error: config.h not found in FFmpeg build directory!"
+            exit 1
+          fi
+
+          if [ ! -f config_components.h ]; then
+            echo "Error: config_components.h not found in FFmpeg build directory!"
+            exit 1
+          fi
+
+          # List all config files for debugging
+          ls -la config*.h || true
+          echo "✓ Config files verified in externals/jellyfin-ffmpeg/"
+
+          # Fix permissions before caching
+          sudo chown -R $USER:staff /opt/ffbuild
+
+          cd ..
+
+      - name: Save FFmpeg cache
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true' && steps.build-ffmpeg.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            /opt/ffbuild/prefix
+            externals/jellyfin-ffmpeg/config*.h
+          key: ffmpeg-macos-${{ matrix.arch }}${{ env.VARIANT_SUFFIX }}-${{ env.CACHE_VERSION_MACOS }}-xcode${{ env.XCODE_VERSION }}-${{ steps.ffmpeg-hash.outputs.hash }}
+
+      - name: Upload FFmpeg cache as artifact
+        if: inputs.upload_caches == true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-cache-macos-${{ matrix.arch }}${{ env.VARIANT_SUFFIX }}
+          path: /opt/ffbuild/prefix
+          retention-days: 7
+
+      - name: Package FFmpeg binary
+        run: |
+          FFMPEG_BIN="/opt/ffbuild/prefix/bin/ffmpeg"
+          if [ -f "$FFMPEG_BIN" ]; then
+            mkdir -p ffmpeg-binary-macos-${{ matrix.arch }}-jellyfin
+            cp "$FFMPEG_BIN" ffmpeg-binary-macos-${{ matrix.arch }}-jellyfin/ffmpeg
+            strip ffmpeg-binary-macos-${{ matrix.arch }}-jellyfin/ffmpeg
+            echo "Packaged FFmpeg binary for macos-${{ matrix.arch }}-jellyfin"
+          else
+            echo "Warning: FFmpeg binary not found at $FFMPEG_BIN"
+          fi
+
+      - name: Install Node dependencies
+        run: npm install --ignore-scripts
+
+      - name: Restore native addon cache
+        id: cache-addon
+        uses: actions/cache/restore@v6
+        with:
+          path: .addon-cache
+          key: addon-macos-${{ matrix.arch }}${{ env.VARIANT_SUFFIX }}-${{ needs.addon_key.outputs.inputs }}-${{ env.CACHE_VERSION_MACOS }}-xcode${{ env.XCODE_VERSION }}
+
+      - name: Build Native Addon
+        id: build-addon
+        if: steps.cache-addon.outputs.cache-hit != 'true'
+        run: |
+          cp binding-jellyfin.gyp binding.gyp
+
+          # For x64 builds on ARM64 runner, set up cross-compilation
+          if [ "${{ matrix.arch }}" = "x64" ] && [ "$(uname -m)" = "arm64" ]; then
+            echo "Setting up Node.js cross-compilation for x86_64"
+            export CFLAGS="-arch x86_64"
+            export CXXFLAGS="-arch x86_64"
+            export LDFLAGS="-arch x86_64"
+            export npm_config_arch=x64
+            export npm_config_target_arch=x64
+            export npm_config_disturl=https://nodejs.org/dist
+            export npm_config_runtime=node
+            export npm_config_build_from_source=true
+          fi
+
+          # Build N-API binary
+          npx prebuildify \
+            --napi \
+            --strip \
+            --arch=${{ matrix.arch }}
+
+          BUILT_FILE=$(find prebuilds -name "*.node" -type f | head -1)
+          if [ -z "$BUILT_FILE" ]; then
+            echo "Error: No .node file found in prebuilds directory"
+            exit 1
+          fi
+          mkdir -p .addon-cache
+          mv "$BUILT_FILE" .addon-cache/node-av.node
+          rm -rf prebuilds
+
+      # Saved right after the build, whatever the tests say: the key covers everything the
+      # addon is built from, so a fix outside the bindings reuses it and one inside rebuilds
+      - name: Save native addon cache
+        if: steps.cache-addon.outputs.cache-hit != 'true' && steps.build-addon.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: .addon-cache
+          key: addon-macos-${{ matrix.arch }}${{ env.VARIANT_SUFFIX }}-${{ needs.addon_key.outputs.inputs }}-${{ env.CACHE_VERSION_MACOS }}-xcode${{ env.XCODE_VERSION }}
+
+      - name: Collect Native Addon
+        run: |
+          # The variant's packages get their own folder (lgpl-darwin-arm64)
+          DIR="prebuilds/${VARIANT_PREFIX}darwin-${{ matrix.arch }}"
+          mkdir -p "$DIR" binary
+          cp .addon-cache/node-av.node "$DIR/node-av.node"
+
+          # Copy binaries for tests
+          cp .addon-cache/node-av.node binary/node-av.node
+          if [ -f "ffmpeg-binary-macos-${{ matrix.arch }}-jellyfin/ffmpeg" ]; then
+            cp "ffmpeg-binary-macos-${{ matrix.arch }}-jellyfin/ffmpeg" binary/ffmpeg
+            echo "Copied FFmpeg binary for tests"
+          fi
+
+      # Cache the Whisper test models (see the other test jobs - avoids HTTP 429
+      # rate limits from Hugging Face when runners share an IP pool).
+      - name: Cache Whisper Models
+        if: matrix.arch == 'arm64' && matrix.variant == 'gpl'
+        uses: actions/cache@v6
+        with:
+          path: models
+          key: whisper-models-v1
+
+      # Every variant runs the full suite, a test that needs a component the variant
+      # leaves out (libx264, whisper, ...) skips itself (requires() in test/index.ts)
+      - name: Run Tests
+        if: matrix.arch == 'arm64'
+        env:
+          AV_FROM_SOURCE: 1
+        run: npm run test:all
+
+      - name: Run Tests
+        if: matrix.arch == 'x64'
+        run: |
+          NODE_VERSION=$(node -p "process.version")
+          curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-darwin-x64.tar.gz" -o /tmp/node-x64.tar.gz
+          mkdir -p /tmp/node-x64
+          tar -xzf /tmp/node-x64.tar.gz -C /tmp/node-x64 --strip-components=1
+
+          /tmp/node-x64/bin/node -p "process.arch" | grep -qx "x64"
+          /tmp/node-x64/bin/node -e "
+            process.dlopen(module, require('path').resolve('binary/node-av.node'));
+            console.log('x64 addon loaded under Rosetta, exports:', Object.keys(module.exports).length);
+          "
+
+      - name: Upload Prebuild
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: prebuild-${{ env.VARIANT_PREFIX }}macos-${{ matrix.arch }}
+          path: prebuilds/
+          if-no-files-found: ignore
+
+      - name: Upload FFmpeg binary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-v${{ steps.ffmpeg-version.outputs.version }}-macos-${{ matrix.arch }}-jellyfin${{ env.VARIANT_SUFFIX }}.zip
+          path: ffmpeg-binary-macos-${{ matrix.arch }}-jellyfin/
+          if-no-files-found: ignore
+
+  cleanup_caches:
+    name: "Cleanup stale caches"
+    runs-on: ubuntu-latest
+    needs: [addon_key, build_linux]
+    if: always() && github.event_name != 'pull_request'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Delete FFmpeg and addon caches with outdated keys
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ADDON_INPUTS: ${{ needs.addon_key.outputs.inputs }}
+        run: |
+          # The submodule pointer is part of the tree - no submodule checkout needed
+          HASH="${JELLYFIN_FFMPEG_HASH:-$(git ls-tree HEAD --object-only externals/jellyfin-ffmpeg)}"
+          # no windows keys: the MinGW job is disabled, its caches are stale
+          KEEP=""
+          for variant in "" -lgpl -light; do
+            for platform in linux-x64 linux-arm64 linux-x64-musl linux-arm64-musl; do
+              KEEP+="ffmpeg-${platform}${variant}-${CACHE_VERSION_LINUX}-${HASH}"$'\n'
+            done
+            for arch in x64 arm64; do
+              KEEP+="ffmpeg-macos-${arch}${variant}-${CACHE_VERSION_MACOS}-xcode${XCODE_VERSION}-${HASH}"$'\n'
+            done
+          done
+
+          # The addon keys of this commit, in the format of the build jobs
+          if [ -n "$ADDON_INPUTS" ]; then
+            for variant in "" -lgpl -light; do
+              for platform in linux-x64 linux-arm64 linux-x64-musl linux-arm64-musl; do
+                KEEP+="addon-${platform}${variant}-${ADDON_INPUTS}-${CACHE_VERSION_LINUX}"$'\n'
+              done
+              for arch in x64 arm64; do
+                KEEP+="addon-macos-${arch}${variant}-${ADDON_INPUTS}-${CACHE_VERSION_MACOS}-xcode${XCODE_VERSION}"$'\n'
+                KEEP+="addon-win32-${arch}${variant}-${ADDON_INPUTS}-${FFMPEG_MSVC_PREBUILT_TAG}"$'\n'
+              done
+            done
+          fi
+
+          gh cache list --limit 200 --json id,key --jq '.[] | select(.key | startswith("ffmpeg-") or startswith("addon-")) | "\(.id) \(.key)"' |
+          while read -r id key; do
+            # Without the addon_key output nothing is known to be current, the addon caches stay
+            [[ $key == addon-* && -z "$ADDON_INPUTS" ]] && continue
+            if ! grep -qxF "$key" <<< "$KEEP"; then
+              echo "Deleting stale cache: $key"
+              gh cache delete "$id" || true
+            fi
+          done

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 
@@ -8,19 +8,56 @@ import { log } from './ffmpeg.js';
 
 const require = createRequire(import.meta.url);
 
-const tryLoadPrebuilt = () => {
-  const platform = process.platform;
-  const arch = process.arch;
-  const packageName = `@revizly/node-av-${platform}-${arch}`;
+// This fork installs its own scoped platform packages (@revizly/node-av-linux-x64, ...).
+// The package name is already the scoped prefix, so the platform packages are `${name}-${platform}-${arch}`.
+const { name } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+const packagePrefix = name;
 
-  try {
-    const packageJsonPath = require.resolve(`${packageName}/package.json`);
-    if (existsSync(packageJsonPath)) {
-      log(`Using prebuilt binary from ${packageName}`);
-      return true;
+const tryLoadPrebuilt = () => {
+  // Try to load from platform-specific package (optionalDependencies)
+  const { platform, arch, musl } = installTarget();
+
+  if (platform === 'win32') {
+    // MinGW builds are discontinued, Windows ships MSVC only
+    // const useMingW = type() !== 'Windows_NT';
+    // if (useMingW) {
+    //   try {
+    //     const packageName = `@seydx/node-av-${platform}-${arch}-mingw`;
+    //     const packageJsonPath = require.resolve(`${packageName}/package.json`);
+    //     if (existsSync(packageJsonPath)) {
+    //       log(`Using prebuilt binary from ${packageName}`);
+    //       return true;
+    //     }
+    //   } catch {
+    //     // Package not installed
+    //   }
+    // }
+
+    try {
+      const packageName = `${packagePrefix}-${platform}-${arch}-msvc`;
+      // Check if the package is installed (don't check for .node file yet - it may be extracted by postinstall)
+      const packageJsonPath = require.resolve(`${packageName}/package.json`);
+      if (existsSync(packageJsonPath)) {
+        log(`Using prebuilt binary from ${packageName}`);
+        return true;
+      }
+    } catch {
+      // Package not installed
     }
-  } catch {
-    // Package not installed
+  } else {
+    // musl (Alpine) has its own build, a glibc one doesn't load there
+    const packageName = `${packagePrefix}-${platform}-${arch}${musl ? '-musl' : ''}`;
+
+    try {
+      // Check if the package is installed (don't check for .node file yet - it may be extracted by postinstall)
+      const packageJsonPath = require.resolve(`${packageName}/package.json`);
+      if (existsSync(packageJsonPath)) {
+        log(`Using prebuilt binary from ${packageName}`);
+        return true;
+      }
+    } catch {
+      // Package not installed
+    }
   }
 
   // Try local binary folder (for development)
@@ -31,6 +68,14 @@ const tryLoadPrebuilt = () => {
   }
 
   return false;
+};
+
+// A cross build (npm --os/--cpu/--libc) installs the target's package, not the build host's
+const installTarget = () => {
+  const platform = process.env.npm_config_os || process.platform;
+  const arch = process.env.npm_config_cpu || process.arch;
+  const libc = process.env.npm_config_libc || (isMuslLibc() ? 'musl' : 'glibc');
+  return { platform, arch, musl: platform === 'linux' && libc === 'musl' };
 };
 
 const isMuslLibc = () => {
@@ -47,14 +92,9 @@ const isMuslLibc = () => {
 };
 
 const noPrebuiltError = () => {
+  const { platform, arch, musl } = installTarget();
   log('');
-  log(`No prebuilt binary available for ${process.platform}-${process.arch}.`);
-
-  if (isMuslLibc()) {
-    log('Note: You appear to be on a musl-based system (e.g. Alpine Linux).');
-    log('Prebuilt binaries are only provided for glibc-based Linux distributions.');
-  }
-
+  log(`No prebuilt binary available for ${platform}-${arch}${musl ? ' (musl)' : ''}.`);
   log('The published npm package does not contain the native sources,');
   log('so it cannot be built from source inside node_modules.');
   log('To build from source, clone the repository and follow the build instructions:');

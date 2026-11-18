@@ -4,7 +4,165 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [6.2.0-beta.35] - 2026-10-25
+## [7.1.0] - 2026-11-14
+
+### Added
+
+- **node-av-lgpl, an LGPL build of node-av** ([#99](https://github.com/seydx/node-av/issues/99)). Same API, linked against FFmpeg built without GPL components: no libx264, libx265 and chromaprint, no GPL-only filters, and no libfdk_aac, which has its own license (AAC goes through FFmpeg's own encoder). H.264 and H.265 are encoded only with a hardware encoder: there is no LGPL software encoder for them, and `FMP4Stream` says so when it has to transcode without one. Install it as `npm install node-av@npm:node-av-lgpl` to keep the `node-av/...` imports. Its FFmpeg CLI is `@seydx/node-av-ffmpeg-lgpl`.
+- **node-av-light, a smaller build of node-av** ([#69](https://github.com/seydx/node-av/issues/69)). It keeps all of FFmpeg's own components and every hardware backend, plus x264, x265, Opus and libfdk_aac, and leaves out the less common external libraries: Whisper, libplacebo, libvpx, SVT-AV1, JPEG XL, WebP, Vorbis, Theora, libass, zimg, SRT, Blu-ray, teletext and tracker music. Its FFmpeg CLI is `@seydx/node-av-ffmpeg-light`.
+
+### Changed
+
+- **The platform and FFmpeg CLI packages declare the license of the FFmpeg they contain.** They said MIT, which only covers node-av's own code. The native binding links FFmpeg statically, so the packages now say `GPL-3.0-or-later AND FDK-AAC` (`LGPL-3.0-or-later` for node-av-lgpl). The README lists what each variant contains and points out that node-av and node-av-light include libfdk_aac under the Fraunhofer FDK AAC license.
+- **The platform and FFmpeg CLI packages ship their license texts.** Each one contains the GPL or LGPL text of its FFmpeg, the Fraunhofer FDK AAC license where libfdk_aac is linked, and a LICENSE.md that links the exact FFmpeg sources the binary was built from.
+- **The Windows (MSVC) FFmpeg compiles its CUDA filters with clang instead of nvcc.** nvcc needs `--enable-nonfree`, which made the Windows x64 binaries non-redistributable. The filters (`scale_cuda`, `overlay_cuda`, `tonemap_cuda`, ...) stay the same, and node-av-lgpl has them as well.
+
+### Fixed
+
+- **node-av can be imported in an Electron renderer.** The demuxer created a `SharedArrayBuffer` when the module loaded, which a renderer without cross-origin isolation doesn't have, so the import failed. It is now created on the first EAGAIN retry in `packetsSync()`. Closing a demuxer also no longer calls `unref()` on the browser timers of a renderer, which are plain numbers.
+- **Logging no longer aborts the process after a worker thread that set the log callback has ended.** The callback belongs to the thread that called `Log.setCallback()`. When that worker ended without `Log.resetCallback()`, the next FFmpeg log line from any other thread still went to its function. Logging now falls back to FFmpeg's default output. A callback that replaces one set in another thread also releases the old one.
+- **`RTPStream.stop()` and `FMP4Stream.stop()` close the input when a codec fails to close.** A decoder, filter or encoder that was still busy threw from `close()` and the teardown ended there, so the input, e.g. an RTSP connection, stayed open. The error still reaches the caller.
+- **`AudioFifo` checks the length of the buffers it is given.** `write()`, `read()`, `peek()` and their sync variants copied `nb_samples` per buffer without looking at its size, so a buffer that was too short was read or written past its end. They now throw a `RangeError`, and a `TypeError` for a plane that is not a `Buffer`.
+- **`sendRTSPPacket()` rejects a packet over 65535 bytes on a TCP session.** The interleaved header has 16 bits for the length, a larger packet was sent with a wrong one. It now returns `AVERROR(EINVAL)`.
+- **An input with custom I/O no longer reads freed memory when its `IOContext` is garbage collected first.** This could happen to an input that was dropped without `close()` while it was still reading. Its reads now end with an error.
+- **Reading an input with `packets()` no longer crashes at the end of the stream on musl (Alpine).** The DTS prediction read the stream's parser on the main thread, while the input's reader thread reads ahead and frees that parser at the end of the stream and on a seek. On musl this crashed now and then with a segmentation fault, elsewhere it could read a stale value. The parser state is now taken with each packet on the thread that reads it, as the FFmpeg CLI does.
+- **`Stream.parser` returns a copy of the parser state instead of the stream's parser.** The returned `CodecParser` pointed to a parser FFmpeg frees at the end of the stream and on a seek, so reading `repeatPict` afterwards read freed memory, and with `readFrame()` the main thread touched a parser the reader thread was using. It now carries the state as of the last packet read from the stream, stays valid after the input is closed, and is `null` before the first packet. It cannot parse; a parser of your own comes from `new CodecParser()` and `init()`.
+
+## [7.0.3] - 2026-11-12
+
+### Fixed
+
+- **Installing for another platform no longer fails.** With `npm install --os=linux --cpu=arm64` (plus `--libc=musl` for Alpine), e.g. to build an arm64 image on an x64 machine, npm installs the target's prebuilt package. The install check looked for the build host's package instead and aborted with "No prebuilt binary available".
+
+## [7.0.2] - 2026-11-12
+
+### Fixed
+
+- **A broken OpenCL installation no longer exits the process when Whisper starts.** whisper.cpp's OpenCL backend called `exit(1)` when its kernels failed to compile, e.g. on Alpine with `intel-compute-runtime` but without `intel-graphics-compiler`. The kernels compile while the backend probes the devices, so this hit every `WhisperTranscriber`, even with `useGpu: false`. The device is now skipped and Whisper runs on Vulkan or the CPU.
+- **Whisper on Windows skips Vulkan when no Vulkan loader is installed.** The fix from 7.0.0 for Linux systems without `libvulkan.so.1` was missing from the Windows builds. Without `vulkan-1.dll`, Whisper now transcribes on the CPU there as well.
+
+## [7.0.1] - 2026-11-12
+
+### Added
+
+- **`audio.transcode` on `RTPStream`.** The audio is encoded again even when its codec is one of `supportedAudioCodecs`, so the encoder options apply, e.g. for a receiver that negotiated Opus in 20 ms frames from a source that sends 60 ms.
+
+### Fixed
+
+- **`RTPStream` and `FMP4Stream` decode Opus with libopus.** FFmpeg's own Opus decoder turned SILK frames with in-band FEC into loud noise, e.g. the audio of Ring cameras.
+
+## [7.0.0] - 2026-11-12
+
+### Breaking Changes
+
+#### The FFmpeg CLI is a separate package ([#332](https://github.com/seydx/node-av/issues/332))
+
+node-av no longer downloads the `ffmpeg` binary in a `postinstall` script. Install `@seydx/node-av-ffmpeg` next to it if you use `node-av/ffmpeg`:
+
+```bash
+npm install node-av @seydx/node-av-ffmpeg
+```
+
+Like the native bindings, the binary comes as one npm package per platform (`@seydx/node-av-ffmpeg-{darwin,linux,win32}-{arm64,x64}`, plus `-musl` variants for Linux), and npm installs only the matching one. Installs without the CLI are 29–63 MB smaller to download, depending on the platform. Installing no longer needs network access to GitHub. It also works where lifecycle scripts are blocked (pnpm 10+, bun, `--ignore-scripts`).
+
+- `ffmpegPath()` throws when the package is not installed instead of returning a path that doesn't exist. Check `isFfmpegAvailable()` first if the CLI is optional.
+- The binary moves from `node_modules/node-av/binary/` into `node_modules/@seydx/node-av-ffmpeg-<platform>/`. Electron apps must unpack it from the ASAR archive (e.g. `asarUnpack: node_modules/@seydx/**`).
+- `SKIP_FFMPEG` is gone, and node-av no longer depends on `unzipper`.
+
+#### FFmpeg 8.1.3 from jellyfin-ffmpeg instead of an FFmpeg development snapshot
+
+The bundled FFmpeg moves from an FFmpeg master snapshot (June 2026) to jellyfin-ffmpeg 8.1.3 and its patch set. Every prebuild now builds this one source with the same patches and dependency versions, including the Windows MSVC builds. 8.1.3 carries the 8.1 branch's backported fixes, among them security fixes the snapshot lacked (mov/mpegts bounds checks, HEVC WPP, RTSP credentials on redirect, …). It does not carry the features that only existed on FFmpeg master.
+
+`ffmpegVersion()` returns `'8.1.3'` instead of `'8.1'`. `getFFmpegInfo()` reports lower library versions than 6.2.0 (e.g. libavcodec 62.28 instead of 62.36), because the snapshot was ahead of the 8.1 branch.
+
+Removed together with the master-only features:
+
+- **Constants:**
+  - the swscale ops API: `SWS_UOP_*`, `SWS_OP_FILTER_H`/`_V`, `SWS_RW_*`, `SWS_BACKEND_GLSL`, `SWS_BACKEND_MAX_ENUM`
+  - frame and packet side data: `AV_FRAME_DATA_IAMF_*_PARAM`, `AV_FRAME_DATA_RAW_COLOR_PARAMS` with `AV_RAW_COLOR_PARAMS_*`, `AV_FRAME_DATA_DYNAMIC_HDR_SMPTE_2094_APP5`, `AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5`, `AV_PKT_DATA_HEVC_CONF`
+  - stream groups: `AV_STREAM_GROUP_PARAMS_DOLBY_VISION`, `AV_STREAM_GROUP_PARAMS_TREF`
+  - codec IDs: `AV_CODEC_ID_APPLE_APAC`, `AV_CODEC_ID_WEBP_ANIM`
+  - flags: `AVFMT_FIXED_FRAMESIZE`, `AV_CODEC_FLAG2_FIXED_FRAME_SIZE`, `AVFMT_PROGCOPY_*`, `AV_CPU_FLAG_EOR3`, `AV_CPU_FLAG_PMULL`
+- **Components:**
+  - the `pdv` encoder and muxer (`FF_ENCODER_PDV`)
+  - the `webp_anim` decoder and demuxer (`FF_DECODER_WEBP_ANIM`)
+  - the `frc_amf` and `v360_vulkan` filters
+  - the `dovi_split` bitstream filter
+- **Options:**
+  - `whisper`: `translate`
+  - `aac`/`aac_fixed`: `target_level`
+  - `libopus`: `dtx`
+  - `h264_d3d12va`/`hevc_d3d12va`: `constrained_intra_pred`
+  - `ffv1_vulkan`: `remap_mode`
+  - `overlay_vaapi`: `alpha_format`
+  - `vpp_amf`: the `in_*`/`out_*` color options
+  - `dash`: `availability_start_time_ms`, `suggested_presentation_delay`
+  - `whip`: `timeout`
+
+#### Constant values that changed
+
+`AV_HWDEVICE_TYPE_RKMPP`, `AV_HWDEVICE_TYPE_AMF` and `AV_HWDEVICE_TYPE_OHCODEC` are now 15, 13 and 14 (were 13, 14 and 15). `AV_PKT_DATA_RTP_TIMESTAMP` is now 41 (was 43). Code that uses the constants by name is unaffected. Numeric values stored or sent elsewhere must be updated.
+
+#### NVENC uses SDK 12.0: driver 520/522 instead of 610, without SDK 12.1+ features
+
+The NVENC headers move from SDK 13.1 to SDK 12.0, as in jellyfin-ffmpeg. NVENC now opens on drivers from 520.56 (Linux) and 522.25 (Windows). In 6.2.0, every `*_nvenc` encoder failed below driver 610 with "Driver does not support the required nvenc API version", so NVENC returns on older and stable-branch drivers (e.g. a GTX 1080 on 582).
+
+Not available in SDK 12.0, and no longer part of the encoders' option types:
+
+- split-frame encoding (`split_encode_mode`)
+- temporal filtering (`tf_level`)
+- `lookahead_level`
+- UHQ tuning (`tune: 'uhq'`)
+- unidirectional B-frames (`unidir_b`)
+- 10-bit and 4:2:2 H.264 (`highbitdepth`, `high10`, `high422`) and the `highbitdepth` option of `hevc_nvenc`
+- MV-HEVC (`mv`)
+- HEVC/AV1 mastering display metadata
+
+#### `scale_opencl` has no crop options
+
+The `cw`, `ch`, `cx` and `cy` options of `scale_opencl` came from a node-av FFmpeg patch that is gone: jellyfin's `scale_opencl` applies the frame's crop fields itself. `FilterPreset.crop()` on OpenCL now emits `crop=w:h:x:y,scale_opencl=w:h`, and `Scaler` follows. Filter strings that pass the options directly must crop first.
+
+**Migration:**
+
+```typescript
+// Before
+'scale_opencl=cw=1280:ch=720:cx=320:cy=180'
+
+// After
+'crop=1280:720:320:180,scale_opencl=1280:720'
+```
+
+### Added
+
+- **Prebuilt binaries for musl Linux (Alpine)** ([#280](https://github.com/seydx/node-av/issues/280)). node-av and `@seydx/node-av-ffmpeg` now install on Alpine and other musl distributions (x64 and arm64), from the new packages `@seydx/node-av-linux-{arm64,x64}-musl` and `@seydx/node-av-ffmpeg-linux-{arm64,x64}-musl`. They are built from the same FFmpeg with the same codecs, filters and hardware APIs as the glibc builds. NVIDIA (CUDA, NVENC, NVDEC) and AMD AMF are unavailable on musl, because their drivers exist only for glibc. VAAPI, QSV and Vulkan need the drivers from Alpine's packages (e.g. `mesa-va-gallium`, `intel-media-driver`, `onevpl-intel-gpu`, `vulkan-loader`). The Linux packages now declare their C library, so npm and pnpm install only the matching one. To install the musl binaries from a glibc system (e.g. for an Alpine image), pass `--libc=musl`.
+- **VAAPI on Linux arm64.** The Linux arm64 prebuilds link VA-API like the x64 ones, so `HardwareContext.create(AV_HWDEVICE_TYPE_VAAPI)` and the `*_vaapi` codecs and filters work on arm64 boards with a VA-API driver.
+- **`DeviceMode.codecId` identifies compressed capture modes** ([#349](https://github.com/seydx/node-av/issues/349)). MJPEG and H.264 (and HEVC on Linux) camera modes reported `pixelFormat: AV_PIX_FMT_NONE` and nothing else, so they couldn't be told apart. Raw modes now report `AV_CODEC_ID_RAWVIDEO` next to their pixel format, compressed modes their codec (`avGetCodecName(mode.codecId)` → `'mjpeg'`). On Windows, modes described by a `VIDEOINFOHEADER2` are listed too.
+- **`AV_PROFILE_DTS_HD_HRA_X`, `AV_PROFILE_DTS_HD_HRA_X_IMAX` and `FF_DECODER_LIBCELT`.**
+
+### Performance
+
+- **HEVC software decoding is about 13 % faster** per thread (4K on Apple Silicon: ~128 → ~148 fps single-threaded, about 9 % less CPU multithreaded), from FFmpeg master's residual decoding and deblocking improvements. Output is bit-identical; the HEVC conformance suite passes.
+- **Hardware frame downloads reuse their buffers.** `av_hwframe_transfer_data()` into an empty frame (used by the `Decoder` and `Scaler` when they move hardware frames to system memory) now takes the buffer from a pool instead of allocating it per frame. Per download: CUDA on a GTX 1080 (Windows) 1.8 → 0.9 ms at 1080p and 6.2 → 2.5 ms at 4K, D3D11VA 1.8 → 1.1 ms and 6.9 → 3.9 ms, VAAPI on an Intel N100 7.0 → 3.3 ms at 1080p (4K unchanged). macOS's allocator already cached these buffers, so it shows no difference there.
+
+### Changed
+
+- **Codec constants carry the right media type.** 13 encoders and 67 decoders were typed as video. Among them are audio codecs like `libgsm`, `libopencore_amrnb`, `libshine`, `ape` and `als`, and subtitle codecs like `mov_text`. `Encoder.create()`/`Decoder.create()` now type the options for what the codec really is.
+- **Option types match what FFmpeg reports at runtime.** The generators now expand macro-built option tables and resolve classes and option arrays across files. The output is checked against a runtime dump of the build.
+  - Many hardware codecs gained option types (`*_cuvid`, `*_qsv`, `*_rkmpp`, `*_v4l2m2m`, `*_mediacodec`, `*_amf`, …), as did raw, PCM and image-pipe formats and filters such as `vpp_qsv`, `scale_qsv`, the `*_d3d11` and `*_videotoolbox` filters, the biquad audio filters and `lut*`.
+  - Options that never existed are gone: `noise`'s `all`/`c0`–`c3` (really `all_seed`, `c0_strength`, …), `selectivecolor`'s `red`, `green`, … (really `reds`, `greens`, …), framesync options on `lut3d` and `tblend`, and `file` on `haldclut`.
+- **`MuxerFormat` and `DemuxerFormat` list every format.** 21 muxers and 75 demuxers were missing: PCM, raw bitstreams like `h264`, `hevc` and `mjpeg`, and the image pipes.
+- **The bundled Windows `ffmpeg.exe` has an application icon** (jellyfin's `fftools.ico`).
+
+### Fixed
+
+- **The `whisper` filter no longer crashes the process on Linux systems without a Vulkan loader** (`libvulkan.so.1`), e.g. Docker containers without a GPU stack. Transcribing there (`WhisperTranscriber` or the filter directly) ended in a segmentation fault, even with GPU use disabled. ggml now skips its Vulkan backend when no loader is found and transcribes on the CPU.
+- **Closing an RTSP input sends TEARDOWN.** `Demuxer.close()` interrupts pending I/O first, which also aborted the TEARDOWN, so cameras kept the session alive until it timed out (60 s with mediamtx over UDP) and could reject an immediate reconnect with "453 Not Enough Bandwidth". The TEARDOWN is now sent and its reply read within 500 ms.
+- **RTP/RTSP depacketizer fixes from FFmpeg master:** MPEG-TS over RTP no longer loses data after a reordered packet, RTCP receiver reports clamp cumulative loss correctly, SRTP setup errors are reported, and malformed H.264 framesize, Opus and AV1 payloads and SampleRate attributes are rejected. Redirects are limited.
+- **H.264 streams with lost frames decode better with hardware decoding.** Frames filling a `frame_num` gap had invalid field POCs and lacked the hardware decoder state of the frame they duplicate, so frames referencing them decoded wrong. With VAAPI on an Intel N100, 551 instead of 403 of 878 frames of a test stream with dropped frames now match the software decoder. NVIDIA (NVDEC, D3D11VA) was barely affected.
+- **HEVC deblocking and chroma SAO fixes** for deblocking offsets taken from the wrong CTB and chroma SAO with 16×16 CTBs.
+- **`h264_videotoolbox`/`hevc_videotoolbox` no longer crash when opened again in the same process** after encoding a transfer characteristic CoreVideo has no constant for (e.g. V-Log). Also fixes a double free when a frame submission fails, leaks when frames are dropped or on error paths, and timestamps when VideoToolbox returns another timescale.
+
+## [6.2.0] - 2026-11-01
 
 ### Performance
 

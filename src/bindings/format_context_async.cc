@@ -481,7 +481,7 @@ Napi::Value FormatContext::CloseInputAsync(const Napi::CallbackInfo& info) {
 
   // Here, not in the worker: the wrappers are read on this thread, so after
   // this no JS access can reach the context the worker frees
-  borrowers_->InvalidateAll();
+  InvalidateBorrowers();
   ReleasePbIO(!detachPb && ClosesPb());
 
   FormatContext* self = this;
@@ -577,7 +577,7 @@ Napi::Value FormatContext::DisposeAsync(const Napi::CallbackInfo& info) {
     }
 
     // On this thread, before the worker frees the context (see CloseInputAsync)
-    borrowers_->InvalidateAll();
+    InvalidateBorrowers();
     ReleasePbIO(ClosesPb());
 
     FormatContext* self = this;
@@ -714,6 +714,11 @@ Napi::Value FormatContext::SendRTSPPacketAsync(const Napi::CallbackInfo& info) {
       // TCP: Send with interleaved header over RTSP connection
       if (!rt->rtsp_hd) {
         return AVERROR(ENOTSUP); // No TCP connection
+      }
+
+      // The interleaved header carries the length in 16 bits
+      if (rtpData->size() > 0xFFFF) {
+        return AVERROR(EINVAL);
       }
 
       // Build interleaved packet: $ + channel_id + length (2 bytes) + RTP data

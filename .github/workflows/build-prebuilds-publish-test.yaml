@@ -1,0 +1,226 @@
+name: "🧪 Build and Test Publish Release"
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_version:
+        description: "Test version to use (e.g., 0.0.99-test.1)"
+        required: true
+        default: "0.0.99-test.1"
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-prebuilds.yaml
+    permissions:
+      contents: read
+      actions: write
+
+  package-and-publish:
+    name: "Package and Publish"
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # Fetch all history for tags
+          submodules: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: npm install --ignore-scripts
+
+      - name: Build TypeScript
+        run: npm run build:tsc
+
+      - name: Download all prebuilds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: prebuild-*
+          path: prebuilds-artifacts
+
+      - name: Download FFmpeg binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ffmpeg-v*
+          path: ffmpeg-binaries
+
+      - name: Prepare prebuilds structure
+        run: |
+          mkdir -p prebuilds
+
+          # Copy all prebuilds to a single directory structure, one folder per
+          # variant and platform (linux-x64, lgpl-linux-x64, light-linux-x64, ...)
+          for dir in prebuilds-artifacts/*/; do
+            cp -r "$dir"* prebuilds/
+          done
+
+          echo "Combined prebuilds structure:"
+          ls -laR prebuilds/
+
+      - name: Create platform packages
+        run: |
+          # Creates the packages of every variant and copies the prebuilds and
+          # FFmpeg binaries in; fails if one is missing
+          node scripts/create-platform-packages.js "${{ github.event.inputs.test_version }}" \
+            --prebuilds prebuilds \
+            --ffmpeg-binaries ffmpeg-binaries
+
+          echo "Platform packages created:"
+          ls -la packages/
+          for pkg in packages/*/; do
+            echo "Contents of $pkg:"
+            ls -la "$pkg"
+          done
+
+      - name: Update version
+        run: |
+          # Use test version from input
+          VERSION="${{ github.event.inputs.test_version }}"
+          echo "Test Version: $VERSION"
+
+          # Check if main package needs version update
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          if [ "$CURRENT_VERSION" != "$VERSION" ]; then
+            echo "Updating main package version from $CURRENT_VERSION to $VERSION"
+            npm version $VERSION --no-git-tag-version
+          else
+            echo "Main package already at version $VERSION"
+          fi
+
+          # Update platform package versions
+          for pkg in packages/*/package.json; do
+            if [ -f "$pkg" ]; then
+              cd $(dirname "$pkg")
+              PKG_VERSION=$(node -p "require('./package.json').version")
+              if [ "$PKG_VERSION" != "$VERSION" ]; then
+                echo "Updating $(basename $(dirname "$pkg")) from $PKG_VERSION to $VERSION"
+                npm version $VERSION --no-git-tag-version
+              else
+                echo "$(basename $(dirname "$pkg")) already at version $VERSION"
+              fi
+              cd -
+            fi
+          done
+
+      - name: Create release archives (TEST)
+        run: |
+          # Create archives for each variant and platform
+          VERSION="${{ github.event.inputs.test_version }}"
+          for dir in prebuilds/*/; do
+            platform=$(basename "$dir")
+            zip -r "node-av-${platform}-${VERSION}.zip" "prebuilds/$platform"
+            echo "Created: node-av-${platform}-${VERSION}.zip"
+          done
+
+          # Copy FFmpeg binaries to root for release
+          if [ -d "ffmpeg-binaries" ]; then
+            echo "Copying FFmpeg binaries for release:"
+            for ffmpeg_dir in ffmpeg-binaries/*/; do
+              if [ -d "$ffmpeg_dir" ]; then
+                # Extract the artifact name from directory
+                artifact_name=$(basename "$ffmpeg_dir")
+                echo "Processing FFmpeg artifact: $artifact_name"
+
+                # Create zip files for each FFmpeg binary
+                if [ -d "$ffmpeg_dir" ] && [ "$(ls -A "$ffmpeg_dir")" ]; then
+                  cd "$ffmpeg_dir"
+                  zip -r "../../${artifact_name}" *
+                  cd ../..
+                  echo "Created: ${artifact_name}"
+                fi
+              fi
+            done
+          fi
+
+          echo "All release archives created:"
+          ls -la *.zip
+
+      - name: Generate test release notes with commit history
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Get the most recent tag
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+          # Build the test release notes, packages in publish order
+          VERSION="${{ github.event.inputs.test_version }}"
+          {
+            echo "## node-av Test Release $VERSION"
+            echo ""
+            echo "### 📦 Test Packages (NOT PUBLISHED)"
+            echo ""
+            echo "The following packages would be updated to $VERSION:"
+            for dir in $(jq -r '.[][]' packages/publish-order.json); do
+              echo "- $(jq -r .name "$dir/package.json")@$VERSION"
+            done
+          } > test_release_notes.md
+
+          # Add recent commits since last tag
+          if [ -n "$LATEST_TAG" ]; then
+            echo "" >> test_release_notes.md
+            echo "### 📝 Recent changes since $LATEST_TAG" >> test_release_notes.md
+            echo "" >> test_release_notes.md
+
+            CHANGES=$(gh api --paginate "repos/${{ github.repository }}/compare/${LATEST_TAG}...HEAD" \
+              --jq '.commits[] | "- \(.commit.message | split("\n")[0]) (\(.sha[:7])) - \(if .author then "@\(.author.login)" else (.commit.author.name | if test("^[A-Za-z0-9-]+$") then "@\(.)" else . end) end)"' 2>/dev/null | tac)
+            if [ -n "$CHANGES" ]; then
+              echo "$CHANGES" >> test_release_notes.md
+            else
+              git log --pretty=format:"- %s (%h) - %an" "$LATEST_TAG..HEAD" >> test_release_notes.md
+            fi
+          else
+            echo "" >> test_release_notes.md
+            echo "### 📝 Recent changes" >> test_release_notes.md
+            echo "" >> test_release_notes.md
+
+            # Get last 20 commits if no tags exist (author name only; no GitHub
+            # login resolution without a base for the compare API)
+            git log --pretty=format:"- %s (%h) - %an" -20 >> test_release_notes.md
+          fi
+
+      - name: Test GitHub Release (DRY RUN)
+        run: |
+          echo "🧪 TEST MODE: Would create GitHub Release"
+          echo "============================================"
+          echo "Release Title: node-av Test Release ${{ github.event.inputs.test_version }}"
+          echo ""
+          echo "Release Body:"
+          cat test_release_notes.md
+          echo ""
+          echo "Artifacts that would be uploaded:"
+          ls -la *.zip
+
+      - name: Test NPM Publish (DRY RUN)
+        run: |
+          echo "🧪 TEST MODE: Running npm publish with --dry-run"
+          echo "================================================"
+          echo ""
+
+          # Clean up artifacts that shouldn't be in the main package
+          rm -rf prebuilds-artifacts
+          rm -f *.zip
+
+          # Same stages as the release, platform packages first, each stage in parallel
+          dry_run() {
+            local output status=0
+            output=$(cd "$1" && npm publish --access public --dry-run --tag test 2>&1) || status=$?
+            printf '::group::📦 %s\n%s\n::endgroup::\n' "$(jq -r .name "$1/package.json")" "$output"
+            [ "$status" -eq 0 ] || printf '::error::Dry run failed for %s\n' "$(jq -r .name "$1/package.json")"
+            return "$status"
+          }
+          export -f dry_run
+
+          for stage in $(jq -r 'keys[]' packages/publish-order.json); do
+            jq -r ".[$stage][]" packages/publish-order.json | xargs -P 6 -n 1 bash -c 'dry_run "$1"' _
+          done
+
+          echo ""
+          echo "✅ Dry run completed successfully!"
+          echo "No packages were actually published to NPM."

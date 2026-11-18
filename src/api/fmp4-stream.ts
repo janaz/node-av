@@ -13,7 +13,6 @@ import { FF_ENCODER_AAC, FF_ENCODER_LIBOPUS, FF_ENCODER_LIBX264 } from '../const
 import { Codec } from '../lib/codec.js';
 import { Rational } from '../lib/rational.js';
 import { avGetCodecString, avGetMediaTypeString } from '../lib/utilities.js';
-import { Decoder } from './decoder.js';
 import { Demuxer } from './demuxer.js';
 import { Encoder } from './encoder.js';
 import { FilterPreset } from './filter-presets.js';
@@ -21,12 +20,14 @@ import { FilterAPI } from './filter.js';
 import { HardwareContext } from './hardware.js';
 import { Muxer } from './muxer.js';
 import { consumeStreamInParallel, interruptibleFrameSource, pipeline, PipelineControlImpl } from './pipeline.js';
+import { openAudioDecoder } from './utilities/audio-transcode.js';
 import { configureLiveDecoderThreading } from './utilities/live-decoding.js';
 import { PacketAgeWatchdog } from './utilities/packet-age-watchdog.js';
 import { transcodeScale } from './utilities/scale-size.js';
 import { applyVideoBitrate, createVideoTranscodeFilter, findUsableHardwareEncoder, openTranscodeDecoder } from './utilities/video-transcode.js';
 
 import type { AVCodecID, AVHWDeviceType, FFHWDeviceType } from '../constants/index.js';
+import type { Decoder } from './decoder.js';
 import type { DemuxerOptions } from './demuxer.js';
 import type { EncoderOptions } from './encoder.js';
 import type { IOOutputCallbacks } from './io-stream.js';
@@ -920,8 +921,7 @@ export class FMP4Stream {
       const { codecpar } = videoStream;
       const scale = transcodeScale(codecpar.width, codecpar.height, this.options.video.width, this.options.video.height);
       // a GPU encodes up to a size of its own, test it with the size it will get
-      const encoderCodec =
-        (await findUsableHardwareEncoder(this.hardwareContext, 'h264', this.options.video.encoderOptions, scale.output)) ?? Codec.findEncoderByName(FF_ENCODER_LIBX264)!;
+      const encoderCodec = (await findUsableHardwareEncoder(this.hardwareContext, 'h264', this.options.video.encoderOptions, scale.output)) ?? this.softwareH264Encoder();
       this.throwIfStopRequested();
 
       this.videoDecoder = await openTranscodeDecoder(videoStream, this.hardwareContext, {
@@ -975,7 +975,7 @@ export class FMP4Stream {
     const needsAudioTranscode = audioStream && !this.isAudioCodecSupported(audioStream.codecpar.codecId);
 
     if (needsAudioTranscode) {
-      this.audioDecoder = await Decoder.create(audioStream, {
+      this.audioDecoder = await openAudioDecoder(audioStream, {
         exitOnError: false,
       });
 
@@ -1005,6 +1005,23 @@ export class FMP4Stream {
     if (this.stopRequested) {
       throw new Error('FMP4Stream stopped during start');
     }
+  }
+
+  /**
+   * libx264, the encoder for H.264 output when no hardware encoder is usable.
+   *
+   * @returns The libx264 encoder
+   *
+   * @throws {Error} If the FFmpeg build has no libx264 (node-av-lgpl)
+   *
+   * @internal
+   */
+  private softwareH264Encoder(): Codec {
+    const codec = Codec.findEncoderByName(FF_ENCODER_LIBX264);
+    if (!codec) {
+      throw new Error('No H.264 encoder available: no usable hardware encoder and this FFmpeg build has no libx264 (node-av-lgpl encodes H.264 only in hardware)');
+    }
+    return codec;
   }
 
   /**
@@ -1214,8 +1231,7 @@ export class FMP4Stream {
         this.hardwareContext = HardwareContext.create(this.options.hardware.deviceType, this.options.hardware.device, this.options.hardware.options);
       }
 
-      const encoderCodec =
-        (await findUsableHardwareEncoder(this.hardwareContext, 'h264', this.options.video.encoderOptions)) ?? Codec.findEncoderByName(FF_ENCODER_LIBX264)!;
+      const encoderCodec = (await findUsableHardwareEncoder(this.hardwareContext, 'h264', this.options.video.encoderOptions)) ?? this.softwareH264Encoder();
       this.throwIfStopRequested();
 
       let encoderOptions: EncoderOptions['options'] = {};
@@ -1394,25 +1410,29 @@ export class FMP4Stream {
       this.output = undefined;
       this.packetAgeWatchdog = undefined;
 
-      this.videoDecoder?.close();
-      this.videoDecoder = undefined;
-      this.videoFilter?.close();
-      this.videoFilter = undefined;
-      this.videoEncoder?.close();
-      this.videoEncoder = undefined;
+      // A codec that refuses to close (still busy) must not leave the input,
+      // an RTSP connection, open.
+      try {
+        this.videoDecoder?.close();
+        this.videoDecoder = undefined;
+        this.videoFilter?.close();
+        this.videoFilter = undefined;
+        this.videoEncoder?.close();
+        this.videoEncoder = undefined;
 
-      this.audioDecoder?.close();
-      this.audioDecoder = undefined;
-      this.audioFilter?.close();
-      this.audioFilter = undefined;
-      this.audioEncoder?.close();
-      this.audioEncoder = undefined;
+        this.audioDecoder?.close();
+        this.audioDecoder = undefined;
+        this.audioFilter?.close();
+        this.audioFilter = undefined;
+        this.audioEncoder?.close();
+        this.audioEncoder = undefined;
 
-      this.hardwareContext?.dispose();
-      this.hardwareContext = undefined;
-
-      await this.input?.close();
-      this.input = undefined;
+        this.hardwareContext?.dispose();
+        this.hardwareContext = undefined;
+      } finally {
+        await this.input?.close();
+        this.input = undefined;
+      }
 
       // Reset parser and init segment state so a restart parses a clean stream.
       this.incompleteBoxBuffer = null;

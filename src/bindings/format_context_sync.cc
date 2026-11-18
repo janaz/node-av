@@ -59,6 +59,9 @@ Napi::Value FormatContext::ReadFrameSync(const Napi::CallbackInfo& info) {
 
   // av_read_frame fills the packet's buffer internally; reconcile V8 accounting.
   if (result >= 0) {
+    int repeatPict = ParserRepeatPict(ctx_, packet->Get());
+    packet->SetParserRepeatPict(repeatPict);
+    RecordParserRepeatPict(packet->Get()->stream_index, repeatPict);
     packet->SyncExternalMemory(env);
   }
 
@@ -438,7 +441,7 @@ Napi::Value FormatContext::CloseInputSync(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  borrowers_->InvalidateAll();
+  InvalidateBorrowers();
   ReleasePbIO(!detachPb && ClosesPb());
 
   // Detach a caller-owned pb only now: until the guard above waited for it, an
@@ -667,6 +670,11 @@ Napi::Value FormatContext::SendRTSPPacketSync(const Napi::CallbackInfo& info) {
     // TCP: Send with interleaved header over RTSP connection
     if (!rt->rtsp_hd) {
       return Napi::Number::New(env, AVERROR(ENOTSUP)); // No TCP connection
+    }
+
+    // The interleaved header carries the length in 16 bits
+    if (len > 0xFFFF) {
+      return Napi::Number::New(env, AVERROR(EINVAL));
     }
 
     // Build interleaved packet: $ + channel_id + length (2 bytes) + RTP data

@@ -1,0 +1,278 @@
+name: "🚀 Build and Publish Release"
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-prebuilds.yaml
+    permissions:
+      contents: read
+      actions: write
+
+  package-and-publish:
+    name: "Package and Publish"
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # Fetch all history for tags
+          submodules: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      # Trusted publishing (OIDC, no token) needs npm >= 11.5.1
+      - name: Update npm
+        run: npm install -g npm@11
+
+      - name: Install dependencies
+        run: npm install --ignore-scripts
+
+      - name: Build TypeScript
+        run: npm run build:tsc
+
+      - name: Download all prebuilds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: prebuild-*
+          path: prebuilds-artifacts
+
+      - name: Download FFmpeg binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ffmpeg-v*
+          path: ffmpeg-binaries
+
+      - name: Prepare prebuilds structure
+        run: |
+          mkdir -p prebuilds
+
+          # Copy all prebuilds to a single directory structure, one folder per
+          # variant and platform (linux-x64, lgpl-linux-x64, light-linux-x64, ...)
+          for dir in prebuilds-artifacts/*/; do
+            cp -r "$dir"* prebuilds/
+          done
+
+          echo "Combined prebuilds structure:"
+          ls -laR prebuilds/
+
+      - name: Create platform packages
+        run: |
+          # Creates the packages of every variant (scripts/ffmpeg-variant.js): the
+          # native platform packages, the FFmpeg CLI packages, and the node-av-lgpl
+          # and node-av-light main packages from dist/. Copies the node-av.node
+          # prebuilds and FFmpeg binaries in and fails if one is missing.
+          node scripts/create-platform-packages.js "${GITHUB_REF#refs/tags/v}" \
+            --prebuilds prebuilds \
+            --ffmpeg-binaries ffmpeg-binaries
+
+          echo "Platform packages created:"
+          ls -la packages/
+          for pkg in packages/*/; do
+            echo "Contents of $pkg:"
+            ls -la "$pkg"
+          done
+
+      - name: Update version
+        run: |
+          # Extract version from tag
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "Version: $VERSION"
+
+          # Check if main package needs version update
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          if [ "$CURRENT_VERSION" != "$VERSION" ]; then
+            echo "Updating main package version from $CURRENT_VERSION to $VERSION"
+            npm version $VERSION --no-git-tag-version
+          else
+            echo "Main package already at version $VERSION"
+          fi
+
+          # Update platform package versions
+          for pkg in packages/*/package.json; do
+            if [ -f "$pkg" ]; then
+              cd $(dirname "$pkg")
+              PKG_VERSION=$(node -p "require('./package.json').version")
+              if [ "$PKG_VERSION" != "$VERSION" ]; then
+                echo "Updating $(basename $(dirname "$pkg")) from $PKG_VERSION to $VERSION"
+                npm version $VERSION --no-git-tag-version
+              else
+                echo "$(basename $(dirname "$pkg")) already at version $VERSION"
+              fi
+              cd -
+            fi
+          done
+
+      - name: Create release archives
+        run: |
+          # Create archives for each variant and platform (node-av-linux-x64-v7.1.0.zip,
+          # node-av-lgpl-linux-x64-v7.1.0.zip, ...)
+          for dir in prebuilds/*/; do
+            platform=$(basename "$dir")
+            zip -r "node-av-${platform}-${GITHUB_REF#refs/tags/}.zip" "prebuilds/$platform"
+            echo "Created: node-av-${platform}-${GITHUB_REF#refs/tags/}.zip"
+          done
+
+          # Copy FFmpeg binaries to root for release
+          if [ -d "ffmpeg-binaries" ]; then
+            echo "Copying FFmpeg binaries for release:"
+            for ffmpeg_dir in ffmpeg-binaries/*/; do
+              if [ -d "$ffmpeg_dir" ]; then
+                # Extract the artifact name from directory
+                artifact_name=$(basename "$ffmpeg_dir")
+                echo "Processing FFmpeg artifact: $artifact_name"
+
+                # Create zip files for each FFmpeg binary
+                if [ -d "$ffmpeg_dir" ] && [ "$(ls -A "$ffmpeg_dir")" ]; then
+                  cd "$ffmpeg_dir"
+                  zip -r "../../${artifact_name}" *
+                  cd ../..
+                  echo "Created: ${artifact_name}"
+                fi
+              fi
+            done
+          fi
+
+          echo "All release archives created:"
+          ls -la *.zip
+
+          # Checksums over all release zips
+          sha256sum *.zip > SHA256SUMS
+          echo "SHA256SUMS:"
+          cat SHA256SUMS
+
+      - name: Generate release notes from CHANGELOG
+        id: release_notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Extract version without 'v' prefix
+          VERSION="${{ github.ref_name }}"
+          VERSION_NO_V="${VERSION#v}"
+
+          # Check if this is a beta release
+          IS_BETA="false"
+          if [[ "$VERSION_NO_V" == *"-beta."* ]]; then
+            IS_BETA="true"
+            # Extract base version (e.g., 5.2.0 from 5.2.0-beta.1)
+            BASE_VERSION="${VERSION_NO_V%%-beta.*}"
+          fi
+
+          # Start building the release body
+          echo "" > release_notes.md
+
+          # Beta warning at the top
+          if [ "$IS_BETA" = "true" ]; then
+            echo "> ⚠️ This is a pre-release version for testing. Install with: \`npm install node-av@beta\`" >> release_notes.md
+            echo "" >> release_notes.md
+          fi
+
+          # Extract the specific version section from CHANGELOG.md (only for stable releases)
+          if [ "$IS_BETA" = "false" ] && [ -f "CHANGELOG.md" ]; then
+            VERSION_CONTENT=$(sed -n "/## \[${VERSION_NO_V}\]/,/## \[/p" CHANGELOG.md | sed '$d')
+            if [ -n "$VERSION_CONTENT" ]; then
+              echo "$VERSION_CONTENT" | tail -n +2 >> release_notes.md
+              echo "" >> release_notes.md
+            fi
+          fi
+
+          # Find the previous stable tag (not a beta tag) for commit history
+          # Get all stable tags sorted, exclude the current tag, then get the last one
+          PREVIOUS_STABLE_TAG=$(git tag -l 'v*' | grep -v '\-beta\.' | sort -V | grep -v "^${{ github.ref_name }}$" | tail -1)
+          echo "Previous stable tag: $PREVIOUS_STABLE_TAG"
+
+          if [ -n "$PREVIOUS_STABLE_TAG" ]; then
+            echo "### 📋 All Changes since $PREVIOUS_STABLE_TAG" >> release_notes.md
+            echo "" >> release_notes.md
+            CHANGES=$(gh api --paginate "repos/${{ github.repository }}/compare/${PREVIOUS_STABLE_TAG}...${{ github.ref_name }}" \
+              --jq '.commits[] | "- \(.commit.message | split("\n")[0]) (\(.sha[:7])) - \(if .author then "@\(.author.login)" else (.commit.author.name | if test("^[A-Za-z0-9-]+$") then "@\(.)" else . end) end)"' 2>/dev/null | tac)
+            if [ -n "$CHANGES" ]; then
+              echo "$CHANGES" >> release_notes.md
+            else
+              git log --pretty=format:"- %s (%h) - %an" "$PREVIOUS_STABLE_TAG..${{ github.ref_name }}" >> release_notes.md
+            fi
+            echo "" >> release_notes.md
+          fi
+
+          # Packages at the end, in publish order (scripts/create-platform-packages.js)
+          {
+            echo ""
+            echo "### 📦 Packages"
+            echo ""
+            echo "The following packages have been updated to v$VERSION_NO_V:"
+            for dir in $(jq -r '.[][]' packages/publish-order.json); do
+              echo "- \`$(jq -r .name "$dir/package.json")@$VERSION_NO_V\`"
+            done
+          } >> release_notes.md
+
+          # Output the release notes
+          cat release_notes.md
+
+      - name: Determine NPM tag
+        id: npm_tag
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "Version: $VERSION"
+
+          # Determine NPM dist-tag based on version
+          if [[ "$VERSION" == *"-beta."* ]]; then
+            echo "tag=beta" >> $GITHUB_OUTPUT
+            echo "NPM tag: beta"
+          else
+            echo "tag=latest" >> $GITHUB_OUTPUT
+            echo "NPM tag: latest"
+          fi
+
+      # Trusted publishing: npm exchanges the job's OIDC token (id-token: write)
+      # for a publish token, so no NPM_TOKEN is needed. Every package needs a
+      # trusted publisher on npmjs.com for this workflow file.
+      - name: Publish to NPM
+        env:
+          NPM_TAG: ${{ steps.npm_tag.outputs.tag }}
+        run: |
+          echo "Publishing with tag: $NPM_TAG"
+
+          # Skips versions that are already on npm, so a failed run can be re-run. The
+          # publishes run in parallel, so each one prints its output in one block at the end
+          publish() {
+            local name version output status=0
+            name=$(node -p "require('./$1/package.json').name")
+            version=$(node -p "require('./$1/package.json').version")
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "$name@$version is already published, skipping"
+              return
+            fi
+            output=$(cd "$1" && npm publish --access public --tag "$NPM_TAG" --provenance 2>&1) || status=$?
+            if [ "$status" -eq 0 ]; then
+              printf '::group::Published %s\n%s\n::endgroup::\n' "$name@$version" "$output"
+            else
+              printf '::group::Failed to publish %s\n%s\n::endgroup::\n::error::Failed to publish %s\n' "$name@$version" "$output" "$name@$version"
+            fi
+            return "$status"
+          }
+          export -f publish
+
+          # Platform packages first, then the packages that pin them. A stage starts only
+          # when every package of the one before is on npm (xargs fails the step otherwise),
+          # so a main package never goes out without its platform packages
+          for stage in $(jq -r 'keys[]' packages/publish-order.json); do
+            jq -r ".[$stage][]" packages/publish-order.json | xargs -P 6 -n 1 bash -c 'publish "$1"' _
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            *.zip
+            SHA256SUMS
+          body_path: release_notes.md
+          prerelease: ${{ steps.npm_tag.outputs.tag == 'beta' }}

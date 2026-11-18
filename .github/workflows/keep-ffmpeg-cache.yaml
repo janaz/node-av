@@ -1,0 +1,80 @@
+name: "♻️ Keep FFmpeg caches alive"
+
+on:
+  schedule:
+    - cron: "0 4 */5 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  touch:
+    name: "Restore ${{ matrix.platform }}${{ matrix.variant }}"
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Cache key suffix of the variants (scripts/ffmpeg-variant.js), empty for gpl.
+        # windows: MinGW builds are discontinued, MSVC uses a prebuilt FFmpeg
+        variant: ["", -lgpl, -light]
+        platform: [linux-x64, linux-arm64, linux-x64-musl, linux-arm64-musl, macos-x64, macos-arm64]
+        include:
+          - platform: linux-x64
+            runner: ubuntu-latest
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: linux-x64-musl
+            runner: ubuntu-latest
+          - platform: linux-arm64-musl
+            runner: ubuntu-24.04-arm
+          - platform: macos-x64
+            runner: macos-26
+          - platform: macos-arm64
+            runner: macos-26
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Derive key from build-prebuilds.yaml
+        id: key
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          WORKFLOW=.github/workflows/build-prebuilds.yaml
+          value() { grep -E "^  $1: \"" "$WORKFLOW" | head -1 | sed -E 's/.*: "([^"]*)".*/\1/'; }
+          LINUX=$(value CACHE_VERSION_LINUX)
+          MACOS=$(value CACHE_VERSION_MACOS)
+          XCODE=$(value XCODE_VERSION)
+          # the submodule pointer is part of the tree, no submodule checkout needed
+          HASH=$(git ls-tree HEAD --object-only externals/jellyfin-ffmpeg)
+          for v in LINUX MACOS XCODE HASH; do
+            [ -n "${!v}" ] || { echo "::error::could not derive $v"; exit 1; }
+          done
+          if [[ $PLATFORM == macos-* ]]; then
+            echo "key=ffmpeg-${PLATFORM}${VARIANT}-${MACOS}-xcode${XCODE}-${HASH}" | tee -a "$GITHUB_OUTPUT"
+          else
+            echo "key=ffmpeg-${PLATFORM}${VARIANT}-${LINUX}-${HASH}" | tee -a "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare directory
+        run: |
+          sudo mkdir -p /opt/ffbuild/prefix
+          sudo chown -R "$USER" /opt/ffbuild
+
+      - name: Restore FFmpeg cache
+        id: restore
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            /opt/ffbuild/prefix
+            externals/jellyfin-ffmpeg/config*.h
+          key: ${{ steps.key.outputs.key }}
+
+      - name: Report
+        run: |
+          if [ "${{ steps.restore.outputs.cache-hit }}" = "true" ]; then
+            echo "kept ${{ steps.key.outputs.key }}"
+          else
+            echo "::warning::no cache for ${{ steps.key.outputs.key }}, the next release run builds FFmpeg for this platform"
+          fi

@@ -11,6 +11,7 @@
 #include <optional>
 #include <thread>
 #include <vector>
+#include "packet.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -19,7 +20,6 @@ extern "C" {
 namespace ffmpeg {
 
 class FormatContext;
-class Packet;
 
 // One owner thread per input context, modelled on the ffmpeg CLI's demuxer
 // thread: once reading has started it is the only thread that touches the
@@ -57,6 +57,7 @@ private:
     std::vector<Napi::ObjectReference> pins;
     Packet* packet = nullptr;
     AVPacket* delivered = nullptr;
+    int repeatPict = kNoParserRepeatPict;
     int result = 0;
     bool release = false;
   };
@@ -91,7 +92,13 @@ private:
 
   std::mutex mutex_;
   std::condition_variable cv_;
-  std::deque<AVPacket*> packets_;
+  // A packet read ahead, with the parser state of its stream at that read
+  struct QueuedPacket {
+    AVPacket* packet;
+    int repeatPict;
+  };
+
+  std::deque<QueuedPacket> packets_;
   size_t queuedBytes_ = 0;
   int terminal_ = 0;
   bool stop_ = false;
