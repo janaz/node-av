@@ -12,33 +12,19 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = join(__dirname, '..');
 const packagesDir = join(rootDir, 'packages');
 
-// Platform configurations. Linux has a glibc and a musl (Alpine) build, the
-// package managers pick the right one through the libc field.
+// Platform configurations. The revizly fork publishes only the Linux glibc builds
+// (build-prebuilds.yaml builds linux64 + linuxarm64, revizly variant); upstream's
+// macOS, Windows and musl targets are not built, so they are left out here.
 const platforms = [
-  { name: 'darwin-arm64', os: 'darwin', cpu: 'arm64' },
-  { name: 'darwin-x64', os: 'darwin', cpu: 'x64' },
   { name: 'linux-arm64', os: 'linux', cpu: 'arm64', libc: 'glibc' },
-  { name: 'linux-arm64-musl', os: 'linux', cpu: 'arm64', libc: 'musl' },
   { name: 'linux-x64', os: 'linux', cpu: 'x64', libc: 'glibc' },
-  { name: 'linux-x64-musl', os: 'linux', cpu: 'x64', libc: 'musl' },
-  // MinGW builds are discontinued
-  // { name: 'win32-arm64-mingw', os: 'win32', cpu: 'arm64' },
-  // { name: 'win32-x64-mingw', os: 'win32', cpu: 'x64' },
-  { name: 'win32-arm64-msvc', os: 'win32', cpu: 'arm64' },
-  { name: 'win32-x64-msvc', os: 'win32', cpu: 'x64' },
 ];
 
 // FFmpeg CLI platforms. `artifact` is the suffix of the ffmpeg-v<version>-<suffix>.zip
-// build artifact of the gpl variant, the other variants append -<variant>.
+// build artifact. Same Linux-glibc-only set as above.
 const ffmpegPlatforms = [
-  { name: 'darwin-arm64', os: 'darwin', cpu: 'arm64', artifact: 'macos-arm64-jellyfin' },
-  { name: 'darwin-x64', os: 'darwin', cpu: 'x64', artifact: 'macos-x64-jellyfin' },
   { name: 'linux-arm64', os: 'linux', cpu: 'arm64', libc: 'glibc', artifact: 'linux-arm64-jellyfin' },
-  { name: 'linux-arm64-musl', os: 'linux', cpu: 'arm64', libc: 'musl', artifact: 'linux-arm64-musl-jellyfin' },
   { name: 'linux-x64', os: 'linux', cpu: 'x64', libc: 'glibc', artifact: 'linux-x64-jellyfin' },
-  { name: 'linux-x64-musl', os: 'linux', cpu: 'x64', libc: 'musl', artifact: 'linux-x64-musl-jellyfin' },
-  { name: 'win32-arm64', os: 'win32', cpu: 'arm64', artifact: 'win-arm64' },
-  { name: 'win32-x64', os: 'win32', cpu: 'x64', artifact: 'win-x64' },
 ];
 
 // Read template
@@ -181,8 +167,13 @@ const licenseSection = (variant, withTexts = false) => `## License
 ${variant.licenseText}.${withTexts ? ' See LICENSE.md for the license texts and the sources.' : ''}
 `;
 
-for (const [variantName, variant] of Object.entries(VARIANTS)) {
-  const isGpl = variantName === 'gpl';
+// The revizly fork builds and publishes only its own variant (Linux glibc); upstream's
+// gpl/lgpl/light variants are not built here, so they are skipped.
+for (const [variantName, variant] of Object.entries(VARIANTS).filter(([name]) => name === 'revizly')) {
+  // revizly is this fork's primary build and behaves like upstream's gpl: its main package
+  // is the repository root (not a separate packages/ folder) and its FFmpeg build artifacts
+  // carry no variant suffix.
+  const isGpl = variantName === 'gpl' || variantName === 'revizly';
 
   // Native binding packages (@seydx/node-av-linux-x64, @seydx/node-av-lgpl-linux-x64, ...)
   for (const platform of platforms) {
