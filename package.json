@@ -125,9 +125,9 @@
     "ws": "^8.23.0"
   },
   "bugs": {
-    "url": "https://github.com/seydx/node-av/issues"
+    "url": "https://github.com/janaz/node-av/issues"
   },
-  "homepage": "https://github.com/seydx/node-av#readme",
+  "homepage": "https://github.com/janaz/node-av#readme",
   "keywords": [
     "node",
     "ffmpeg",
@@ -146,6 +146,6 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/seydx/node-av.git"
+    "url": "git+https://github.com/janaz/node-av.git"
   }
 }
